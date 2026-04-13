@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = [
     "Ziqiao Kong <mio@lazym.io>"
@@ -25,5 +25,5 @@ sea-orm = {version = "2.0.0-rc", features = ["runtime-tokio-rustls", "sqlx-sqlit
 serde = { version = "1", features = ["derive"] }
 serde_json = {version = "1"}
 clap = {version = "4", features = ["env", "derive"] }
-knowdit-kg-model = { version = "0.1.0", path = "./crates/knowdit-kg-model" }
-knowdit-kg = { version = "0.1.0", path = "./crates/knowdit-kg" }
+knowdit-kg-model = { version = "0.1.1", path = "./crates/knowdit-kg-model" }
+knowdit-kg = { version = "0.1.1", path = "./crates/knowdit-kg" }

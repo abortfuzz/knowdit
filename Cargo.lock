@@ -1617,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "clap",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-kg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "color-eyre",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-kg-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sea-orm",
  "serde",
