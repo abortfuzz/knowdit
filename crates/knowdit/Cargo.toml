@@ -1,0 +1,21 @@
+[package]
+name = "knowdit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+itertools.workspace = true
+dotenvy.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber = {workspace = true, features = ["env-filter"]}
+llmy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = {workspace = true}
+clap = {workspace = true, features = ["env", "derive"] }
+async-channel.workspace = true
+knowdit-kg = { path = "../knowdit-kg" }
+knowdit-kg-model = { path = "../knowdit-kg-model" }

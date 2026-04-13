@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = [
+    "Ziqiao Kong <mio@lazym.io>"
+]
+license = "GPL-2.0-only"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+itertools = "0"
+dotenvy = "0"
+color-eyre = "0"
+tracing = "0"
+tracing-subscriber = {version = "0", features = ["env-filter"]}
+llmy = "0.4"
+thiserror = "2"
+async-channel = "2"
+
+sea-orm = {version = "2.0.0-rc", features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-mysql"]}
+serde = { version = "1", features = ["derive"] }
+serde_json = {version = "1"}
+clap = {version = "4", features = ["env", "derive"] }
