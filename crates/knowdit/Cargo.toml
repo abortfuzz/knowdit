@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-readme.workspace = true
 description.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -21,5 +20,19 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = {workspace = true}
 clap = {workspace = true, features = ["env", "derive"] }
 async-channel.workspace = true
+sea-orm.workspace = true
+url.workspace = true
+globset.workspace = true
+
 knowdit-kg.workspace = true
 knowdit-kg-model.workspace = true
+knowdit-project.workspace = true
+knowdit-repo-model.workspace = true
+knowdit-sol.workspace = true
+knowdit-agents.workspace = true
+knowdit-audit.workspace = true
+knowdit-cg-static.workspace = true
+
+foundry-compilers.workspace = true
+foundry-compilers-artifacts.workspace = true
+toml.workspace = true

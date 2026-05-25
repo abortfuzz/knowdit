@@ -1,14 +1,14 @@
 use crate::error::Result;
-use knowdit_kg_model::model::{
+use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_merge, project,
-    project_category, project_platform, semantic_finding_link, semantic_function, semantic_merge,
-    semantic_node,
+    project_category, project_finding, project_platform, project_semantic, semantic_finding_link,
+    semantic_function, semantic_merge, semantic_node,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// In-memory representation of the full knowledge graph.
-/// Built via `DatabaseGraph::load_knowledge_graph()`.
+/// Built via `HistoricalDatabase::load_knowledge_graph()`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnowledgeGraph {
     pub projects: Vec<project::Model>,
@@ -17,12 +17,46 @@ pub struct KnowledgeGraph {
     pub nodes: Vec<semantic_node::Model>,
     pub semantic_functions: Vec<semantic_function::Model>,
     pub project_categories: Vec<project_category::Model>,
+    /// Project ↔ semantic provenance edges. Replaces the old scalar
+    /// `semantic_node.project_id` so that a single canonical semantic (the
+    /// merge target — the surviving node after raw siblings fold into it) can
+    /// list every contributing project.
+    pub project_semantics: Vec<project_semantic::Model>,
     pub semantic_merges: Vec<semantic_merge::Model>,
     pub findings: Vec<audit_finding::Model>,
     pub finding_categories: Vec<finding_category::Model>,
     pub audit_finding_categories: Vec<audit_finding_category::Model>,
+    /// Project ↔ finding provenance edges. Replaces the old scalar
+    /// `audit_finding.project_id` for the same reason.
+    pub project_findings: Vec<project_finding::Model>,
     pub semantic_finding_links: Vec<semantic_finding_link::Model>,
     pub finding_merges: Vec<finding_merge::Model>,
+}
+
+impl KnowledgeGraph {
+    /// Build a `semantic_node_id → [project_id]` lookup map from the
+    /// `project_semantic` join rows. Used by visualization paths that need
+    /// to draw a project→node edge per contributor.
+    fn project_ids_per_semantic(&self) -> HashMap<i32, Vec<i32>> {
+        let mut out: HashMap<i32, Vec<i32>> = HashMap::new();
+        for row in &self.project_semantics {
+            out.entry(row.semantic_node_id)
+                .or_default()
+                .push(row.project_id);
+        }
+        out
+    }
+
+    /// Build a `audit_finding_id → [project_id]` lookup map.
+    fn project_ids_per_finding(&self) -> HashMap<i32, Vec<i32>> {
+        let mut out: HashMap<i32, Vec<i32>> = HashMap::new();
+        for row in &self.project_findings {
+            out.entry(row.audit_finding_id)
+                .or_default()
+                .push(row.project_id);
+        }
+        out
+    }
 }
 
 impl KnowledgeGraph {
@@ -175,20 +209,28 @@ impl KnowledgeGraph {
             ));
         }
 
+        let projects_per_semantic = self.project_ids_per_semantic();
         for node in &self.nodes {
-            if !merged_from_semantics.contains(&node.id) {
+            if merged_from_semantics.contains(&node.id) {
+                continue;
+            }
+            for project_id in projects_per_semantic.get(&node.id).into_iter().flatten() {
                 dot.push_str(&format!(
                     "  proj_{} -> sem_{} [color=darkgreen];\n",
-                    node.project_id, node.id
+                    project_id, node.id
                 ));
             }
         }
 
+        let projects_per_finding = self.project_ids_per_finding();
         for finding in &self.findings {
-            if !merged_from_findings.contains(&finding.id) {
+            if merged_from_findings.contains(&finding.id) {
+                continue;
+            }
+            for project_id in projects_per_finding.get(&finding.id).into_iter().flatten() {
                 dot.push_str(&format!(
                     "  proj_{} -> finding_{} [color=firebrick];\n",
-                    finding.project_id, finding.id
+                    project_id, finding.id
                 ));
             }
         }
@@ -196,14 +238,14 @@ impl KnowledgeGraph {
 
         for merge in &self.semantic_merges {
             dot.push_str(&format!(
-                "  sem_{} -> sem_{} [label=\"merged\", style=dotted, color=red];\n",
+                "  sem_{} -> sem_{} [label=\"raw→canonical\", style=dotted, color=red];\n",
                 merge.from_semantic_id, merge.to_semantic_id
             ));
         }
 
         for merge in &self.finding_merges {
             dot.push_str(&format!(
-                "  finding_{} -> finding_{} [label=\"merged\", style=dotted, color=orangered];\n",
+                "  finding_{} -> finding_{} [label=\"raw→canonical\", style=dotted, color=orangered];\n",
                 merge.from_finding_id, merge.to_finding_id
             ));
         }
@@ -402,14 +444,14 @@ impl KnowledgeGraph {
             );
 
             let raw_semantic_count = self
-                .nodes
+                .project_semantics
                 .iter()
-                .filter(|node| node.project_id == project.id)
+                .filter(|row| row.project_id == project.id)
                 .count();
             let raw_finding_count = self
-                .findings
+                .project_findings
                 .iter()
-                .filter(|finding| finding.project_id == project.id)
+                .filter(|row| row.project_id == project.id)
                 .count();
             push_detail(
                 &mut fields,
@@ -520,11 +562,26 @@ impl KnowledgeGraph {
             });
         }
 
+        let projects_per_semantic = self.project_ids_per_semantic();
+        let projects_per_finding = self.project_ids_per_finding();
+        let resolve_project_label = |pids: Option<&Vec<i32>>| -> Option<String> {
+            let pids = pids?;
+            let mut names: Vec<String> = pids
+                .iter()
+                .filter_map(|pid| projects_by_id.get(pid).map(|p| p.name.clone()))
+                .collect();
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                None
+            } else {
+                Some(names.join(", "))
+            }
+        };
+
         for node in &self.nodes {
             let is_merged = merged_from_semantics.contains(&node.id);
-            let project_name = projects_by_id
-                .get(&node.project_id)
-                .map(|project| project.name.clone());
+            let project_name = resolve_project_label(projects_per_semantic.get(&node.id));
             let mut fields = Vec::new();
             push_detail(&mut fields, "Name", Some(node.name.clone()));
             push_detail(&mut fields, "Definition", Some(node.definition.clone()));
@@ -549,9 +606,9 @@ impl KnowledgeGraph {
                 &mut fields,
                 "Status",
                 Some(if is_merged {
-                    "Merged".to_string()
+                    "Raw (folded into canonical)".to_string()
                 } else {
-                    "Active".to_string()
+                    "Canonical".to_string()
                 }),
             );
 
@@ -568,7 +625,7 @@ impl KnowledgeGraph {
                     subtitle: Some(format!(
                         "{} semantic{}",
                         node.category,
-                        if is_merged { " (merged)" } else { "" }
+                        if is_merged { " (raw, merged-away)" } else { "" }
                     )),
                     fields,
                 },
@@ -598,9 +655,7 @@ impl KnowledgeGraph {
 
         for finding in &self.findings {
             let is_merged = merged_from_findings.contains(&finding.id);
-            let project_name = projects_by_id
-                .get(&finding.project_id)
-                .map(|project| project.name.clone());
+            let project_name = resolve_project_label(projects_per_finding.get(&finding.id));
             let category = finding_category_for_finding.get(&finding.id).copied();
             let mut fields = Vec::new();
             push_detail(&mut fields, "Title", Some(finding.title.clone()));
@@ -635,9 +690,9 @@ impl KnowledgeGraph {
                 &mut fields,
                 "Status",
                 Some(if is_merged {
-                    "Merged".to_string()
+                    "Raw (folded into canonical)".to_string()
                 } else {
-                    "Active".to_string()
+                    "Canonical".to_string()
                 }),
             );
 
@@ -649,7 +704,7 @@ impl KnowledgeGraph {
                     subtitle: Some(format!(
                         "{} severity{}",
                         finding.severity,
-                        if is_merged { " (merged)" } else { "" }
+                        if is_merged { " (raw, merged-away)" } else { "" }
                     )),
                     fields,
                 },
@@ -725,8 +780,14 @@ impl KnowledgeGraph {
 
         for node in &self.nodes {
             let is_merged = merged_from_semantics.contains(&node.id);
-            if let Some(project) = projects_by_id.get(&node.project_id) {
-                let edge_id = format!("proj-sem-{}-{}", node.project_id, node.id);
+            let Some(project_ids) = projects_per_semantic.get(&node.id) else {
+                continue;
+            };
+            for project_id in project_ids {
+                let Some(project) = projects_by_id.get(project_id) else {
+                    continue;
+                };
+                let edge_id = format!("proj-sem-{}-{}", project_id, node.id);
                 let mut fields = vec![
                     HtmlDetailField {
                         label: "Project".to_string(),
@@ -743,9 +804,9 @@ impl KnowledgeGraph {
                     HtmlDetailField {
                         label: "Status".to_string(),
                         value: if is_merged {
-                            "Merged".to_string()
+                            "Raw (folded into canonical)".to_string()
                         } else {
-                            "Active".to_string()
+                            "Canonical".to_string()
                         },
                     },
                 ];
@@ -764,9 +825,10 @@ impl KnowledgeGraph {
                     HtmlSelectionDetails {
                         title: "Project -> Semantic".to_string(),
                         subtitle: Some(if is_merged {
-                            "Merged semantic still originates from this project".to_string()
+                            "Raw (merged-away) semantic still originates from this project"
+                                .to_string()
                         } else {
-                            "Contains active semantic node".to_string()
+                            "Contains canonical semantic node".to_string()
                         }),
                         fields,
                     },
@@ -774,7 +836,7 @@ impl KnowledgeGraph {
                 bump_edge_type_count(&mut edge_type_counts, EDGE_TYPE_PROJECT_SEMANTIC);
                 edges.push(HtmlGraphEdge {
                     id: edge_id,
-                    from: format!("proj_{}", node.project_id),
+                    from: format!("proj_{}", project_id),
                     to: format!("sem_{}", node.id),
                     edge_type: EDGE_TYPE_PROJECT_SEMANTIC.to_string(),
                     arrows: "to".to_string(),
@@ -793,8 +855,14 @@ impl KnowledgeGraph {
 
         for finding in &self.findings {
             let is_merged = merged_from_findings.contains(&finding.id);
-            if let Some(project) = projects_by_id.get(&finding.project_id) {
-                let edge_id = format!("proj-finding-{}-{}", finding.project_id, finding.id);
+            let Some(project_ids) = projects_per_finding.get(&finding.id) else {
+                continue;
+            };
+            for project_id in project_ids {
+                let Some(project) = projects_by_id.get(project_id) else {
+                    continue;
+                };
+                let edge_id = format!("proj-finding-{}-{}", project_id, finding.id);
                 let mut fields = vec![
                     HtmlDetailField {
                         label: "Project".to_string(),
@@ -811,9 +879,9 @@ impl KnowledgeGraph {
                     HtmlDetailField {
                         label: "Status".to_string(),
                         value: if is_merged {
-                            "Merged".to_string()
+                            "Raw (folded into canonical)".to_string()
                         } else {
-                            "Active".to_string()
+                            "Canonical".to_string()
                         },
                     },
                 ];
@@ -832,9 +900,10 @@ impl KnowledgeGraph {
                     HtmlSelectionDetails {
                         title: "Project -> Audit Finding".to_string(),
                         subtitle: Some(if is_merged {
-                            "Merged finding still originates from this project".to_string()
+                            "Raw (merged-away) finding still originates from this project"
+                                .to_string()
                         } else {
-                            "Active finding originates from project".to_string()
+                            "Canonical finding originates from project".to_string()
                         }),
                         fields,
                     },
@@ -842,7 +911,7 @@ impl KnowledgeGraph {
                 bump_edge_type_count(&mut edge_type_counts, EDGE_TYPE_PROJECT_FINDING);
                 edges.push(HtmlGraphEdge {
                     id: edge_id,
-                    from: format!("proj_{}", finding.project_id),
+                    from: format!("proj_{}", project_id),
                     to: format!("finding_{}", finding.id),
                     edge_type: EDGE_TYPE_PROJECT_FINDING.to_string(),
                     arrows: "to".to_string(),
@@ -876,10 +945,10 @@ impl KnowledgeGraph {
                 edge_id.clone(),
                 HtmlSelectionDetails {
                     title: "Semantic Merge".to_string(),
-                    subtitle: Some("Source semantic points to canonical semantic".to_string()),
+                    subtitle: Some("Raw semantic folded into canonical semantic".to_string()),
                     fields: vec![
                         HtmlDetailField {
-                            label: "Merged Node".to_string(),
+                            label: "Raw Node".to_string(),
                             value: from_label,
                         },
                         HtmlDetailField {
@@ -888,8 +957,9 @@ impl KnowledgeGraph {
                         },
                         HtmlDetailField {
                             label: "Relation".to_string(),
-                            value: "Merged semantic redirects into the canonical semantic node"
-                                .to_string(),
+                            value:
+                                "Raw semantic redirects into its canonical (merge target) semantic"
+                                    .to_string(),
                         },
                     ],
                 },
@@ -926,10 +996,10 @@ impl KnowledgeGraph {
                 edge_id.clone(),
                 HtmlSelectionDetails {
                     title: "Finding Merge".to_string(),
-                    subtitle: Some("Source finding points to canonical finding".to_string()),
+                    subtitle: Some("Raw finding folded into canonical finding".to_string()),
                     fields: vec![
                         HtmlDetailField {
-                            label: "Merged Node".to_string(),
+                            label: "Raw Node".to_string(),
                             value: from_label,
                         },
                         HtmlDetailField {
@@ -938,8 +1008,9 @@ impl KnowledgeGraph {
                         },
                         HtmlDetailField {
                             label: "Relation".to_string(),
-                            value: "Merged finding redirects into the canonical finding node"
-                                .to_string(),
+                            value:
+                                "Raw finding redirects into its canonical (merge target) finding"
+                                    .to_string(),
                         },
                     ],
                 },
@@ -1518,16 +1589,19 @@ impl KnowledgeGraph {
       const sidebar = document.querySelector('.layout > aside');
       const headerElement = document.querySelector('header');
       const nodeFilterState = new Map(nodeFilters.map((filter) => [filter.id, filter.enabledByDefault]));
+      // "Merged-away" = raw nodes folded into a canonical via semantic_merge /
+      // finding_merge. The toggle hides the raw provenance siblings, leaving
+      // only the canonical (un-merged) nodes plus everything else.
       const mergedNodeFilters = [
         {
           id: 'merged-semantic',
-          label: 'Merged Semantic Nodes',
+          label: 'Raw Merged-Away Semantics',
           count: graphData.nodes.filter((node) => node.nodeType === 'semantic' && node.isMerged).length,
           color: { background: '#fef3c7', border: '#b45309' },
         },
         {
           id: 'merged-finding',
-          label: 'Merged Finding Nodes',
+          label: 'Raw Merged-Away Findings',
           count: graphData.nodes.filter((node) => node.nodeType === 'finding' && node.isMerged).length,
           color: { background: '#fde68a', border: '#b45309' },
         },
@@ -1934,16 +2008,16 @@ impl KnowledgeGraph {
       const totalMergedCount = mergedNodeFilters.reduce((count, filter) => count + filter.count, 0);
 
       if (totalMergedCount === 0) {
-        mergedNodeFilterSummary.textContent = 'No merged semantic or finding nodes are present in this export.';
+        mergedNodeFilterSummary.textContent = 'No raw merged-away semantic or finding nodes are present in this export.';
         return;
       }
 
       if (hiddenMergedCount === 0) {
-        mergedNodeFilterSummary.textContent = `Showing all ${totalMergedCount} merged semantic/finding nodes.`;
+        mergedNodeFilterSummary.textContent = `Showing all ${totalMergedCount} raw merged-away semantic/finding nodes.`;
         return;
       }
 
-      mergedNodeFilterSummary.textContent = `Hiding ${hiddenMergedCount} / ${totalMergedCount} merged semantic/finding nodes.`;
+      mergedNodeFilterSummary.textContent = `Hiding ${hiddenMergedCount} / ${totalMergedCount} raw merged-away semantic/finding nodes.`;
     }
 
     function updateEdgeFilterSummary() {

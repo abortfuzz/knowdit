@@ -1,0 +1,21 @@
+[package]
+name = "knowdit-agents"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+knowdit-kg.workspace = true
+knowdit-repo-model.workspace = true
+knowdit-sol.workspace = true
+llmy.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

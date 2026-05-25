@@ -1,0 +1,19 @@
+[package]
+name = "knowdit-sol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+color-eyre.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-solidity.workspace = true
+
+knowdit-repo-model.workspace = true

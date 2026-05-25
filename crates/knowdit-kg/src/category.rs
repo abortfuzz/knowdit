@@ -1,1 +1,1 @@
-pub use knowdit_kg_model::model::category::DeFiCategory;
+pub use knowdit_kg_model::category::DeFiCategory;

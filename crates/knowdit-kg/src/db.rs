@@ -3,14 +3,15 @@ use crate::error::{KgError, Result};
 use crate::knowledge_graph::KnowledgeGraph;
 use crate::vulnerability::{FINDING_TAXONOMY, VulnerabilityCategory};
 use itertools::Itertools;
-use knowdit_kg_model::model::{
+use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_link_status,
-    finding_merge, project, project_category, project_platform, semantic_finding_link,
-    semantic_function, semantic_merge, semantic_node,
+    finding_merge, project, project_category, project_finding, project_platform, project_semantic,
+    semantic_finding_link, semantic_function, semantic_merge, semantic_node,
 };
+use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
     ActiveModelTrait,
-    ActiveValue::Set,
+    ActiveValue::{NotSet, Set},
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
     IntoActiveModel, QueryFilter, Schema, Statement, TransactionTrait,
     sea_query::{ForeignKey, ForeignKeyAction, TableCreateStatement},
@@ -20,8 +21,32 @@ use std::collections::{HashMap, HashSet};
 /// Main database handle wrapping a SeaORM connection.
 /// All knowledge-graph queries and mutations go through this struct.
 #[derive(Debug, Clone)]
-pub struct DatabaseGraph {
+pub struct HistoricalDatabase {
     db: DatabaseConnection,
+}
+
+/// One row to append to `semantic_finding_link`. Produced by the link
+/// agent and persisted via [`HistoricalDatabase::append_semantic_finding_links`].
+/// Carries the full set of columns including strength + evidence so the
+/// write path has a single typed argument (no `(i32, i32, …)` tuples).
+#[derive(Debug, Clone)]
+pub struct LinkEdge {
+    pub semantic_node_id: i32,
+    pub audit_finding_id: i32,
+    pub strength: LinkStrength,
+    pub evidence: String,
+}
+
+/// One row returned by [`HistoricalDatabase::findings_for_semantic_ids`].
+/// `canonical_semantic_id` is one of the input ids regardless of whether
+/// the link's source row sat on the canonical or on a merged raw — see
+/// the function's docstring for the merge-chase behaviour.
+#[derive(Debug, Clone)]
+pub struct LinkedFinding {
+    pub canonical_semantic_id: i32,
+    pub finding: audit_finding::Model,
+    pub strength: LinkStrength,
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +54,24 @@ pub struct DbValidationIssue {
     pub table: &'static str,
     pub row_key: String,
     pub problem: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticScopeSeed {
+    pub name: String,
+    pub category: DeFiCategory,
+    pub definition: String,
+    pub description: String,
+    pub functions: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VulnerabilityScopeSeed {
+    pub title: String,
+    pub severity: String,
+    pub description: String,
+    pub categories: Vec<DeFiCategory>,
+    pub semantic_names: Vec<String>,
 }
 
 impl std::fmt::Display for DbValidationIssue {
@@ -176,10 +219,11 @@ impl DbValidationRepairAction {
     }
 }
 
-impl DatabaseGraph {
+impl HistoricalDatabase {
     /// Connect to the database and return a new handle.
     pub async fn connect(url: &str) -> Result<Self> {
         use sea_orm::{Database, DatabaseBackend};
+        tracing::info!(database_url = %redact_database_url(url), "Connecting to database");
         let db = Database::connect(url).await?;
         if db.get_database_backend() == DatabaseBackend::Sqlite {
             db.execute_unprepared("PRAGMA journal_mode=WAL;").await?;
@@ -256,6 +300,11 @@ impl DatabaseGraph {
             schema.create_table_from_entity(semantic_finding_link::Entity),
             schema.create_table_from_entity(finding_link_status::Entity),
             finding_merge_table,
+            // M:N provenance + retro-link tracking introduced by the
+            // historical-DB refactor.
+            schema.create_table_from_entity(project_semantic::Entity),
+            schema.create_table_from_entity(project_finding::Entity),
+            schema.create_table_from_entity(knowdit_kg_model::db::pending_semantic::Entity),
         ];
 
         for mut table in tables {
@@ -263,6 +312,29 @@ impl DatabaseGraph {
                 table.if_not_exists();
             }
             conn.execute(&table).await?;
+        }
+
+        // sea-query 1.0 doesn't expose `MEDIUMTEXT` as a column type;
+        // its `Text` variant maps to MySQL `TEXT` which tops out at
+        // 64 KiB. LLM-generated `description` / `patterns` /
+        // `exploits` blobs in this schema routinely exceed that, so
+        // post-create we widen those specific columns to MEDIUMTEXT
+        // (~16 MiB) on MySQL. SQLite/Postgres are unaffected — their
+        // `TEXT` is unbounded — and `ALTER ... MODIFY` to a wider
+        // type is a no-op on an already-widened column, so this is
+        // idempotent across re-runs.
+        if self.db.get_database_backend() == DatabaseBackend::MySql {
+            for (table, column) in [
+                ("semantic_node", "description"),
+                ("audit_finding", "description"),
+                ("audit_finding", "patterns"),
+                ("audit_finding", "exploits"),
+            ] {
+                conn.execute_unprepared(&format!(
+                    "ALTER TABLE `{table}` MODIFY `{column}` MEDIUMTEXT NOT NULL"
+                ))
+                .await?;
+            }
         }
 
         Ok(())
@@ -510,6 +582,340 @@ impl DatabaseGraph {
 
         txn.commit().await?;
         Ok(imported_rows)
+    }
+
+    /// Drop every table in `dst`, recreate the schema fresh, then
+    /// copy every row of every table from `self` into `dst` inside
+    /// one destination-side transaction. Source IDs are preserved.
+    /// Backend-agnostic: source and destination may be different
+    /// SeaORM backends (sqlite ↔ mysql ↔ postgres) because all I/O
+    /// goes through the ORM rather than dialect-specific SQL.
+    pub async fn clobber_into(&self, dst: &HistoricalDatabase) -> Result<usize> {
+        let dst_backend = dst.db.get_database_backend();
+        let dst_existing = dst.snapshot_table_names().await?;
+        let dst_txn = dst.db.begin().await?;
+
+        for table in dst_existing.iter().rev() {
+            dst_txn
+                .execute_unprepared(&format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_identifier(dst_backend, table)
+                ))
+                .await?;
+        }
+        dst.create_tables(&dst_txn, false).await?;
+
+        let mut copied = 0usize;
+
+        // Sqlite caps bound parameters per statement (default 32766);
+        // sea_orm's `insert_many` packs every row into one statement,
+        // so we split into row-batches small enough that even the
+        // widest table stays comfortably under the cap.
+        const BATCH_SIZE: usize = 256;
+        macro_rules! copy_table {
+            ($entity:path) => {{
+                let rows = <$entity>::find().all(&self.db).await?;
+                for chunk in rows.chunks(BATCH_SIZE) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    <$entity>::insert_many(
+                        chunk.iter().cloned().map(|model| model.into_active_model()),
+                    )
+                    .exec(&dst_txn)
+                    .await?;
+                    copied += chunk.len();
+                }
+            }};
+        }
+
+        copy_table!(project::Entity);
+        copy_table!(project_platform::Entity);
+        copy_table!(category::Entity);
+        copy_table!(project_category::Entity);
+        copy_table!(semantic_node::Entity);
+        copy_table!(semantic_function::Entity);
+        copy_table!(semantic_merge::Entity);
+        copy_table!(audit_finding::Entity);
+        copy_table!(finding_category::Entity);
+        copy_table!(audit_finding_category::Entity);
+        copy_table!(semantic_finding_link::Entity);
+        copy_table!(finding_link_status::Entity);
+        copy_table!(finding_merge::Entity);
+        copy_table!(project_semantic::Entity);
+        copy_table!(project_finding::Entity);
+        copy_table!(knowdit_kg_model::db::pending_semantic::Entity);
+
+        dst_txn.commit().await?;
+        Ok(copied)
+    }
+
+    /// Append every row from `self` into `dst` without touching
+    /// `dst`'s existing rows. Auto-increment PKs are reassigned on
+    /// insert and every FK is rewritten through an in-memory id map
+    /// so foreign-key constraints stay intact. Seeded reference
+    /// tables (`category`, `finding_category`) are matched on their
+    /// natural keys so the dst's `init()`-seeded rows are reused
+    /// instead of duplicated. Caller is responsible for ensuring
+    /// `dst.init()` has run before this is invoked.
+    pub async fn merge_into(&self, dst: &HistoricalDatabase) -> Result<usize> {
+        use knowdit_kg_model::db::pending_semantic;
+        let txn = dst.db.begin().await?;
+        let mut copied = 0usize;
+
+        // category — seeded; match by `name`. Any extra category in
+        // src gets inserted with a fresh id.
+        let dst_categories = category::Entity::find().all(&txn).await?;
+        let mut dst_category_by_name: HashMap<DeFiCategory, i32> =
+            dst_categories.into_iter().map(|c| (c.name, c.id)).collect();
+        let mut category_id_map: HashMap<i32, i32> = HashMap::new();
+        for src_c in category::Entity::find().all(&self.db).await? {
+            let new_id = match dst_category_by_name.get(&src_c.name) {
+                Some(&id) => id,
+                None => {
+                    let mut am = src_c.clone().into_active_model();
+                    am.id = NotSet;
+                    let inserted = am.insert(&txn).await?;
+                    copied += 1;
+                    dst_category_by_name.insert(inserted.name, inserted.id);
+                    inserted.id
+                }
+            };
+            category_id_map.insert(src_c.id, new_id);
+        }
+
+        // finding_category — seeded; match by `(category, name)`.
+        let dst_finding_categories = finding_category::Entity::find().all(&txn).await?;
+        let mut dst_finding_category_by_key: HashMap<(VulnerabilityCategory, String), i32> =
+            dst_finding_categories
+                .into_iter()
+                .map(|c| ((c.category, c.name), c.id))
+                .collect();
+        let mut finding_category_id_map: HashMap<i32, i32> = HashMap::new();
+        for src_fc in finding_category::Entity::find().all(&self.db).await? {
+            let key = (src_fc.category, src_fc.name.clone());
+            let new_id = match dst_finding_category_by_key.get(&key) {
+                Some(&id) => id,
+                None => {
+                    let mut am = src_fc.clone().into_active_model();
+                    am.id = NotSet;
+                    let inserted = am.insert(&txn).await?;
+                    copied += 1;
+                    dst_finding_category_by_key
+                        .insert((inserted.category, inserted.name.clone()), inserted.id);
+                    inserted.id
+                }
+            };
+            finding_category_id_map.insert(src_fc.id, new_id);
+        }
+
+        // project — always insert fresh; the historical KG has no
+        // unique constraint on project.name and intentionally
+        // tolerates the same project name landing twice from
+        // independent sources.
+        let mut project_id_map: HashMap<i32, i32> = HashMap::new();
+        for src_p in project::Entity::find().all(&self.db).await? {
+            let src_id = src_p.id;
+            let mut am = src_p.into_active_model();
+            am.id = NotSet;
+            let inserted = am.insert(&txn).await?;
+            copied += 1;
+            project_id_map.insert(src_id, inserted.id);
+        }
+
+        // semantic_node — same: always insert fresh, build id map.
+        let mut semantic_node_id_map: HashMap<i32, i32> = HashMap::new();
+        for src_sn in semantic_node::Entity::find().all(&self.db).await? {
+            let src_id = src_sn.id;
+            let mut am = src_sn.into_active_model();
+            am.id = NotSet;
+            let inserted = am.insert(&txn).await?;
+            copied += 1;
+            semantic_node_id_map.insert(src_id, inserted.id);
+        }
+
+        // audit_finding — same.
+        let mut audit_finding_id_map: HashMap<i32, i32> = HashMap::new();
+        for src_af in audit_finding::Entity::find().all(&self.db).await? {
+            let src_id = src_af.id;
+            let mut am = src_af.into_active_model();
+            am.id = NotSet;
+            let inserted = am.insert(&txn).await?;
+            copied += 1;
+            audit_finding_id_map.insert(src_id, inserted.id);
+        }
+
+        let remap = |map: &HashMap<i32, i32>, src_id: i32, table: &'static str| -> Result<i32> {
+            map.get(&src_id).copied().ok_or_else(|| {
+                KgError::other(format!(
+                    "merge_into: src {} id {} has no dst mapping",
+                    table, src_id
+                ))
+            })
+        };
+
+        // semantic_function: belongs_to semantic_node, has its own
+        // auto-incr id (which we drop — the row has no inbound FKs).
+        for src_sf in semantic_function::Entity::find().all(&self.db).await? {
+            let new_sn_id = remap(
+                &semantic_node_id_map,
+                src_sf.semantic_node_id,
+                "semantic_node",
+            )?;
+            let mut am = src_sf.into_active_model();
+            am.id = NotSet;
+            am.semantic_node_id = Set(new_sn_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        // project_platform: belongs_to project; has its own auto-incr
+        // id plus a unique constraint on project_id (so no two src
+        // rows can collide here — and dst projects are fresh inserts,
+        // so the unique constraint is trivially satisfied).
+        for src_pp in project_platform::Entity::find().all(&self.db).await? {
+            let new_project_id = remap(&project_id_map, src_pp.project_id, "project")?;
+            let mut am = src_pp.into_active_model();
+            am.id = NotSet;
+            am.project_id = Set(new_project_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        // The remaining tables are pure join rows (composite PK,
+        // no auto-incr) — remap both FKs and insert.
+        for src_pc in project_category::Entity::find().all(&self.db).await? {
+            let new_project_id = remap(&project_id_map, src_pc.project_id, "project")?;
+            let new_category_id = remap(&category_id_map, src_pc.category_id, "category")?;
+            let mut am = src_pc.into_active_model();
+            am.project_id = Set(new_project_id);
+            am.category_id = Set(new_category_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_ps in project_semantic::Entity::find().all(&self.db).await? {
+            let new_project_id = remap(&project_id_map, src_ps.project_id, "project")?;
+            let new_sn_id = remap(
+                &semantic_node_id_map,
+                src_ps.semantic_node_id,
+                "semantic_node",
+            )?;
+            let mut am = src_ps.into_active_model();
+            am.project_id = Set(new_project_id);
+            am.semantic_node_id = Set(new_sn_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_pf in project_finding::Entity::find().all(&self.db).await? {
+            let new_project_id = remap(&project_id_map, src_pf.project_id, "project")?;
+            let new_af_id = remap(
+                &audit_finding_id_map,
+                src_pf.audit_finding_id,
+                "audit_finding",
+            )?;
+            let mut am = src_pf.into_active_model();
+            am.project_id = Set(new_project_id);
+            am.audit_finding_id = Set(new_af_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_afc in audit_finding_category::Entity::find().all(&self.db).await? {
+            let new_af_id = remap(
+                &audit_finding_id_map,
+                src_afc.audit_finding_id,
+                "audit_finding",
+            )?;
+            let new_fc_id = remap(
+                &finding_category_id_map,
+                src_afc.finding_category_id,
+                "finding_category",
+            )?;
+            let mut am = src_afc.into_active_model();
+            am.audit_finding_id = Set(new_af_id);
+            am.finding_category_id = Set(new_fc_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_sfl in semantic_finding_link::Entity::find().all(&self.db).await? {
+            let new_sn_id = remap(
+                &semantic_node_id_map,
+                src_sfl.semantic_node_id,
+                "semantic_node",
+            )?;
+            let new_af_id = remap(
+                &audit_finding_id_map,
+                src_sfl.audit_finding_id,
+                "audit_finding",
+            )?;
+            let mut am = src_sfl.into_active_model();
+            am.semantic_node_id = Set(new_sn_id);
+            am.audit_finding_id = Set(new_af_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_fls in finding_link_status::Entity::find().all(&self.db).await? {
+            let new_af_id = remap(
+                &audit_finding_id_map,
+                src_fls.audit_finding_id,
+                "audit_finding",
+            )?;
+            let mut am = src_fls.into_active_model();
+            am.audit_finding_id = Set(new_af_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_sm in semantic_merge::Entity::find().all(&self.db).await? {
+            let new_from = remap(
+                &semantic_node_id_map,
+                src_sm.from_semantic_id,
+                "semantic_node",
+            )?;
+            let new_to = remap(
+                &semantic_node_id_map,
+                src_sm.to_semantic_id,
+                "semantic_node",
+            )?;
+            let mut am = src_sm.into_active_model();
+            am.from_semantic_id = Set(new_from);
+            am.to_semantic_id = Set(new_to);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_fm in finding_merge::Entity::find().all(&self.db).await? {
+            let new_from = remap(
+                &audit_finding_id_map,
+                src_fm.from_finding_id,
+                "audit_finding",
+            )?;
+            let new_to = remap(&audit_finding_id_map, src_fm.to_finding_id, "audit_finding")?;
+            let mut am = src_fm.into_active_model();
+            am.from_finding_id = Set(new_from);
+            am.to_finding_id = Set(new_to);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_psn in pending_semantic::Entity::find().all(&self.db).await? {
+            let new_sn_id = remap(
+                &semantic_node_id_map,
+                src_psn.semantic_node_id,
+                "semantic_node",
+            )?;
+            let mut am = src_psn.into_active_model();
+            am.semantic_node_id = Set(new_sn_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        txn.commit().await?;
+        Ok(copied)
     }
 
     async fn snapshot_table_names(&self) -> Result<Vec<String>> {
@@ -836,8 +1242,22 @@ impl DatabaseGraph {
         &self,
         project_id: i32,
     ) -> Result<Vec<(semantic_node::Model, Vec<semantic_function::Model>)>> {
+        // Project provenance lives in `project_semantic` since the refactor.
+        // Note: a single project may attach to multiple semantic nodes
+        // (canonical or merged-away — the LLM merge step doesn't strip these
+        // out of the join table when it folds raw nodes).
+        let semantic_ids: Vec<i32> = project_semantic::Entity::find()
+            .filter(project_semantic::Column::ProjectId.eq(project_id))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| row.semantic_node_id)
+            .collect();
+        if semantic_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let nodes = semantic_node::Entity::find()
-            .filter(semantic_node::Column::ProjectId.eq(project_id))
+            .filter(semantic_node::Column::Id.is_in(semantic_ids))
             .all(&self.db)
             .await?;
 
@@ -867,17 +1287,94 @@ impl DatabaseGraph {
             .all(&self.db)
             .await?;
 
+        // Project provenance is many-to-many now, so a node may originate
+        // from multiple historical projects; we surface the lexicographically
+        // earliest project name as the display label and "+N" if there are
+        // more contributors.
         let mut results = Vec::new();
         for node in nodes {
-            let proj = project::Entity::find_by_id(node.project_id)
-                .one(&self.db)
+            let project_ids: Vec<i32> = project_semantic::Entity::find()
+                .filter(project_semantic::Column::SemanticNodeId.eq(node.id))
+                .all(&self.db)
                 .await?
-                .map(|p| p.name)
-                .unwrap_or_else(|| "unknown".to_string());
-            results.push((node, proj));
+                .into_iter()
+                .map(|row| row.project_id)
+                .collect();
+            let label = if project_ids.is_empty() {
+                "unknown".to_string()
+            } else {
+                let mut names: Vec<String> = project::Entity::find()
+                    .filter(project::Column::Id.is_in(project_ids.clone()))
+                    .all(&self.db)
+                    .await?
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                names.sort();
+                let primary = names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                if names.len() > 1 {
+                    format!("{} +{}", primary, names.len() - 1)
+                } else {
+                    primary
+                }
+            };
+            results.push((node, label));
         }
 
         Ok(results)
+    }
+
+    /// Fetch existing canonical semantic nodes (= survivors of any merge)
+    /// for the given categories, paired with the raw children that have
+    /// been merged into each canonical. The merge orchestrator renders
+    /// each canonical with its children so the LLM's `updated_*`
+    /// generalisations can take prior merges into account.
+    pub async fn canonical_semantics_with_children_for_categories(
+        &self,
+        categories: &[crate::category::DeFiCategory],
+    ) -> Result<Vec<crate::agents::CanonicalWithChildren<semantic_node::Model>>> {
+        let canonicals = self.existing_semantics_for_categories(categories).await?;
+        if canonicals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let canonical_ids: Vec<i32> = canonicals.iter().map(|n| n.id).collect();
+        let merge_rows = semantic_merge::Entity::find()
+            .filter(semantic_merge::Column::ToSemanticId.is_in(canonical_ids.clone()))
+            .all(&self.db)
+            .await?;
+        let raw_ids: Vec<i32> = merge_rows.iter().map(|m| m.from_semantic_id).collect();
+        let raws = if raw_ids.is_empty() {
+            Vec::new()
+        } else {
+            semantic_node::Entity::find()
+                .filter(semantic_node::Column::Id.is_in(raw_ids))
+                .all(&self.db)
+                .await?
+        };
+        let raws_by_id: HashMap<i32, semantic_node::Model> =
+            raws.into_iter().map(|n| (n.id, n)).collect();
+        let mut children_by_canonical: HashMap<i32, Vec<semantic_node::Model>> = HashMap::new();
+        for row in merge_rows {
+            if let Some(raw) = raws_by_id.get(&row.from_semantic_id) {
+                children_by_canonical
+                    .entry(row.to_semantic_id)
+                    .or_default()
+                    .push(raw.clone());
+            }
+        }
+        Ok(canonicals
+            .into_iter()
+            .map(|c| {
+                let raw_children = children_by_canonical.remove(&c.id).unwrap_or_default();
+                crate::agents::CanonicalWithChildren {
+                    canonical: c,
+                    raw_children,
+                }
+            })
+            .collect())
     }
 
     /// Fetch existing active semantic nodes for the given categories.
@@ -922,6 +1419,93 @@ impl DatabaseGraph {
         };
 
         Ok(nodes)
+    }
+
+    /// Fetch every finding linked to any of `semantic_ids` via
+    /// `semantic_finding_link`. Returns `(semantic_node_id, finding_model)` pairs;
+    /// the same finding may appear multiple times if it is linked to multiple
+    /// semantics in the input set.
+    /// Findings linked to any of the given semantic ids OR to any raw
+    /// (merged-away) semantic that resolves to one of those ids.
+    ///
+    /// Each returned tuple uses the *canonical* semantic id (one of the
+    /// inputs) as the first element regardless of whether the link's source
+    /// row was on the canonical or on a raw child. This lets callers reason
+    /// about findings against the canonical they matched on without having
+    /// to handle merge chains themselves.
+    pub async fn findings_for_semantic_ids(
+        &self,
+        semantic_ids: &[i32],
+    ) -> Result<Vec<LinkedFinding>> {
+        if semantic_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Chase merge children: any row in semantic_merge where the
+        // canonical (to_semantic_id) is one of the requested ids contributes
+        // its raw (from_semantic_id) to the search set, and we record a
+        // raw → canonical mapping so the returned tuple stays canonical.
+        let merge_rows = semantic_merge::Entity::find()
+            .filter(semantic_merge::Column::ToSemanticId.is_in(semantic_ids.iter().copied()))
+            .all(&self.db)
+            .await?;
+
+        let mut canonical_for_id: HashMap<i32, i32> = HashMap::new();
+        let mut search_ids: HashSet<i32> = semantic_ids.iter().copied().collect();
+        for row in &merge_rows {
+            search_ids.insert(row.from_semantic_id);
+            canonical_for_id.insert(row.from_semantic_id, row.to_semantic_id);
+        }
+        // Identity mapping for the canonical inputs themselves.
+        for id in semantic_ids {
+            canonical_for_id.insert(*id, *id);
+        }
+
+        let links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.is_in(search_ids.iter().copied()))
+            .all(&self.db)
+            .await?;
+
+        if links.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let finding_ids: Vec<i32> = links.iter().map(|l| l.audit_finding_id).unique().collect();
+
+        let findings = audit_finding::Entity::find()
+            .filter(audit_finding::Column::Id.is_in(finding_ids))
+            .all(&self.db)
+            .await?;
+        let findings_by_id: HashMap<i32, audit_finding::Model> =
+            findings.into_iter().map(|f| (f.id, f)).collect();
+
+        let mut out = Vec::with_capacity(links.len());
+        for link in links {
+            let canonical_id = canonical_for_id
+                .get(&link.semantic_node_id)
+                .copied()
+                .unwrap_or(link.semantic_node_id);
+            if let Some(finding) = findings_by_id.get(&link.audit_finding_id) {
+                out.push(LinkedFinding {
+                    canonical_semantic_id: canonical_id,
+                    finding: finding.clone(),
+                    strength: link.strength,
+                    evidence: link.evidence,
+                });
+            }
+        }
+        // De-duplicate (canonical_id, finding_id) pairs so callers don't see
+        // the same finding twice when both raw and canonical happen to be
+        // linked to it. When duplicates exist, keep the strongest row.
+        out.sort_by(|a, b| {
+            (a.canonical_semantic_id, a.finding.id)
+                .cmp(&(b.canonical_semantic_id, b.finding.id))
+                .then(b.strength.rank().cmp(&a.strength.rank()))
+        });
+        out.dedup_by(|a, b| {
+            a.canonical_semantic_id == b.canonical_semantic_id && a.finding.id == b.finding.id
+        });
+        Ok(out)
     }
 
     pub async fn semantic_link_candidates_for_categories(
@@ -986,6 +1570,273 @@ impl DatabaseGraph {
         }
 
         materialize_semantic_link_candidates(nodes_by_id.into_values().collect(), &merge_map)
+    }
+
+    /// All canonical semantics across every category, with merged-away aliases
+    /// excluded. Linking is one-time, so this is the single candidate set we
+    /// present to the LLM regardless of the pending finding's project category.
+    pub async fn all_canonical_semantic_link_candidates(
+        &self,
+    ) -> Result<Vec<semantic_node::Model>> {
+        let merged_away_ids: HashSet<i32> = semantic_merge::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|merge| merge.from_semantic_id)
+            .collect();
+        let mut nodes: Vec<semantic_node::Model> = semantic_node::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .filter(|node| !merged_away_ids.contains(&node.id))
+            .collect();
+        nodes.sort_by_key(|node| node.id);
+        Ok(nodes)
+    }
+
+    pub async fn load_semantic_scope_seed(&self) -> Result<Vec<SemanticScopeSeed>> {
+        let nodes = self
+            .existing_semantics_for_categories(DeFiCategory::ALL)
+            .await?;
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        let mut functions_by_semantic = HashMap::<i32, Vec<(String, String)>>::new();
+        for function in semantic_function::Entity::find()
+            .filter(semantic_function::Column::SemanticNodeId.is_in(node_ids))
+            .all(&self.db)
+            .await?
+        {
+            functions_by_semantic
+                .entry(function.semantic_node_id)
+                .or_default()
+                .push((function.function_name, function.contract_path));
+        }
+
+        let mut out = nodes
+            .into_iter()
+            .map(|node| SemanticScopeSeed {
+                name: node.name,
+                category: node.category,
+                definition: node.definition,
+                description: node.description,
+                functions: functions_by_semantic.remove(&node.id).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|lhs, rhs| {
+            lhs.category
+                .as_str()
+                .cmp(rhs.category.as_str())
+                .then_with(|| lhs.name.cmp(&rhs.name))
+        });
+        Ok(out)
+    }
+
+    pub async fn load_vulnerability_scope_seed(&self) -> Result<Vec<VulnerabilityScopeSeed>> {
+        let findings = audit_finding::Entity::find().all(&self.db).await?;
+        if findings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let finding_merge_map = build_merge_map(
+            finding_merge::Entity::find()
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|merge| (merge.from_finding_id, merge.to_finding_id)),
+        );
+        let semantic_merge_map = build_merge_map(
+            semantic_merge::Entity::find()
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|merge| (merge.from_semantic_id, merge.to_semantic_id)),
+        );
+
+        let semantic_by_id = semantic_node::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|semantic| (semantic.id, semantic))
+            .collect::<HashMap<_, _>>();
+
+        let project_category_names = category::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.name))
+            .collect::<HashMap<_, _>>();
+        let mut project_categories_by_project = HashMap::<i32, Vec<DeFiCategory>>::new();
+        for link in project_category::Entity::find().all(&self.db).await? {
+            if let Some(category) = project_category_names.get(&link.category_id) {
+                project_categories_by_project
+                    .entry(link.project_id)
+                    .or_default()
+                    .push(*category);
+            }
+        }
+        for categories in project_categories_by_project.values_mut() {
+            categories.sort_by_key(DeFiCategory::as_str);
+            categories.dedup();
+        }
+
+        let mut findings_by_id = findings
+            .into_iter()
+            .map(|finding| (finding.id, finding))
+            .collect::<HashMap<_, _>>();
+        let active_finding_ids = findings_by_id
+            .keys()
+            .copied()
+            .filter(|finding_id| {
+                resolve_merge_target(*finding_id, &finding_merge_map) == *finding_id
+            })
+            .collect::<HashSet<_>>();
+
+        // Project provenance now lives in `project_finding` (a finding may
+        // have multiple originating projects after merge). For seed
+        // construction we want any one project's category set as a fallback;
+        // using the lowest project id is deterministic.
+        let mut project_id_by_finding: HashMap<i32, i32> = HashMap::new();
+        for row in project_finding::Entity::find().all(&self.db).await? {
+            project_id_by_finding
+                .entry(row.audit_finding_id)
+                .and_modify(|cur| {
+                    if row.project_id < *cur {
+                        *cur = row.project_id;
+                    }
+                })
+                .or_insert(row.project_id);
+        }
+
+        let mut semantic_names_by_finding = HashMap::<i32, HashSet<String>>::new();
+        let mut semantic_categories_by_finding = HashMap::<i32, HashSet<DeFiCategory>>::new();
+        for link in semantic_finding_link::Entity::find().all(&self.db).await? {
+            let canonical_finding_id =
+                resolve_merge_target(link.audit_finding_id, &finding_merge_map);
+            if !active_finding_ids.contains(&canonical_finding_id) {
+                continue;
+            }
+
+            let canonical_semantic_id =
+                resolve_merge_target(link.semantic_node_id, &semantic_merge_map);
+            let Some(semantic) = semantic_by_id.get(&canonical_semantic_id) else {
+                continue;
+            };
+
+            semantic_names_by_finding
+                .entry(canonical_finding_id)
+                .or_default()
+                .insert(semantic.name.clone());
+            semantic_categories_by_finding
+                .entry(canonical_finding_id)
+                .or_default()
+                .insert(semantic.category);
+        }
+
+        let mut active_ids = active_finding_ids.into_iter().collect::<Vec<_>>();
+        active_ids.sort_unstable();
+
+        let mut out = Vec::new();
+        for finding_id in active_ids {
+            let Some(finding) = findings_by_id.remove(&finding_id) else {
+                continue;
+            };
+
+            let mut semantic_names = semantic_names_by_finding
+                .remove(&finding_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            semantic_names.sort();
+            semantic_names.dedup();
+            if semantic_names.is_empty() {
+                continue;
+            }
+
+            let mut categories = semantic_categories_by_finding
+                .remove(&finding_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if categories.is_empty() {
+                if let Some(pid) = project_id_by_finding.get(&finding_id) {
+                    categories = project_categories_by_project
+                        .get(pid)
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
+            if categories.is_empty() {
+                categories.push(DeFiCategory::Others);
+            }
+            categories.sort_by_key(DeFiCategory::as_str);
+            categories.dedup();
+
+            out.push(VulnerabilityScopeSeed {
+                title: finding.title,
+                severity: finding.severity.as_str().to_string(),
+                description: finding.description,
+                categories,
+                semantic_names,
+            });
+        }
+
+        Ok(out)
+    }
+
+    /// Fetch existing canonical findings (= survivors of any merge) for
+    /// the given vulnerability categories, paired with their taxonomy
+    /// entry and the raw children that have been merged into each
+    /// canonical. Mirrors
+    /// [`Self::canonical_semantics_with_children_for_categories`].
+    pub async fn canonical_findings_with_children_for_categories(
+        &self,
+        categories: &[VulnerabilityCategory],
+    ) -> Result<Vec<crate::agents::FindingCanonicalWithTaxonomy>> {
+        let canonicals = self.existing_findings_for_categories(categories).await?;
+        if canonicals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let canonical_ids: Vec<i32> = canonicals.iter().map(|(f, _)| f.id).collect();
+        let merge_rows = finding_merge::Entity::find()
+            .filter(finding_merge::Column::ToFindingId.is_in(canonical_ids.clone()))
+            .all(&self.db)
+            .await?;
+        let raw_ids: Vec<i32> = merge_rows.iter().map(|m| m.from_finding_id).collect();
+        let raws = if raw_ids.is_empty() {
+            Vec::new()
+        } else {
+            audit_finding::Entity::find()
+                .filter(audit_finding::Column::Id.is_in(raw_ids))
+                .all(&self.db)
+                .await?
+        };
+        let raws_by_id: HashMap<i32, audit_finding::Model> =
+            raws.into_iter().map(|f| (f.id, f)).collect();
+        let mut children_by_canonical: HashMap<i32, Vec<audit_finding::Model>> = HashMap::new();
+        for row in merge_rows {
+            if let Some(raw) = raws_by_id.get(&row.from_finding_id) {
+                children_by_canonical
+                    .entry(row.to_finding_id)
+                    .or_default()
+                    .push(raw.clone());
+            }
+        }
+        Ok(canonicals
+            .into_iter()
+            .map(|(canonical, category)| {
+                let raw_children = children_by_canonical
+                    .remove(&canonical.id)
+                    .unwrap_or_default();
+                crate::agents::FindingCanonicalWithTaxonomy {
+                    canonical,
+                    category,
+                    raw_children,
+                }
+            })
+            .collect())
     }
 
     pub async fn existing_findings_for_categories(
@@ -1159,6 +2010,18 @@ impl DatabaseGraph {
             categories.dedup();
         }
 
+        // Pre-load finding → originating projects from the join table.
+        // A canonical finding may have several originating projects after
+        // raw siblings fold into it; we union their category lists for
+        // category-aware linking context.
+        let mut project_ids_by_finding: HashMap<i32, Vec<i32>> = HashMap::new();
+        for row in project_finding::Entity::find().all(&self.db).await? {
+            project_ids_by_finding
+                .entry(row.audit_finding_id)
+                .or_default()
+                .push(row.project_id);
+        }
+
         let mut pending = Vec::new();
         for finding in findings.into_iter().sorted_by_key(|finding| finding.id) {
             let canonical_id = resolve_merge_target(finding.id, &finding_merge_map);
@@ -1168,7 +2031,11 @@ impl DatabaseGraph {
                 if canonical_has_links {
                     continue;
                 }
-            } else if finding_is_processed || already_linked_ids.contains(&finding.id) {
+            } else if finding_is_processed {
+                // After the in-project linking refactor, every raw finding
+                // already carries ≥1 row in `semantic_finding_link`. Whether
+                // it has been *globally* linked is tracked via
+                // `finding_link_status`, so check that alone here.
                 continue;
             }
 
@@ -1176,10 +2043,14 @@ impl DatabaseGraph {
                 KgError::other(format!("Finding {} is missing taxonomy", finding.id))
             })?;
 
-            let mut categories = project_categories_by_project
-                .get(&finding.project_id)
-                .cloned()
-                .unwrap_or_default();
+            let mut categories: Vec<DeFiCategory> = Vec::new();
+            if let Some(pids) = project_ids_by_finding.get(&finding.id) {
+                for pid in pids {
+                    if let Some(cats) = project_categories_by_project.get(pid) {
+                        categories.extend(cats.iter().copied());
+                    }
+                }
+            }
             categories.sort_by_key(DeFiCategory::as_str);
             categories.dedup();
 
@@ -1209,9 +2080,9 @@ impl DatabaseGraph {
     ) -> Result<()> {
         let txn = self.db.begin().await?;
 
-        for &semantic_id in &result.semantic_ids {
+        for link in &result.semantic_links {
             let existing = semantic_finding_link::Entity::find()
-                .filter(semantic_finding_link::Column::SemanticNodeId.eq(semantic_id))
+                .filter(semantic_finding_link::Column::SemanticNodeId.eq(link.semantic_id))
                 .filter(
                     semantic_finding_link::Column::AuditFindingId.eq(result.link_target_finding_id),
                 )
@@ -1219,11 +2090,13 @@ impl DatabaseGraph {
                 .await?;
 
             if existing.is_none() {
-                let link = semantic_finding_link::ActiveModel {
-                    semantic_node_id: Set(semantic_id),
+                let row = semantic_finding_link::ActiveModel {
+                    semantic_node_id: Set(link.semantic_id),
                     audit_finding_id: Set(result.link_target_finding_id),
+                    strength: Set(link.strength),
+                    evidence: Set(link.evidence.clone()),
                 };
-                semantic_finding_link::Entity::insert(link)
+                semantic_finding_link::Entity::insert(row)
                     .exec(&txn)
                     .await?;
             }
@@ -1245,10 +2118,141 @@ impl DatabaseGraph {
         tracing::info!(
             "Finding {} processed with {} semantic link(s) targeting finding {}",
             result.finding_id,
-            result.semantic_ids.len(),
+            result.semantic_links.len(),
             result.link_target_finding_id
         );
         Ok(())
+    }
+
+    /// Findings that have been globally linked already (i.e., have a row in
+    /// `finding_link_status`). Used by the retro-link pass to feed the LLM
+    /// the set of findings that should be re-checked against newly-introduced
+    /// canonical semantics queued in `pending_semantic`.
+    pub async fn list_findings_with_link_status(
+        &self,
+    ) -> Result<Vec<crate::learn::PendingFindingForLinking>> {
+        let processed_ids: HashSet<i32> = finding_link_status::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|s| s.audit_finding_id)
+            .collect();
+        if processed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let findings = audit_finding::Entity::find()
+            .filter(audit_finding::Column::Id.is_in(processed_ids.iter().copied()))
+            .all(&self.db)
+            .await?;
+        if findings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let finding_merge_map = build_merge_map(
+            finding_merge::Entity::find()
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|merge| (merge.from_finding_id, merge.to_finding_id)),
+        );
+
+        // Load taxonomy via audit_finding_category → finding_category.
+        let category_rows = finding_category::Entity::find().all(&self.db).await?;
+        let category_by_id: HashMap<i32, finding_category::Model> =
+            category_rows.into_iter().map(|row| (row.id, row)).collect();
+        let mut finding_taxonomy: HashMap<i32, finding_category::Model> = HashMap::new();
+        for link in audit_finding_category::Entity::find().all(&self.db).await? {
+            if let Some(cat) = category_by_id.get(&link.finding_category_id) {
+                finding_taxonomy.insert(link.audit_finding_id, cat.clone());
+            }
+        }
+
+        let mut pending = Vec::new();
+        for finding in findings {
+            let canonical_id = resolve_merge_target(finding.id, &finding_merge_map);
+            let taxonomy = match finding_taxonomy.get(&finding.id) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            pending.push(crate::learn::PendingFindingForLinking {
+                finding_id: finding.id,
+                link_target_finding_id: canonical_id,
+                categories: Vec::new(), // retro-link is category-agnostic
+                finding: crate::learn::ExtractedFinding {
+                    title: finding.title,
+                    severity: finding.severity,
+                    category: taxonomy.category,
+                    subcategory: taxonomy.name.clone(),
+                    root_cause: finding.root_cause,
+                    description: finding.description,
+                    patterns: finding.patterns,
+                    exploits: finding.exploits,
+                },
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Currently-queued canonical semantics waiting for retro-link consideration.
+    pub async fn list_pending_canonical_semantics(&self) -> Result<Vec<semantic_node::Model>> {
+        let pending_ids: Vec<i32> = knowdit_kg_model::db::pending_semantic::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|p| p.semantic_node_id)
+            .collect();
+        if pending_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(semantic_node::Entity::find()
+            .filter(semantic_node::Column::Id.is_in(pending_ids))
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Append `(canonical_semantic_id, finding_id, strength, evidence)`
+    /// rows to `semantic_finding_link`. Idempotent on the composite
+    /// primary key: existing rows are left untouched (use a separate
+    /// upsert helper if you need to overwrite strength/evidence; the
+    /// current write path is append-only). Does NOT touch
+    /// `finding_link_status` — retro-link is for findings already there.
+    pub async fn append_semantic_finding_links(&self, edges: &[LinkEdge]) -> Result<usize> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin().await?;
+        let mut inserted = 0;
+        for edge in edges {
+            let already = semantic_finding_link::Entity::find()
+                .filter(semantic_finding_link::Column::SemanticNodeId.eq(edge.semantic_node_id))
+                .filter(semantic_finding_link::Column::AuditFindingId.eq(edge.audit_finding_id))
+                .one(&txn)
+                .await?;
+            if already.is_none() {
+                semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+                    semantic_node_id: Set(edge.semantic_node_id),
+                    audit_finding_id: Set(edge.audit_finding_id),
+                    strength: Set(edge.strength),
+                    evidence: Set(edge.evidence.clone()),
+                })
+                .exec(&txn)
+                .await?;
+                inserted += 1;
+            }
+        }
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Empty the `pending_semantic` queue. Run after retro-link successfully
+    /// processed the queued semantics against the existing finding_link_status
+    /// set.
+    pub async fn clear_pending_semantic_queue(&self) -> Result<usize> {
+        let result = knowdit_kg_model::db::pending_semantic::Entity::delete_many()
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected as usize)
     }
 
     pub async fn list_processed_findings_without_semantic_links(&self) -> Result<Vec<i32>> {
@@ -1576,6 +2580,7 @@ impl DatabaseGraph {
         categories: &[crate::category::DeFiCategory],
         semantic_merge_results: &[crate::learn::MergeResult],
         finding_merge_results: &[crate::learn::FindingMergeResult],
+        in_project_links: &crate::learn::InProjectLinks,
     ) -> Result<()> {
         use crate::learn::{FindingMergeAction, MergeAction};
 
@@ -1656,9 +2661,43 @@ impl DatabaseGraph {
             }
         }
 
+        // Track raw row ids per `semantic_merge_results` / `finding_merge_results`
+        // index. The InProjectLinks edges reference these positions, and the
+        // final block at the bottom of this transaction translates the index
+        // pairs into actual `semantic_finding_link` rows.
+        let mut raw_semantic_id_by_idx: Vec<i32> = Vec::with_capacity(semantic_merge_results.len());
+        let mut raw_finding_id_by_idx: Vec<i32> = Vec::with_capacity(finding_merge_results.len());
+        // Newly-introduced canonical semantic ids (action == New) — these
+        // populate `pending_semantic` so the retro-link pass during the
+        // incremental learn flow can attach existing findings to them.
+        let mut new_canonical_semantic_ids: Vec<i32> = Vec::new();
+
         // Process merge results
         let mut new_semantic_count = 0;
         let mut merged_semantic_count = 0;
+
+        // Inserts a project_semantic row if the (project, semantic) pair is
+        // not yet present. Idempotent under the composite primary key.
+        async fn upsert_project_semantic<C: ConnectionTrait>(
+            txn: &C,
+            project_id: i32,
+            semantic_node_id: i32,
+        ) -> Result<()> {
+            let existing = project_semantic::Entity::find()
+                .filter(project_semantic::Column::ProjectId.eq(project_id))
+                .filter(project_semantic::Column::SemanticNodeId.eq(semantic_node_id))
+                .one(txn)
+                .await?;
+            if existing.is_none() {
+                project_semantic::Entity::insert(project_semantic::ActiveModel {
+                    project_id: Set(project_id),
+                    semantic_node_id: Set(semantic_node_id),
+                })
+                .exec(txn)
+                .await?;
+            }
+            Ok(())
+        }
 
         for result in semantic_merge_results {
             match &result.action {
@@ -1668,11 +2707,14 @@ impl DatabaseGraph {
                         category: Set(result.semantic.category),
                         definition: Set(result.semantic.definition.clone()),
                         description: Set(result.semantic.description.clone()),
-                        project_id: Set(project_id),
                         ..Default::default()
                     };
                     let inserted = semantic_node::Entity::insert(node).exec(&txn).await?;
                     let node_id = inserted.last_insert_id;
+
+                    upsert_project_semantic(&txn, project_id, node_id).await?;
+                    raw_semantic_id_by_idx.push(node_id);
+                    new_canonical_semantic_ids.push(node_id);
 
                     for func in &result.semantic.functions {
                         let f = semantic_function::ActiveModel {
@@ -1687,49 +2729,26 @@ impl DatabaseGraph {
                     new_semantic_count += 1;
                 }
                 MergeAction::Merge {
-                    target_id,
-                    updated_name,
-                    updated_definition,
-                    updated_description,
+                    target_ids,
+                    appended_description,
                 } => {
-                    let target = semantic_node::Entity::find_by_id(*target_id)
-                        .one(&txn)
-                        .await?
-                        .ok_or_else(|| {
-                            KgError::other(format!(
-                                "Semantic merge target sem-{} does not exist while writing project '{}'",
-                                target_id, name
-                            ))
-                        })?;
-
+                    // Insert the new raw semantic once, then write one
+                    // `semantic_merge` row per target canonical (multi-
+                    // target merge). The canonical's `name` and
+                    // `definition` are stable identity and are NEVER
+                    // modified by a merge; only `description` may have
+                    // additional context appended.
                     let node = semantic_node::ActiveModel {
                         name: Set(result.semantic.name.clone()),
                         category: Set(result.semantic.category),
                         definition: Set(result.semantic.definition.clone()),
                         description: Set(result.semantic.description.clone()),
-                        project_id: Set(project_id),
                         ..Default::default()
                     };
                     let inserted = semantic_node::Entity::insert(node).exec(&txn).await?;
                     let new_id = inserted.last_insert_id;
-
-                    let merge = semantic_merge::ActiveModel {
-                        from_semantic_id: Set(new_id),
-                        to_semantic_id: Set(*target_id),
-                    };
-                    semantic_merge::Entity::insert(merge).exec(&txn).await?;
-
-                    let mut am = target.into_active_model();
-                    if let Some(name) = updated_name {
-                        am.name = Set(name.clone());
-                    }
-                    if let Some(def) = updated_definition {
-                        am.definition = Set(def.clone());
-                    }
-                    if let Some(desc) = updated_description {
-                        am.description = Set(desc.clone());
-                    }
-                    am.update(&txn).await?;
+                    upsert_project_semantic(&txn, project_id, new_id).await?;
+                    raw_semantic_id_by_idx.push(new_id);
 
                     for func in &result.semantic.functions {
                         let f = semantic_function::ActiveModel {
@@ -1739,6 +2758,47 @@ impl DatabaseGraph {
                             ..Default::default()
                         };
                         semantic_function::Entity::insert(f).exec(&txn).await?;
+                    }
+
+                    for target_id in target_ids {
+                        let target = semantic_node::Entity::find_by_id(*target_id)
+                            .one(&txn)
+                            .await?
+                            .ok_or_else(|| {
+                                KgError::other(format!(
+                                    "Semantic merge target sem-{} does not exist while writing project '{}'",
+                                    target_id, name
+                                ))
+                            })?;
+
+                        // Project provenance grows on the canonical too:
+                        // every merged-away raw contributed by some project
+                        // surfaces as a project_semantic edge on the canonical.
+                        upsert_project_semantic(&txn, project_id, *target_id).await?;
+
+                        let merge = semantic_merge::ActiveModel {
+                            from_semantic_id: Set(new_id),
+                            to_semantic_id: Set(*target_id),
+                        };
+                        semantic_merge::Entity::insert(merge).exec(&txn).await?;
+
+                        // Only append to description; never touch name or
+                        // definition. The append carries a separator and
+                        // a provenance hint to the source raw.
+                        if let Some(addition) = appended_description {
+                            let trimmed = addition.trim();
+                            if !trimmed.is_empty() {
+                                let new_desc = format!(
+                                    "{}\n\n— additional context (from raw \"{}\"): {}",
+                                    target.description.trim_end(),
+                                    result.semantic.name,
+                                    trimmed,
+                                );
+                                let mut am = target.into_active_model();
+                                am.description = Set(new_desc);
+                                am.update(&txn).await?;
+                            }
+                        }
                     }
 
                     merged_semantic_count += 1;
@@ -1769,11 +2829,19 @@ impl DatabaseGraph {
                 description: Set(result.finding.description.clone()),
                 patterns: Set(result.finding.patterns.clone()),
                 exploits: Set(result.finding.exploits.clone()),
-                project_id: Set(project_id),
                 ..Default::default()
             };
             let inserted = audit_finding::Entity::insert(finding).exec(&txn).await?;
             let finding_id = inserted.last_insert_id;
+            raw_finding_id_by_idx.push(finding_id);
+
+            // Always record the (project, raw finding) provenance edge.
+            project_finding::Entity::insert(project_finding::ActiveModel {
+                project_id: Set(project_id),
+                audit_finding_id: Set(finding_id),
+            })
+            .exec(&txn)
+            .await?;
 
             let finding_category_link = audit_finding_category::ActiveModel {
                 audit_finding_id: Set(finding_id),
@@ -1788,60 +2856,187 @@ impl DatabaseGraph {
                     new_finding_count += 1;
                 }
                 FindingMergeAction::Merge {
-                    target_id,
-                    updated_severity,
-                    updated_root_cause,
-                    updated_description,
-                    updated_patterns,
-                    updated_exploits,
+                    target_ids,
+                    appended_description,
+                    appended_patterns,
+                    appended_exploits,
                 } => {
-                    let target = audit_finding::Entity::find_by_id(*target_id)
-                        .one(&txn)
-                        .await?
-                        .ok_or_else(|| {
-                            KgError::other(format!(
-                                "Finding merge target finding-{} does not exist while writing project '{}'",
-                                target_id, name
-                            ))
-                        })?;
+                    // Multi-target merge: one finding_merge row per
+                    // canonical the agent decided this raw should fold
+                    // into. Canonical's `title`, `severity`, and
+                    // `root_cause` are stable identity and are NEVER
+                    // modified by a merge; only `description`,
+                    // `patterns`, `exploits` may be appended to.
+                    for target_id in target_ids {
+                        let target = audit_finding::Entity::find_by_id(*target_id)
+                            .one(&txn)
+                            .await?
+                            .ok_or_else(|| {
+                                KgError::other(format!(
+                                    "Finding merge target finding-{} does not exist while writing project '{}'",
+                                    target_id, name
+                                ))
+                            })?;
 
-                    let merge = finding_merge::ActiveModel {
-                        from_finding_id: Set(finding_id),
-                        to_finding_id: Set(*target_id),
-                    };
-                    finding_merge::Entity::insert(merge).exec(&txn).await?;
+                        let merge = finding_merge::ActiveModel {
+                            from_finding_id: Set(finding_id),
+                            to_finding_id: Set(*target_id),
+                        };
+                        finding_merge::Entity::insert(merge).exec(&txn).await?;
 
-                    let mut am = target.into_active_model();
-                    if let Some(severity) = updated_severity {
-                        am.severity = Set(*severity);
+                        let already = project_finding::Entity::find()
+                            .filter(project_finding::Column::ProjectId.eq(project_id))
+                            .filter(project_finding::Column::AuditFindingId.eq(*target_id))
+                            .one(&txn)
+                            .await?;
+                        if already.is_none() {
+                            project_finding::Entity::insert(project_finding::ActiveModel {
+                                project_id: Set(project_id),
+                                audit_finding_id: Set(*target_id),
+                            })
+                            .exec(&txn)
+                            .await?;
+                        }
+
+                        // Apply appendages to description / patterns /
+                        // exploits. Never touch title / severity /
+                        // root_cause — those are the canonical's stable
+                        // identity.
+                        let mut touched = false;
+                        let mut am = target.clone().into_active_model();
+                        if let Some(addition) = appended_description {
+                            let trimmed = addition.trim();
+                            if !trimmed.is_empty() {
+                                let merged = format!(
+                                    "{}\n\n— additional context (from raw \"{}\"): {}",
+                                    target.description.trim_end(),
+                                    result.finding.title,
+                                    trimmed,
+                                );
+                                am.description = Set(merged);
+                                touched = true;
+                            }
+                        }
+                        if let Some(addition) = appended_patterns {
+                            let trimmed = addition.trim();
+                            if !trimmed.is_empty() {
+                                let merged = format!(
+                                    "{}\n\n— additional pattern (from raw \"{}\"): {}",
+                                    target.patterns.trim_end(),
+                                    result.finding.title,
+                                    trimmed,
+                                );
+                                am.patterns = Set(merged);
+                                touched = true;
+                            }
+                        }
+                        if let Some(addition) = appended_exploits {
+                            let trimmed = addition.trim();
+                            if !trimmed.is_empty() {
+                                let merged = format!(
+                                    "{}\n\n— additional exploit (from raw \"{}\"): {}",
+                                    target.exploits.trim_end(),
+                                    result.finding.title,
+                                    trimmed,
+                                );
+                                am.exploits = Set(merged);
+                                touched = true;
+                            }
+                        }
+                        if touched {
+                            am.update(&txn).await?;
+                        }
                     }
-                    if let Some(root_cause) = updated_root_cause {
-                        am.root_cause = Set(root_cause.clone());
-                    }
-                    if let Some(description) = updated_description {
-                        am.description = Set(description.clone());
-                    }
-                    if let Some(patterns) = updated_patterns {
-                        am.patterns = Set(patterns.clone());
-                    }
-                    if let Some(exploits) = updated_exploits {
-                        am.exploits = Set(exploits.clone());
-                    }
-                    am.update(&txn).await?;
 
                     merged_finding_count += 1;
                 }
             }
         }
 
+        // ── In-project linking → semantic_finding_link rows ────────
+        // Translate each `(finding_idx, semantic_idx)` edge into a row
+        // attached to the *raw* (just-inserted) finding/semantic ids.
+        // After merge, raw rows still hold their links; the mapper's
+        // raw-chase later surfaces them when the canonical is matched.
+        let mut in_project_link_rows = 0usize;
+        for (finding_idx, semantic_idx) in &in_project_links.edges {
+            let raw_finding_id = *raw_finding_id_by_idx.get(*finding_idx).ok_or_else(|| {
+                KgError::other(format!(
+                    "in-project link references missing finding index {} for project '{}'",
+                    finding_idx, name
+                ))
+            })?;
+            let raw_semantic_id = *raw_semantic_id_by_idx.get(*semantic_idx).ok_or_else(|| {
+                KgError::other(format!(
+                    "in-project link references missing semantic index {} for project '{}'",
+                    semantic_idx, name
+                ))
+            })?;
+            let already = semantic_finding_link::Entity::find()
+                .filter(semantic_finding_link::Column::SemanticNodeId.eq(raw_semantic_id))
+                .filter(semantic_finding_link::Column::AuditFindingId.eq(raw_finding_id))
+                .one(&txn)
+                .await?;
+            if already.is_none() {
+                // In-project links come from the extract pipeline's
+                // co-emission of (finding, semantic) within the same
+                // project. By construction this is the strongest possible
+                // signal — the finding instantiates the semantic in its
+                // originating project. Tag as High; evidence is synthetic
+                // (no LLM rationale exists for these auto-generated edges).
+                semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+                    semantic_node_id: Set(raw_semantic_id),
+                    audit_finding_id: Set(raw_finding_id),
+                    strength: Set(LinkStrength::High),
+                    evidence: Set(
+                        "in-project link: finding and semantic co-emitted by the extract \
+                         pipeline against the same project; finding instantiates the semantic \
+                         in its originating codebase"
+                            .to_string(),
+                    ),
+                })
+                .exec(&txn)
+                .await?;
+                in_project_link_rows += 1;
+            }
+        }
+
+        // NOTE: we do NOT write finding_link_status here. In-project links
+        // are intra-project only; the global-link pass still has to attach
+        // these findings to canonical semantics from OTHER projects. The
+        // global linker writes finding_link_status when it has finished
+        // processing each pending finding.
+
+        // ── pending_semantic → enqueue newly-introduced canonicals ─
+        // Used by the retro-link step in the incremental learn-new-project
+        // CLI. On bootstrap (no prior projects) the rows queue up but no
+        // retro-link is needed yet; subsequent learn-new-project runs read
+        // and clear them.
+        for canonical_id in &new_canonical_semantic_ids {
+            let already = knowdit_kg_model::db::pending_semantic::Entity::find_by_id(*canonical_id)
+                .one(&txn)
+                .await?;
+            if already.is_none() {
+                knowdit_kg_model::db::pending_semantic::Entity::insert(
+                    knowdit_kg_model::db::pending_semantic::ActiveModel {
+                        semantic_node_id: Set(*canonical_id),
+                    },
+                )
+                .exec(&txn)
+                .await?;
+            }
+        }
+
         txn.commit().await?;
         tracing::info!(
-            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings",
+            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings, {} in-project links, {} pending canonical semantics enqueued",
             platform_id.unwrap_or(name),
             new_semantic_count,
             merged_semantic_count,
             new_finding_count,
-            merged_finding_count
+            merged_finding_count,
+            in_project_link_rows,
+            new_canonical_semantic_ids.len(),
         );
         Ok(())
     }
@@ -1859,10 +3054,12 @@ impl DatabaseGraph {
         let nodes = semantic_node::Entity::find().all(&self.db).await?;
         let semantic_functions = semantic_function::Entity::find().all(&self.db).await?;
         let project_categories = project_category::Entity::find().all(&self.db).await?;
+        let project_semantics = project_semantic::Entity::find().all(&self.db).await?;
         let semantic_merges = semantic_merge::Entity::find().all(&self.db).await?;
         let findings = audit_finding::Entity::find().all(&self.db).await?;
         let finding_categories = finding_category::Entity::find().all(&self.db).await?;
         let audit_finding_categories = audit_finding_category::Entity::find().all(&self.db).await?;
+        let project_findings = project_finding::Entity::find().all(&self.db).await?;
         let semantic_finding_links = semantic_finding_link::Entity::find().all(&self.db).await?;
         let finding_merges = finding_merge::Entity::find().all(&self.db).await?;
 
@@ -1873,14 +3070,31 @@ impl DatabaseGraph {
             nodes,
             semantic_functions,
             project_categories,
+            project_semantics,
             semantic_merges,
             findings,
             finding_categories,
             audit_finding_categories,
+            project_findings,
             semantic_finding_links,
             finding_merges,
         })
     }
+}
+
+fn redact_database_url(raw_url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(raw_url) else {
+        return "<unparseable database url>".to_string();
+    };
+
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("");
+    }
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(None);
+    }
+
+    parsed.to_string()
 }
 
 fn build_merge_map<I>(pairs: I) -> HashMap<i32, i32>
@@ -2163,8 +3377,27 @@ mod tests {
             definition: format!("Definition for {}", name),
             description: format!("Description for {}", name),
             category,
-            project_id: 1,
         }
+    }
+
+    #[test]
+    fn redact_database_url_removes_credentials() {
+        assert_eq!(
+            redact_database_url("mysql://alice:secret@example.com:3306/knowdit?ssl-mode=required"),
+            "mysql://example.com:3306/knowdit?ssl-mode=required"
+        );
+        assert_eq!(
+            redact_database_url("mysql://alice@example.com/knowdit"),
+            "mysql://example.com/knowdit"
+        );
+        assert_eq!(
+            redact_database_url("sqlite:///tmp/knowdit.sqlite?mode=rwc"),
+            "sqlite:///tmp/knowdit.sqlite?mode=rwc"
+        );
+        assert_eq!(
+            redact_database_url("not a database url"),
+            "<unparseable database url>"
+        );
     }
 
     #[test]
@@ -2252,7 +3485,7 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         );
     }
 
-    async fn create_test_db() -> (DatabaseGraph, PathBuf) {
+    async fn create_test_db() -> (HistoricalDatabase, PathBuf) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after epoch")
@@ -2263,7 +3496,7 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             unique
         ));
         let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
-        let db = DatabaseGraph::connect(&url)
+        let db = HistoricalDatabase::connect(&url)
             .await
             .expect("test db should connect");
         db.init().await.expect("test db should initialize");
@@ -2295,7 +3528,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             category: Set(DeFiCategory::Dexes),
             definition: Set("Definition".to_string()),
             description: Set("Description".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2369,7 +3601,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             definition: Set("Tracks pools with newline\nand quote ' markers".to_string()),
             description: Set("Backslash \\ and semicolon ; stay intact".to_string()),
             category: Set(DeFiCategory::Dexes),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2384,7 +3615,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description with newline\nand quote ' text".to_string()),
             patterns: Set("Pattern A".to_string()),
             exploits: Set("Exploit B".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2395,6 +3625,8 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
             semantic_node_id: Set(semantic_id),
             audit_finding_id: Set(finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
         })
         .exec(&db.db)
         .await
@@ -2417,7 +3649,7 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             restore_unique
         ));
         let restore_url = format!("sqlite://{}?mode=rwc", restore_path.to_string_lossy());
-        let restored = DatabaseGraph::connect(&restore_url)
+        let restored = HistoricalDatabase::connect(&restore_url)
             .await
             .expect("restore db should connect");
 
@@ -2493,7 +3725,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
                 "JSON snapshot should preserve quotes ' and newlines\nverbatim".to_string(),
             ),
             category: Set(DeFiCategory::CrossChain),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2508,7 +3739,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description with ; and newline\ntext".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2519,6 +3749,8 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
             semantic_node_id: Set(semantic_id),
             audit_finding_id: Set(finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
         })
         .exec(&db.db)
         .await
@@ -2546,7 +3778,7 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             restore_unique
         ));
         let restore_url = format!("sqlite://{}?mode=rwc", restore_path.to_string_lossy());
-        let restored = DatabaseGraph::connect(&restore_url)
+        let restored = HistoricalDatabase::connect(&restore_url)
             .await
             .expect("restore db should connect");
 
@@ -2616,7 +3848,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2631,7 +3862,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2644,7 +3874,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             category: Set(DeFiCategory::Dexes),
             definition: Set("Definition".to_string()),
             description: Set("Description".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2655,6 +3884,8 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
             semantic_node_id: Set(semantic_id),
             audit_finding_id: Set(linked_finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
         })
         .exec(&db.db)
         .await
@@ -2729,7 +3960,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2794,7 +4024,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2809,7 +4038,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2822,7 +4050,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             category: Set(DeFiCategory::Dexes),
             definition: Set("Definition".to_string()),
             description: Set("Description".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2841,6 +4068,8 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
             semantic_node_id: Set(semantic_id),
             audit_finding_id: Set(target_finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
         })
         .exec(&db.db)
         .await
@@ -2884,7 +4113,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2899,7 +4127,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             description: Set("Description".to_string()),
             patterns: Set("Pattern".to_string()),
             exploits: Set("Exploit".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2912,7 +4139,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             category: Set(DeFiCategory::Dexes),
             definition: Set("Definition".to_string()),
             description: Set("Description".to_string()),
-            project_id: Set(project_id),
             ..Default::default()
         })
         .exec(&db.db)
@@ -2931,6 +4157,8 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
             semantic_node_id: Set(semantic_id),
             audit_finding_id: Set(target_finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
         })
         .exec(&db.db)
         .await

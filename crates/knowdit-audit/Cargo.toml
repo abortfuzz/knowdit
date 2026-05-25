@@ -1,0 +1,23 @@
+[package]
+name = "knowdit-audit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+alloy-serde.workspace = true
+color-eyre.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+itertools.workspace = true
+llmy.workspace = true
+schemars.workspace = true
+knowdit-kg.workspace = true
+knowdit-kg-model.workspace = true
+knowdit-repo-model.workspace = true
