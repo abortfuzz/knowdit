@@ -1,6 +1,6 @@
 # Knowdit
 
-![framework](./imgs/framework.png)
+![framework](https://github.com/abortfuzz/knowdit/blob/master/imgs/framework.png?raw=true)
 
 Knowdit (Knowledge + Audit) is an LLM-based auditing framework that rigorously reveals high severity vulnerabilities. On our [evaluation](https://arxiv.org/abs/2603.26270), Knowdit is the only tool exploiting all vulnerabilities leading to severe asset loss.
 
