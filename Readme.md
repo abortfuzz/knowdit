@@ -57,6 +57,12 @@ LLM_DEBUG=debug-conversation.sqlite3
 
 Read [llmy](https://github.com/wtdcode/llmy) for how to dump the conversations from the database.
 
+## Configure `forge`
+
+For various reasons, `knowdit` currently relies on a customized `forge`. Though the canonical `forge` might work, we does not offer any guarantee.
+
+On Linux, if `docker` exists, `knowdit` will automatically pull a docker image for fuzzing while in other cases, please download a copy of `forge` [here](https://github.com/abortfuzz/foundry/releases).
+
 ## Train a Historical Database
 
 The knowdit cli contains several helpers to trains a __Historical Database__. Please note Knowdit _does not_ require the projects to build for training purpose.
