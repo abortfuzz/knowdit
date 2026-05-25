@@ -2,9 +2,9 @@
 
 ![framework](./imgs/framework.png)
 
-Knowdit (Knowledge + Audit) is an LLM based auditing framework that rigorously reveals high severity vulnerabilities. On our [evaluation](https://arxiv.org/abs/2603.26270), Knowdit is the only tool exploiting all vulnerabilities leading to severe asset loss.
+Knowdit (Knowledge + Audit) is an LLM-based auditing framework that rigorously reveals high severity vulnerabilities. On our [evaluation](https://arxiv.org/abs/2603.26270), Knowdit is the only tool exploiting all vulnerabilities leading to severe asset loss.
 
-This repo serves as the artifact of our paper. Please report any issue you found in using Knowdit.
+This repo serves as the artifact of our paper. Please report any issue you find in using Knowdit.
 
 # Install
 
@@ -28,13 +28,13 @@ or we also have [releases](https://github.com/abortfuzz/knowdit/releases) availa
 
 In general, Knowdit summarizes **Semantic-Vulnerability Links** from historical audit projects and saves them to a __Historical Database__. Therefore, for Knowdit to scan any project, you have to "train" such a database firstly.
 
-For given projects under auditing, Knowdit repeatly fetches such links from the __Historical Database__, which you could imagine such links like check lists, and tries to **concretize** the links on the new projects to test if the links suggest vulnerabilities. Then, it spins up `foundry` to verify the vulnerability really exists and uses a LLM based reflector to verdict if the exploit is false positive or not.
+For given projects under auditing, Knowdit repeatedly fetches such links from the __Historical Database__, which you could imagine such links as checklists, and tries to **concretize** the links on the new projects to test if the links suggest vulnerabilities. Then, it spins up `foundry` to verify the vulnerability really exists and uses a LLM based reflector to verdict if the exploit is false positive or not.
 
 ## Configure an LLM
 
 In most cases, Knowdit needs a LLM to work. In general, all of our evaluation and testing is based on OpenAI models, like `gpt-5.1`, `gpt-5-mini`, `gpt-5.4-mini` and `gpt-5.5`. We do not offer any guarantee for performance for other models, while our underlying library [llmy](https://github.com/wtdcode/llmy) indeed supports a wide range of providers.
 
-The most straightforward way to configure a LLM:
+The most straightforward way to configure a LLM endpoint:
 
 ```
 OPENAI_API_URL=...
@@ -59,13 +59,13 @@ Read [llmy](https://github.com/wtdcode/llmy) for how to dump the conversations f
 
 ## Configure `forge`
 
-For various reasons, `knowdit` currently relies on a customized `forge`. Though the canonical `forge` might work, we does not offer any guarantee.
+For various reasons, `knowdit` currently relies on a customized `forge`. Though the canonical `forge` might work, we do not offer any guarantee.
 
 On Linux, if `docker` exists, `knowdit` will automatically pull a docker image for fuzzing while in other cases, please download a copy of `forge` [here](https://github.com/abortfuzz/foundry/releases).
 
 ## Train a Historical Database
 
-The knowdit cli contains several helpers to trains a __Historical Database__. Please note Knowdit _does not_ require the projects to build for training purpose.
+The knowdit cli contains several helpers to train a __Historical Database__. Please note Knowdit _does not_ require the projects to build for the training purpose.
 
 For code4rena projects, learn it by:
 
@@ -79,7 +79,7 @@ For other general projects, learn it by:
 ./target/release/knowdit learn projects --database-url ...
 ```
 
-Please note the __Historcal Database__ could be saved in any relation database like `mysql` and `sqlite3`, as long as it is supported by `sea-orm`.
+Please note the __Historcal Database__ could be saved in any relational database like `mysql` and `sqlite3`, as long as it is supported by `sea-orm`.
 
 Let us know if you would like more project layout to be supported.
 
