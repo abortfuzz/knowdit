@@ -113,7 +113,7 @@ Commands:
 
 # Contact
 
-Interested in any research collaboration? Let [me](https://t.me/lazymio) know.
+Interested in any research collaboration? Would like to beat Knowdit in your paper? Let [me](https://t.me/lazymio) know.
 
 # Cite
 
