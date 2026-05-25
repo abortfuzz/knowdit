@@ -1,0 +1,11 @@
+#!/bin/sh
+# Reject commits that list Claude as a co-author.
+
+commit_msg_file=$1
+
+if grep -qiE '^co-authored-by:.*claude' "$commit_msg_file"; then
+    echo "current repo does not allow co author claude" >&2
+    exit 1
+fi
+
+exit 0
