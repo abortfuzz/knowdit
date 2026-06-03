@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-channel",
  "chrono",
@@ -2858,7 +2858,7 @@ dependencies = [
  "foundry-compilers",
  "foundry-compilers-artifacts",
  "globset",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-agents",
  "knowdit-audit",
  "knowdit-cg-static",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-agents"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "knowdit-kg",
@@ -2897,12 +2897,12 @@ dependencies = [
 
 [[package]]
 name = "knowdit-audit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alloy-serde",
  "async-channel",
  "color-eyre",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg",
  "knowdit-kg-model",
  "knowdit-project",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-cg-static"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "foundry-compilers-artifacts",
@@ -2930,11 +2930,11 @@ dependencies = [
 
 [[package]]
 name = "knowdit-kg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-channel",
  "color-eyre",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg-model",
  "knowdit-project",
  "llmy",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-kg-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "schemars",
@@ -2962,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-project"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "foundry-compilers",
@@ -2982,11 +2982,11 @@ dependencies = [
 
 [[package]]
 name = "knowdit-repo-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "glob",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg-model",
  "ropey",
  "sea-orm",
@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "knowdit-sol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "knowdit-repo-model",
