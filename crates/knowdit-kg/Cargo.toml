@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
 [dependencies]
 sea-orm.workspace = true
 knowdit-kg-model.workspace = true
