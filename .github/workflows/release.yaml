@@ -26,7 +26,7 @@ jobs:
             archive: tar.gz
             use_cross: false
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-latest
             archive: tar.gz
             use_cross: true
           - target: x86_64-apple-darwin
