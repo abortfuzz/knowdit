@@ -1,34 +1,57 @@
-//! `knowdit workflow streamloop` — link-by-link orchestrator that runs
-//! `gen-specs` in round-robin order across extracts and immediately drains
-//! downstream phases (`fuzz` → `reflect` → `regen`) after each link.
+//! `knowdit workflow streamloop` — bounded per-link pipeline.
 //!
-//! Compared to `workflow autoloop`, this keeps the pipeline moving for every
-//! semantic instead of first expanding a giant global spec backlog. The
-//! specification generator already interleaves links by `extract_id`; this
-//! orchestrator preserves that order and, after each committed spec link,
-//! runs the downstream phases until they reach a local fixed point before
-//! advancing to the next link.
+//! The CLI runs the one-shot prologue (project DB / KG / call-graph /
+//! extract-semantics / profile / map-semantics / spec-stream prep) once,
+//! then hands the prepared [`SpecGenStream`] to [`LinkScheduler`]. The
+//! scheduler keeps `--stream-link-concurrency` link pipelines flowing at
+//! once: each link claims one [`PlannedLinkWork`], runs **gen-spec →
+//! (fuzz → reflect → regen)\* → snapshot** independently, and as soon
+//! as one finishes the scheduler advances the next planned link onto
+//! the freed worker slot.
+//!
+//! Resume safety lives at two layers:
+//!
+//! * **Project DB**: every phase (spec gen, fuzz, reflect, regen) already
+//!   has its own skip-if-done logic, so re-running the same streamloop
+//!   never replays committed work.
+//! * **On-disk snapshots**: written atomically per link into
+//!   `<output>/summaries/link_summary_NNNN.json` (4-digit zero-padded
+//!   ordinal for natural `ls` order). The file appears only after
+//!   the link's pipeline converged or hit `--max-inner-cycles-per-batch`.
+//!   A crash mid-link leaves the DB consistent and at most a
+//!   `link_summary_NNNN.json.tmp` file (ignored by the next run).
+//!   Already-snapshotted links short-circuit on resume so we don't
+//!   spend LLM tokens re-running converged work.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use knowdit_audit::harness::solidity::FuzzOutcome;
+use knowdit_audit::harness::forge::ForgeBackend;
+use knowdit_audit::harness::solidity::SolidityHarnessGenerator;
 use knowdit_audit::mapper::MapperOutcome;
-use knowdit_audit::spec::{LinkKey, LinkSpecStatus, SpecGenOptions, SpecificationGenerator};
-use knowdit_repo_model::LoadedValidFinding;
+use knowdit_audit::spec::{
+    LinkKey, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork, SpecGenOptions, SpecGenStream,
+    SpecificationGenerator,
+};
+use knowdit_audit::types::AuditSpecification;
+use knowdit_kg_model::db::semantic_finding_link;
+use knowdit_repo_model::{CodeGenStatus, LoadedValidFinding, RepoDatabase, SemanticMatch};
 use llmy::clap::OptOpenAISetup;
 use llmy::client::client::LLM;
 use serde::Serialize;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use crate::cmd::audit::extract_semantics::{ExtractSemanticsArgs, ExtractSemanticsSharedArgs};
-use crate::cmd::audit::fuzz::{FuzzArgs, FuzzSharedArgs};
-use crate::cmd::audit::fuzz_common::HarnessSharedArgs;
+use crate::cmd::audit::fuzz::FuzzSharedArgs;
+use crate::cmd::audit::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
 use crate::cmd::audit::gen_specs::GenSpecsSharedArgs;
 use crate::cmd::audit::map_semantics::{MapSemanticsArgs, MapSemanticsSharedArgs};
 use crate::cmd::audit::profile::{ProfileArgs, ProfileSharedArgs};
-use crate::cmd::audit::reflect::{ReflectArgs, ReflectSharedArgs, ReflectStats};
-use crate::cmd::audit::regen::{RegenArgs, RegenSharedArgs, RegenStats};
+use crate::cmd::audit::reflect::{ReflectArgs, ReflectSharedArgs};
+use crate::cmd::audit::regen::{RegenArgs, RegenSharedArgs};
 use crate::cmd::solidity::SolidityCallGraphStaticArgs;
 
 #[derive(Args, Debug, Clone)]
@@ -72,37 +95,59 @@ pub struct StreamloopArgs {
     #[command(flatten)]
     pub regen: RegenSharedArgs,
 
-    /// Safety cap on how many fuzz→reflect→regen drain passes may happen
-    /// after one batch of committed links before we advance to the next
-    /// gen-specs batch. Prevents a single noisy batch from monopolizing
-    /// the run forever.
+    /// Safety cap on how many fuzz → reflect → regen lineage passes one
+    /// link's pipeline may run before it is summarized and the worker
+    /// slot is released. Prevents a single pathological spec from
+    /// monopolizing one of the `--stream-link-concurrency` workers.
     #[arg(long, default_value_t = 8)]
     pub max_inner_cycles_per_batch: usize,
 
-    /// Number of links processed in parallel during the `gen-specs` phase
-    /// of the stream. `1` keeps strict round-robin order; higher values
-    /// dispatch a batch of links to a worker pool, commit each outcome as
-    /// it finishes, then drain the downstream phases per link in
-    /// completion order. The shared billing cap, prompt cache, and DB
-    /// writes are already concurrency-safe.
-    #[arg(long, default_value_t = 1)]
-    pub stream_link_concurrency: usize,
+    /// Number of link pipelines kept active at once. Raising this lets
+    /// quick links snapshot while a slow link is still fuzzing in
+    /// another worker. Defaults to `1` when omitted. Typed `Option`
+    /// so `--default-concurrency` can fill it in only when the user
+    /// didn't pass an explicit value.
+    #[arg(long)]
+    pub stream_link_concurrency: Option<usize>,
 
+    /// Fallback concurrency for every sub-phase
+    /// (`--gen-specs-concurrency`, `--fuzz-concurrency`,
+    /// `--reflect-concurrency`, `--regen-concurrency`,
+    /// `--stream-link-concurrency`) when that per-phase flag is left
+    /// unset. Per-phase flags ALWAYS win when present, so it's safe
+    /// to combine `-d 4` with e.g. `--fuzz-concurrency 1` to crank
+    /// everything except fuzz.
+    #[arg(short = 'd', long)]
+    pub default_concurrency: Option<usize>,
+
+    /// llmy cache-key prefix used when each link runs its own
+    /// `fuzz_one_existing_spec`. Defaults to
+    /// `{project_name}-knowdit-fuzz` (same convention as `agentic fuzz`).
+    #[arg(long)]
+    pub stream_fuzz_cache_key: Option<String>,
+
+    /// Output folder for per-link `summary.json` files. The directory
+    /// layout is deterministic on `(extract, historical, finding)`, so
+    /// re-running with the same folder safely resumes — links whose
+    /// `summary.json` is already present are skipped end-to-end.
     #[arg(short, long)]
     pub output_folder: PathBuf,
 
+    /// `rm -rf` the output folder before the run. Off by default so
+    /// resume works.
     #[arg(short, long)]
     pub force_clean_output: bool,
 }
 
 impl StreamloopArgs {
     pub async fn run(mut self, primary_llm: &LLM) -> Result<()> {
-        tracing::info!("[streamloop stage 1/10] preparing output folder");
+        self.apply_default_concurrency();
+        tracing::info!("[streamloop stage 1/8] preparing output folder");
         self.prepare_output_folder()?;
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
         let forge_backend = self.harness.to_forge_backend()?;
 
-        tracing::info!("[streamloop stage 2/10] loading project DB and connecting to KG");
+        tracing::info!("[streamloop stage 2/8] loading project DB and connecting to KG");
         let loaded = self
             .project
             .to_repo_database(self.db.database_path.clone())
@@ -112,15 +157,11 @@ impl StreamloopArgs {
         let repo_root = loaded.spec.root.clone();
         let repo = loaded.repo;
         tracing::info!(
-            "[streamloop stage 2/10] DB ready (project={}, repo_root={})",
+            "[streamloop stage 2/8] DB ready (project={}, repo_root={})",
             spec_name,
             repo_root.display(),
         );
 
-        // Preflight the forge environment NOW, before any LLM stage
-        // touches the project. A misconfigured Hardhat-only project
-        // (no foundry.toml, no forge-std, etc.) fails in seconds
-        // here instead of after 4 hours of extract/map/spec-gen.
         tracing::info!("[streamloop preflight] verifying forge environment");
         self.harness
             .preflight(&forge_backend, &repo_root)
@@ -128,11 +169,11 @@ impl StreamloopArgs {
             .wrap_err("forge environment preflight failed — fix the project's foundry config / forge-std install and re-run")?;
         tracing::info!("[streamloop preflight] forge environment OK");
 
-        tracing::info!("[streamloop stage 3/10] loading call graph");
+        tracing::info!("[streamloop stage 3/8] loading call graph");
         let cg = repo.load_call_graph().await?;
         if cg.contracts.is_empty() {
             tracing::info!(
-                "[streamloop stage 3/10] no contracts in call graph — running static call-graph phase"
+                "[streamloop stage 3/8] no contracts in call graph — running static call-graph phase"
             );
             SolidityCallGraphStaticArgs::update_call_graph(&repo, &repo_root, &self.backend)
                 .await?;
@@ -144,7 +185,7 @@ impl StreamloopArgs {
             ));
         }
         tracing::info!(
-            "[streamloop stage 3/10] call graph ready: {} contract(s)",
+            "[streamloop stage 3/8] call graph ready: {} contract(s)",
             cg.contracts.len()
         );
 
@@ -156,7 +197,7 @@ impl StreamloopArgs {
             .map_err(|err| eyre!("failed to build reflect LLM: {err}"))?
             .unwrap_or_else(|| primary_llm.clone());
 
-        tracing::info!("[streamloop stage 4/10] extracting project semantics");
+        tracing::info!("[streamloop stage 4/8] extracting project semantics");
         let project_data = self.project.to_project_data().await?;
         let semantics = ExtractSemanticsArgs::extract_semantics(
             &repo,
@@ -166,33 +207,27 @@ impl StreamloopArgs {
         )
         .await?;
         tracing::info!(
-            "[streamloop stage 4/10] extracted {} project semantic(s)",
+            "[streamloop stage 4/8] extracted {} project semantic(s)",
             semantics.len()
         );
 
-        // Profile phase: runs once between extract and map-semantics.
-        // Resume-safe via `get_project_profile()` inside the generator
-        // — if a profile is already cached this is a cheap DB read.
-        tracing::info!("[streamloop stage 5/10] building project profile");
+        tracing::info!("[streamloop stage 5/8] building project profile");
         let profile =
             ProfileArgs::profile(&repo, primary_llm, &spec_name, &repo_root, &self.profile).await?;
         tracing::info!(
-            "[streamloop stage 5/10] profile ready: {} subsystem(s), {} core component(s)",
+            "[streamloop stage 5/8] profile ready: {} subsystem(s), {} core component(s)",
             profile.subsystems.len(),
             profile.core_components.len(),
         );
 
-        tracing::info!("[streamloop stage 6/10] mapping extract↔historical semantics");
+        tracing::info!("[streamloop stage 6/8] mapping extract↔historical semantics");
         let match_set = repo.load_semantic_match_results().await?;
         if match_set.matches.is_empty() {
-            tracing::info!(
-                "[streamloop stage 6/10] no mapped semantics yet — running map-semantics phase"
-            );
             let outcome: MapperOutcome =
                 MapSemanticsArgs::map_semantics(&repo, &kg, primary_llm, &spec_name, &self.map)
                     .await?;
             tracing::info!(
-                "[streamloop stage 6/10] mapper finished: {} matched pair(s) (High={}/Medium={}/Low={}), {} unmatched extract(s)",
+                "[streamloop stage 6/8] mapper finished: {} matched pair(s) (H/M/L = {}/{}/{}), {} unmatched",
                 outcome.matched_pair_count,
                 outcome.strength_counts.high,
                 outcome.strength_counts.medium,
@@ -201,216 +236,87 @@ impl StreamloopArgs {
             );
         } else {
             tracing::info!(
-                "[streamloop stage 6/10] mapper output already present: {} matched pair(s) — skipping",
+                "[streamloop stage 6/8] mapper output already present: {} matched pair(s) — skipping",
                 match_set.matches.len(),
             );
         }
 
-        tracing::info!("[streamloop stage 7/10] preparing spec-gen stream");
+        tracing::info!("[streamloop stage 7/8] preparing spec-gen stream");
         let gen_options = build_spec_options(&spec_name, &self.gen_specs);
-        let mut stream = match SpecificationGenerator::new()
+        let stream = match SpecificationGenerator::new()
             .prepare_stream(&repo, &gen_options)
             .await?
         {
-            Some(stream) => stream,
+            Some(s) => s,
             None => {
                 tracing::warn!(
-                    "[streamloop stage 7/10] no pending links after planner/resume filters — nothing to do"
+                    "[streamloop stage 7/8] no pending links after planner/resume filters — nothing to do"
                 );
                 return Ok(());
             }
         };
-        let link_concurrency = self.stream_link_concurrency.max(1);
+
         tracing::info!(
-            "[streamloop stage 7/10] starting main loop: {} link(s) across {} extract(s) and {} historical finding(s), gen-specs concurrency={}",
+            "[streamloop stage 8/8] running bounded link pipeline: {} link(s), active_limit={}",
             stream.total_links(),
-            stream.matched_extract_count(),
-            stream.historical_finding_total(),
-            link_concurrency,
+            self.stream_link_concurrency.unwrap_or(1).max(1),
         );
-
-        let mut completed_specs = 0usize;
-        let mut abandoned_links = 0usize;
-        let mut snapshots_written = 0usize;
-        let mut batch_idx = 0usize;
-
-        while !stream.is_empty() {
-            batch_idx += 1;
-            let total_links = stream.total_links();
-            let processed_before = stream.processed_links();
-            let queued = stream.remaining_links().min(link_concurrency);
-            tracing::info!(
-                "[streamloop stage 8/10 batch #{}] gen-specs: dispatching {} link(s) in parallel ({}/{} processed so far)",
-                batch_idx,
-                queued,
-                processed_before,
-                total_links,
-            );
-            let batch = stream
-                .run_next_batch(&repo, primary_llm, link_concurrency)
-                .await?;
-            if batch.is_empty() {
-                break;
-            }
-            tracing::info!(
-                "[streamloop stage 8/10 batch #{}] gen-specs: batch complete: {} outcome(s) returned ({}/{} processed)",
-                batch_idx,
-                batch.len(),
-                stream.processed_links(),
-                total_links,
-            );
-
-            let mut any_committed = false;
-            for outcome in &batch {
-                match outcome.status {
-                    LinkSpecStatus::Built => completed_specs += outcome.specifications.len(),
-                    LinkSpecStatus::Abandoned => abandoned_links += 1,
-                }
-                if !outcome.specifications.is_empty() {
-                    any_committed = true;
-                }
-            }
-
-            // Drain fuzz → reflect → regen for the whole batch in one go.
-            // Each of these phases is already incremental over pending DB
-            // rows, so calling the unfiltered entry points picks up exactly
-            // the specs this batch just committed (plus any stragglers from
-            // earlier batches) — no per-link pair filter needed.
-            let mut drained = LinkDrainCounts::default();
-            if any_committed {
-                for inner_cycle in 1..=self.max_inner_cycles_per_batch {
-                    tracing::info!(
-                        "[streamloop stage 9/10 batch #{}] drain cycle {}/{}: fuzz",
-                        batch_idx,
-                        inner_cycle,
-                        self.max_inner_cycles_per_batch,
-                    );
-                    let fuzz_outcome: FuzzOutcome = FuzzArgs::fuzz(
-                        &repo,
-                        primary_llm,
-                        &spec_name,
-                        &repo_root,
-                        &self.harness,
-                        &self.fuzz,
-                        &forge_backend,
-                    )
-                    .await?;
-                    tracing::info!(
-                        "[streamloop stage 9/10 batch #{}] drain cycle {}/{}: reflect (fuzz: {} completed / {} violated)",
-                        batch_idx,
-                        inner_cycle,
-                        self.max_inner_cycles_per_batch,
-                        fuzz_outcome.completed_count,
-                        fuzz_outcome.violated_count,
-                    );
-                    let reflect_stats: ReflectStats =
-                        ReflectArgs::reflect(&repo, &reflect_llm, &spec_name, &self.reflect)
-                            .await?;
-                    tracing::info!(
-                        "[streamloop stage 9/10 batch #{}] drain cycle {}/{}: regen (reflect: {} graded)",
-                        batch_idx,
-                        inner_cycle,
-                        self.max_inner_cycles_per_batch,
-                        reflect_stats.graded,
-                    );
-                    let regen_stats: RegenStats = RegenArgs::regen(
-                        &repo,
-                        primary_llm,
-                        &spec_name,
-                        &repo_root,
-                        &self.harness,
-                        &self.regen,
-                        &forge_backend,
-                    )
-                    .await?;
-
-                    drained.fuzz_completed += fuzz_outcome.completed_count;
-                    drained.fuzz_violated += fuzz_outcome.violated_count;
-                    drained.reflect_graded += reflect_stats.graded;
-                    drained.regen_codegen += regen_stats.codegen_regen;
-                    drained.regen_spec += regen_stats.spec_regen;
-
-                    let progressed = fuzz_outcome.completed_count > 0
-                        || reflect_stats.graded > 0
-                        || regen_stats.codegen_regen + regen_stats.spec_regen > 0;
-                    if !progressed {
-                        tracing::info!(
-                            "[streamloop stage 9/10 batch #{}] drain: fixed point reached after {} cycle(s)",
-                            batch_idx,
-                            inner_cycle,
-                        );
-                        break;
-                    }
-                    if inner_cycle == self.max_inner_cycles_per_batch {
-                        tracing::info!(
-                            "[streamloop stage 9/10 batch #{}] drain: hit max_inner_cycles_per_batch={} — moving on",
-                            batch_idx,
-                            self.max_inner_cycles_per_batch,
-                        );
-                    }
-                }
-            } else {
-                tracing::info!(
-                    "[streamloop stage 9/10 batch #{}] drain: batch produced no new specs — skipping",
-                    batch_idx,
-                );
-            }
-
-            let valid_findings = repo.load_valid_findings().await?;
-            for outcome in batch {
-                let link_key = LinkKey {
-                    extract_id: outcome.extract_id,
-                    historical_id: outcome.historical_id,
-                    finding_id: outcome.finding_id,
-                };
-                let link_label = format!(
-                    "extract={} historical={} finding={}",
-                    link_key.extract_id, link_key.historical_id, link_key.finding_id,
-                );
-                if outcome.specifications.is_empty() {
-                    tracing::info!(
-                        "[streamloop stage 10/10 batch #{}] snapshot: skipping {} — no committed specs (status={:?}{})",
-                        batch_idx,
-                        link_label,
-                        outcome.status,
-                        outcome
-                            .abort_reason
-                            .as_deref()
-                            .map(|r| format!(", reason={r}"))
-                            .unwrap_or_default(),
-                    );
-                    continue;
-                }
-                snapshots_written += 1;
-                tracing::info!(
-                    "[streamloop stage 10/10 batch #{}] snapshot: writing link_{:04} for {} ({}/{} links done overall)",
-                    batch_idx,
-                    snapshots_written,
-                    link_label,
-                    stream.processed_links(),
-                    total_links,
-                );
-                write_link_snapshot(
-                    &self.output_folder,
-                    snapshots_written,
-                    &link_key,
-                    stream.processed_links(),
-                    total_links,
-                    &outcome,
-                    &drained,
-                    &valid_findings,
-                )?;
-            }
-        }
-
+        let fuzz_cache_key = self
+            .stream_fuzz_cache_key
+            .clone()
+            .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name));
+        let ctx = Arc::new(LinkContext {
+            repo,
+            primary_llm: primary_llm.clone(),
+            reflect_llm,
+            spec_name,
+            repo_root,
+            forge_backend,
+            harness: self.harness.clone(),
+            fuzz: self.fuzz.clone(),
+            reflect: self.reflect.clone(),
+            regen: self.regen.clone(),
+            output_folder: self.output_folder.clone(),
+            max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
+            fuzz_cache_key,
+        });
+        let scheduler = LinkScheduler {
+            ctx,
+            concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
+        };
+        let stats = scheduler.run(stream).await?;
         tracing::info!(
-            "Streamloop finished: processed_links={} built_specs={} abandoned_links={} remaining_links={}",
-            stream.processed_links(),
-            completed_specs,
-            abandoned_links,
-            stream.remaining_links(),
+            "Streamloop finished: processed_links={} built_specs={} abandoned_links={} skipped_resumed={}",
+            stats.processed_links,
+            stats.built_specs,
+            stats.abandoned_links,
+            stats.skipped_resumed,
         );
         Ok(())
+    }
+
+    /// Fill in every per-phase concurrency knob that the user did
+    /// NOT pass explicitly with `--default-concurrency`. Per-phase
+    /// values that ARE present win — `-d 4 --fuzz-concurrency 1`
+    /// runs fuzz serially with everything else at 4.
+    fn apply_default_concurrency(&mut self) {
+        let Some(d) = self.default_concurrency else {
+            return;
+        };
+        let d = d.max(1);
+        self.gen_specs.gen_specs_concurrency.get_or_insert(d);
+        self.fuzz.fuzz_concurrency.get_or_insert(d);
+        self.reflect.reflect_concurrency.get_or_insert(d);
+        self.regen.regen_concurrency.get_or_insert(d);
+        self.stream_link_concurrency.get_or_insert(d);
+        tracing::info!(
+            "[streamloop] --default-concurrency={d} fills in gen-specs={} fuzz={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
+            self.gen_specs.gen_specs_concurrency.unwrap_or(1),
+            self.fuzz.fuzz_concurrency.unwrap_or(1),
+            self.reflect.reflect_concurrency.unwrap_or(1),
+            self.regen.regen_concurrency.unwrap_or(1),
+            self.stream_link_concurrency.unwrap_or(1),
+        );
     }
 
     fn prepare_output_folder(&self) -> Result<()> {
@@ -455,7 +361,573 @@ fn build_spec_options(project_name: &str, shared: &GenSpecsSharedArgs) -> SpecGe
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+// ---------------------------------------------------------------------------
+// Per-link execution context
+// ---------------------------------------------------------------------------
+
+/// Immutable per-run context shared by every link pipeline. Built once
+/// at the bottom of `StreamloopArgs::run` and cloned via `Arc` into each
+/// worker. Everything a single link needs to drive itself end-to-end —
+/// repo handle, both LLMs, forge backend, the four phase arg-sets, and
+/// the resolved `fuzz_cache_key` — lives here.
+struct LinkContext {
+    repo: RepoDatabase,
+    primary_llm: LLM,
+    reflect_llm: LLM,
+    spec_name: String,
+    repo_root: PathBuf,
+    forge_backend: ForgeBackend,
+    harness: HarnessSharedArgs,
+    fuzz: FuzzSharedArgs,
+    reflect: ReflectSharedArgs,
+    regen: RegenSharedArgs,
+    output_folder: PathBuf,
+    max_inner_cycles: usize,
+    fuzz_cache_key: String,
+}
+
+impl LinkContext {
+    /// Drive one claimed link end-to-end. Short-circuits at the top
+    /// if the per-link snapshot already exists for that ordinal — a
+    /// previous run already converged it, and re-running would burn
+    /// LLM tokens for no new output.
+    async fn run_link(self: Arc<Self>, work: PlannedLinkWork) -> Result<LinkTally> {
+        let key = work.link_key();
+        let ordinal = work.ordinal();
+        let total = work.total_links();
+        let snapshot_path = self.snapshot_path(ordinal);
+
+        if snapshot_path.exists() {
+            tracing::info!(
+                "[streamloop link {ordinal:04}/{total}] resume hit: {} already exists — skipping",
+                snapshot_path.display(),
+            );
+            return Ok(LinkTally::skipped());
+        }
+
+        let link_started = std::time::Instant::now();
+        tracing::info!(
+            "[streamloop link {ordinal:04}/{total}] gen-specs: starting (extract={}, hist={}, find={})",
+            key.extract_id,
+            key.historical_id,
+            key.finding_id,
+        );
+        let gen_specs_started = std::time::Instant::now();
+        let outcome = work.run(&self.repo, &self.primary_llm).await;
+        tracing::info!(
+            "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) committed, {} step(s), {} compaction(s) ({})",
+            snapshot_status(outcome.status),
+            outcome.specifications.len(),
+            outcome.steps,
+            outcome.compact_count,
+            fmt_elapsed(gen_specs_started.elapsed()),
+        );
+
+        let mut drain = LinkDrainCounts::default();
+        let mut code_gen_ids: Vec<i32> = Vec::new();
+        let mut cycles_run = 0usize;
+
+        if !outcome.specifications.is_empty() {
+            let mut active: Vec<i32> = outcome.specification_ids.clone();
+            for cycle in 1..=self.max_inner_cycles {
+                if active.is_empty() {
+                    break;
+                }
+                active = self
+                    .advance_cycle(ordinal, cycle, &active, &mut drain, &mut code_gen_ids)
+                    .await?;
+                cycles_run = cycle;
+            }
+        } else {
+            tracing::info!(
+                "[streamloop link {ordinal:04}/{total}] no committed specs — writing terminal summary",
+            );
+        }
+
+        self.write_snapshot(ordinal, total, &key, &outcome, &drain, &code_gen_ids)?;
+        self.dump_valid_findings().await?;
+        tracing::info!(
+            "[streamloop link {ordinal:04}/{total}] DONE — {} cycle(s), {} codegen(s), \
+             fuzz[completed/violated]={}/{}, reflect_graded={}, regen[codegen/spec]={}/{} ({} total)",
+            cycles_run,
+            code_gen_ids.len(),
+            drain.fuzz_completed,
+            drain.fuzz_violated,
+            drain.reflect_graded,
+            drain.regen_codegen,
+            drain.regen_spec,
+            fmt_elapsed(link_started.elapsed()),
+        );
+        Ok(LinkTally::from_outcome(&outcome))
+    }
+
+    /// Mirror every `valid_finding` row in the DB to disk under
+    /// `<output_folder>/valid_findings/finding_{reflection_id}.json`,
+    /// one file per reflection. Idempotent: existing files are left
+    /// untouched so the dozens of concurrent link tasks don't keep
+    /// re-serializing the same finding. The on-disk shape is
+    /// [`OnDiskFinding`] — the raw [`LoadedValidFinding`] row is
+    /// flattened in, and two extra fields are added on top: the
+    /// parsed [`AuditSpecification`] (so readers don't need a second
+    /// JSON parse) and the `(extract_id, historical_id, finding_id)`
+    /// link triple that produced the spec, with both halves of the
+    /// link's strength / evidence pair (fetched via
+    /// [`RepoDatabase::load_link_for_spec`]). Writes go through
+    /// tmp+rename so a crash mid-write can't leave a half-finding on
+    /// disk.
+    async fn dump_valid_findings(&self) -> Result<()> {
+        let dir = self.output_folder.join("valid_findings");
+        std::fs::create_dir_all(&dir)
+            .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+        let findings = self
+            .repo
+            .load_valid_findings()
+            .await
+            .wrap_err("failed to load valid_findings for streamloop dump")?;
+        for loaded in findings {
+            let final_path = dir.join(format!("finding_{}.json", loaded.reflection_id));
+            if final_path.exists() {
+                continue;
+            }
+            let reflection_id = loaded.reflection_id;
+            let spec_id = loaded.spec_id;
+            let link = self.repo.load_link_for_spec(spec_id).await?;
+            let on_disk = OnDiskFinding::build(loaded, link);
+            let tmp_path = dir.join(format!("finding_{}.json.tmp", reflection_id));
+            let body = serde_json::to_string_pretty(&on_disk)
+                .wrap_err("failed to JSON-serialize valid finding")?;
+            std::fs::write(&tmp_path, body)
+                .wrap_err_with(|| format!("failed to write {}", tmp_path.display()))?;
+            std::fs::rename(&tmp_path, &final_path).wrap_err_with(|| {
+                format!(
+                    "failed to atomically rename {} → {}",
+                    tmp_path.display(),
+                    final_path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// One fuzz → reflect → regen iteration for the link's currently
+    /// active `spec_id`s. Returns the **next round's** active spec ids
+    /// (the regen-produced `child_specs`); empty when the link has
+    /// converged.
+    async fn advance_cycle(
+        &self,
+        ordinal: usize,
+        cycle: usize,
+        active_spec_ids: &[i32],
+        drain: &mut LinkDrainCounts,
+        code_gen_ids: &mut Vec<i32>,
+    ) -> Result<Vec<i32>> {
+        let cycle_started = std::time::Instant::now();
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: starting with {} active spec(s)",
+            self.max_inner_cycles,
+            active_spec_ids.len(),
+        );
+        let produced = self
+            .fuzz_active_specs(ordinal, cycle, active_spec_ids, drain)
+            .await?;
+        code_gen_ids.extend(produced.iter().copied());
+
+        self.reflect_produced_codegens(ordinal, cycle, &produced, drain)
+            .await?;
+
+        let (children, child_code_gens) = self
+            .regen_active_specs(ordinal, cycle, active_spec_ids, drain)
+            .await?;
+        code_gen_ids.extend(child_code_gens);
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: finished — {} spec(s) feed into next cycle ({} total)",
+            self.max_inner_cycles,
+            children.len(),
+            fmt_elapsed(cycle_started.elapsed()),
+        );
+        Ok(children)
+    }
+
+    async fn fuzz_active_specs(
+        &self,
+        ordinal: usize,
+        cycle: usize,
+        active_spec_ids: &[i32],
+        drain: &mut LinkDrainCounts,
+    ) -> Result<Vec<i32>> {
+        let total = active_spec_ids.len();
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: fuzz {} spec(s) starting",
+            self.max_inner_cycles,
+            total,
+        );
+        let phase_started = std::time::Instant::now();
+        let fuzz_options = self.harness.to_fuzz_options(FuzzOptionsBuild {
+            repo_root: self.repo_root.clone(),
+            default_cache_key: self.fuzz_cache_key.clone(),
+            max_specs: 0,
+            concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
+            regenerate: self.fuzz.fuzz_regenerate,
+            via_ir: self.harness.harness_via_ir,
+        });
+        let fuzz_generator = SolidityHarnessGenerator::new(
+            self.harness.harness_mode.into(),
+            &self.repo,
+            &self.primary_llm,
+            &fuzz_options,
+            self.forge_backend.clone(),
+        );
+        let mut produced = Vec::new();
+        let mut completed = 0usize;
+        let mut violated = 0usize;
+        for (idx, &spec_id) in active_spec_ids.iter().enumerate() {
+            let spec_started = std::time::Instant::now();
+            tracing::info!(
+                "[streamloop link {ordinal:04}] cycle {cycle}/{} fuzz {}/{}: starting spec_id={spec_id}",
+                self.max_inner_cycles,
+                idx + 1,
+                total,
+            );
+            if let Some(fuzzed) = fuzz_generator.fuzz_one_existing_spec(spec_id).await? {
+                let was_completed = matches!(fuzzed.status, CodeGenStatus::Completed);
+                drain.fuzz_completed += usize::from(was_completed);
+                drain.fuzz_violated += usize::from(fuzzed.any_violation);
+                completed += usize::from(was_completed);
+                violated += usize::from(fuzzed.any_violation);
+                produced.push(fuzzed.code_gen_id);
+                tracing::info!(
+                    "[streamloop link {ordinal:04}] cycle {cycle}/{} fuzz {}/{} done: spec_id={spec_id} code_gen_id={} status={:?} violated={} ({})",
+                    self.max_inner_cycles,
+                    idx + 1,
+                    total,
+                    fuzzed.code_gen_id,
+                    fuzzed.status,
+                    fuzzed.any_violation,
+                    fmt_elapsed(spec_started.elapsed()),
+                );
+            } else {
+                tracing::info!(
+                    "[streamloop link {ordinal:04}] cycle {cycle}/{} fuzz {}/{} skipped: spec_id={spec_id} (no fuzzable codegen) ({})",
+                    self.max_inner_cycles,
+                    idx + 1,
+                    total,
+                    fmt_elapsed(spec_started.elapsed()),
+                );
+            }
+        }
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: fuzz finished — {}/{} completed, {}/{} violated, produced {} codegen(s) ({})",
+            self.max_inner_cycles,
+            completed,
+            total,
+            violated,
+            total,
+            produced.len(),
+            fmt_elapsed(phase_started.elapsed()),
+        );
+        Ok(produced)
+    }
+
+    async fn reflect_produced_codegens(
+        &self,
+        ordinal: usize,
+        cycle: usize,
+        produced: &[i32],
+        drain: &mut LinkDrainCounts,
+    ) -> Result<()> {
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: reflect {} codegen(s) starting",
+            self.max_inner_cycles,
+            produced.len(),
+        );
+        let phase_started = std::time::Instant::now();
+        let stats = ReflectArgs::reflect_code_gens(
+            &self.repo,
+            &self.reflect_llm,
+            &self.spec_name,
+            &self.repo_root,
+            &self.reflect,
+            produced,
+        )
+        .await?;
+        drain.reflect_graded += stats.graded;
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: reflect finished — \
+             graded={} valid={} expected={} suspect={} incomplete_step={} incomplete_spec={} out_of_scope={} \
+             severity[H/M/L]={}/{}/{} ({})",
+            self.max_inner_cycles,
+            stats.graded,
+            stats.valid_finding,
+            stats.expected_violation,
+            stats.graded.saturating_sub(
+                stats.valid_finding
+                    + stats.expected_violation
+                    + stats.incomplete_step
+                    + stats.incomplete_spec
+                    + stats.out_of_scope
+            ),
+            stats.incomplete_step,
+            stats.incomplete_spec,
+            stats.out_of_scope,
+            stats.severity_high,
+            stats.severity_medium,
+            stats.severity_low,
+            fmt_elapsed(phase_started.elapsed()),
+        );
+        Ok(())
+    }
+
+    async fn regen_active_specs(
+        &self,
+        ordinal: usize,
+        cycle: usize,
+        active_spec_ids: &[i32],
+        drain: &mut LinkDrainCounts,
+    ) -> Result<(Vec<i32>, Vec<i32>)> {
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: regen scoped to {} spec(s) starting",
+            self.max_inner_cycles,
+            active_spec_ids.len(),
+        );
+        let phase_started = std::time::Instant::now();
+        let (stats, child_specs, child_code_gens) = RegenArgs::regen_specs(
+            &self.repo,
+            &self.primary_llm,
+            &self.spec_name,
+            &self.repo_root,
+            &self.harness,
+            &self.regen,
+            &self.forge_backend,
+            active_spec_ids,
+        )
+        .await?;
+        drain.regen_codegen += stats.codegen_regen;
+        drain.regen_spec += stats.spec_regen;
+        tracing::info!(
+            "[streamloop link {ordinal:04}] cycle {cycle}/{}: regen finished — \
+             examined={} codegen_regen={} spec_regen={} escalated_chain_depth={} skipped_no_pair={} skipped_abandoned={} errors={} \
+             → {} child spec(s), {} child codegen(s) ({})",
+            self.max_inner_cycles,
+            stats.examined,
+            stats.codegen_regen,
+            stats.spec_regen,
+            stats.escalated_chain_depth,
+            stats.skipped_no_pair,
+            stats.skipped_abandoned_spec,
+            stats.errors,
+            child_specs.len(),
+            child_code_gens.len(),
+            fmt_elapsed(phase_started.elapsed()),
+        );
+        Ok((child_specs, child_code_gens))
+    }
+
+    /// On-disk path for one link's summary file. Deterministic on
+    /// the link's 1-based queue ordinal — flat layout under
+    /// `summaries/` instead of one directory per `(extract, hist,
+    /// find)` triple. The `(extract, hist, find)` triple itself is
+    /// still serialized INSIDE the JSON for traceability.
+    ///
+    /// 4-digit zero pad makes `ls` sort the files in queue order
+    /// without `sort -n`. With >9999 links the names still sort
+    /// correctly lexicographically — they just grow a digit.
+    fn snapshot_path(&self, ordinal: usize) -> PathBuf {
+        self.output_folder
+            .join("summaries")
+            .join(format!("link_summary_{ordinal:04}.json"))
+    }
+
+    /// Atomic write: serialize →
+    /// `link_summary_NNNN.json.tmp` → `rename` →
+    /// `link_summary_NNNN.json`. A crash mid-write leaves at most a
+    /// `.tmp` file that the next run ignores; presence of the final
+    /// file is the resume marker.
+    fn write_snapshot(
+        &self,
+        ordinal: usize,
+        total: usize,
+        key: &LinkKey,
+        outcome: &LinkSpecOutcome,
+        drain: &LinkDrainCounts,
+        code_gen_ids: &[i32],
+    ) -> Result<()> {
+        let dir = self.output_folder.join("summaries");
+        std::fs::create_dir_all(&dir)
+            .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+        let snapshot = LinkSnapshot {
+            ordinal,
+            total_links: total,
+            extract_id: key.extract_id,
+            historical_id: key.historical_id,
+            finding_id: key.finding_id,
+            status: snapshot_status(outcome.status),
+            committed_spec_count: outcome.specifications.len(),
+            specification_ids: outcome.specification_ids.clone(),
+            code_gen_ids: code_gen_ids.to_vec(),
+            abort_reason: outcome.abort_reason.clone(),
+            steps: outcome.steps,
+            compact_count: outcome.compact_count,
+            drain: drain.clone(),
+        };
+        let final_path = self.snapshot_path(ordinal);
+        let tmp_path = final_path.with_extension("json.tmp");
+        let body = serde_json::to_string_pretty(&snapshot)
+            .wrap_err("failed to JSON-serialize link snapshot")?;
+        std::fs::write(&tmp_path, body)
+            .wrap_err_with(|| format!("failed to write {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &final_path).wrap_err_with(|| {
+            format!(
+                "failed to atomically rename {} → {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// Human-readable elapsed duration via `chrono::Duration`. Picks the
+/// right unit bucket so a 2-minute phase reads as `2m07s` instead of
+/// `127.3s`. Backed by chrono because we already pull it transitively
+/// — keeps the arithmetic on a real duration type.
+///
+/// - sub-minute: `"12.345s"`
+/// - sub-hour:   `"2m07s"`
+/// - longer:     `"1h05m12s"`
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let cd = chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::zero());
+    let h = cd.num_hours();
+    let m = cd.num_minutes() % 60;
+    let s = cd.num_seconds() % 60;
+    let ms = (cd.num_milliseconds() % 1000).abs();
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if cd.num_minutes() > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}.{ms:03}s")
+    }
+}
+
+fn snapshot_status(s: LinkSpecStatus) -> &'static str {
+    match s {
+        LinkSpecStatus::Built => "built",
+        LinkSpecStatus::Abandoned => "abandoned",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+
+/// Bounded-concurrency dispatcher. Pops one `PlannedLinkWork` at a time
+/// from the shared stream, spawns a task per claim, and keeps up to
+/// `concurrency` tasks active via [`JoinSet`]. Stats roll up from each
+/// per-link `LinkTally` as workers finish.
+struct LinkScheduler {
+    ctx: Arc<LinkContext>,
+    concurrency: usize,
+}
+
+impl LinkScheduler {
+    async fn run(self, stream: SpecGenStream) -> Result<StreamStats> {
+        let total = stream.total_links();
+        let stream = Arc::new(Mutex::new(stream));
+        let mut tasks: JoinSet<Result<LinkTally>> = JoinSet::new();
+        let mut stats = StreamStats::default();
+        let mut launched = 0usize;
+
+        loop {
+            while tasks.len() < self.concurrency {
+                let work = stream.lock().await.pop_next_work();
+                let Some(work) = work else { break };
+                let ctx = self.ctx.clone();
+                let ordinal = work.ordinal();
+                tracing::info!(
+                    "[streamloop scheduler] launching link {ordinal:04}/{total} (active={}/{})",
+                    tasks.len() + 1,
+                    self.concurrency,
+                );
+                tasks.spawn(async move { ctx.run_link(work).await });
+                launched += 1;
+            }
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok(Ok(tally)) => stats.merge(tally),
+                Ok(Err(err)) => {
+                    tracing::error!("link pipeline failed: {err:#}");
+                    stats.errors += 1;
+                }
+                Err(join_err) => {
+                    tracing::error!("link pipeline task panicked: {join_err:#}");
+                    stats.errors += 1;
+                }
+            }
+        }
+        tracing::info!(
+            "[streamloop scheduler] launched {launched} link pipeline(s); processed_links={} skipped_resumed={}",
+            stats.processed_links,
+            stats.skipped_resumed,
+        );
+        Ok(stats)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stats / snapshot types
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug)]
+struct StreamStats {
+    processed_links: usize,
+    skipped_resumed: usize,
+    built_specs: usize,
+    abandoned_links: usize,
+    errors: usize,
+}
+
+impl StreamStats {
+    fn merge(&mut self, tally: LinkTally) {
+        match tally {
+            LinkTally::Resumed => {
+                self.skipped_resumed += 1;
+            }
+            LinkTally::Ran { specs, abandoned } => {
+                self.processed_links += 1;
+                self.built_specs += specs;
+                if abandoned {
+                    self.abandoned_links += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Per-link outcome surfaced to the scheduler. `Resumed` = snapshot
+/// already on disk, no LLM work done; `Ran` = link's pipeline actually
+/// executed and `specs` / `abandoned` reflect what the gen-spec phase
+/// produced.
+enum LinkTally {
+    Resumed,
+    Ran { specs: usize, abandoned: bool },
+}
+
+impl LinkTally {
+    fn skipped() -> Self {
+        Self::Resumed
+    }
+
+    fn from_outcome(outcome: &LinkSpecOutcome) -> Self {
+        Self::Ran {
+            specs: outcome.specifications.len(),
+            abandoned: matches!(outcome.status, LinkSpecStatus::Abandoned),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct LinkDrainCounts {
     fuzz_completed: usize,
     fuzz_violated: usize,
@@ -468,74 +940,65 @@ struct LinkDrainCounts {
 struct LinkSnapshot {
     ordinal: usize,
     total_links: usize,
-    link: LinkSnapshotKey,
-    status: String,
+    extract_id: i32,
+    historical_id: i32,
+    finding_id: i32,
+    status: &'static str,
     committed_spec_count: usize,
+    specification_ids: Vec<i32>,
+    code_gen_ids: Vec<i32>,
     abort_reason: Option<String>,
     steps: usize,
     compact_count: usize,
     drain: LinkDrainCounts,
-    valid_finding_total: usize,
 }
 
+/// On-disk shape of a `valid_finding` row written to
+/// `<output_folder>/valid_findings/finding_{reflection_id}.json`.
+///
+/// Wraps the raw [`LoadedValidFinding`] row via `#[serde(flatten)]` so
+/// every column shows up at the top level of the JSON file unchanged,
+/// and adds two fields on top:
+///
+/// * `specification`: the parsed [`AuditSpecification`] (nested
+///   objects in place of `loaded.specification_json`'s escaped
+///   string). `None` only if the column fails to parse — shouldn't
+///   happen, we wrote it ourselves, and the raw string is still
+///   reachable as `specification_json` in the flattened section.
+/// * `link`: the `(extract, historical, finding)` triple from
+///   [`RepoDatabase::load_link_for_spec`], with both halves' strength
+///   / evidence pair.
 #[derive(Debug, Serialize)]
-struct LinkSnapshotKey {
-    extract_id: i32,
-    historical_id: i32,
-    finding_id: i32,
+struct OnDiskFinding {
+    #[serde(flatten)]
+    loaded: LoadedValidFinding,
+    specification: Option<AuditSpecification>,
+    /// The mapper's `semantic_matched` row that ties this spec's
+    /// project extract to the chosen historical semantic. `None` only
+    /// when [`RepoDatabase::load_link_for_spec`] couldn't recover the
+    /// link chain.
+    extract_match: Option<SemanticMatch>,
+    /// The KG-side `semantic_finding_link::Model` that ties the chosen
+    /// historical semantic to the finding.
+    link: Option<semantic_finding_link::Model>,
 }
 
-fn write_link_snapshot(
-    output_folder: &Path,
-    sequence: usize,
-    link_key: &LinkKey,
-    ordinal: usize,
-    total_links: usize,
-    outcome: &knowdit_audit::spec::LinkSpecOutcome,
-    drain: &LinkDrainCounts,
-    valid_findings: &[LoadedValidFinding],
-) -> Result<()> {
-    let dir = output_folder.join(format!("link_{sequence:04}"));
-    std::fs::create_dir_all(&dir)
-        .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
-    let snapshot = LinkSnapshot {
-        ordinal,
-        total_links,
-        link: LinkSnapshotKey {
-            extract_id: link_key.extract_id,
-            historical_id: link_key.historical_id,
-            finding_id: link_key.finding_id,
-        },
-        status: match outcome.status {
-            LinkSpecStatus::Built => "built".to_string(),
-            LinkSpecStatus::Abandoned => "abandoned".to_string(),
-        },
-        committed_spec_count: outcome.specifications.len(),
-        abort_reason: outcome.abort_reason.clone(),
-        steps: outcome.steps,
-        compact_count: outcome.compact_count,
-        drain: LinkDrainCounts {
-            fuzz_completed: drain.fuzz_completed,
-            fuzz_violated: drain.fuzz_violated,
-            reflect_graded: drain.reflect_graded,
-            regen_codegen: drain.regen_codegen,
-            regen_spec: drain.regen_spec,
-        },
-        valid_finding_total: valid_findings.len(),
-    };
-    std::fs::write(
-        dir.join("summary.json"),
-        serde_json::to_string_pretty(&snapshot)?,
-    )?;
-    if !valid_findings.is_empty() {
-        let findings_dir = dir.join("valid_findings");
-        std::fs::create_dir_all(&findings_dir)?;
-        for vf in valid_findings {
-            std::fs::write(
-                findings_dir.join(format!("finding_{}.json", vf.reflection_id)),
-                serde_json::to_string_pretty(vf)?,
-            )?;
+impl OnDiskFinding {
+    fn build(
+        loaded: LoadedValidFinding,
+        pair: Option<(SemanticMatch, semantic_finding_link::Model)>,
+    ) -> Self {
+        let specification =
+            serde_json::from_str::<AuditSpecification>(&loaded.specification_json).ok();
+        let (extract_match, link) = match pair {
+            Some((m, l)) => (Some(m), Some(l)),
+            None => (None, None),
+        };
+        Self {
+            loaded,
+            specification,
+            extract_match,
+            link,
         }
     }
-    Ok(())
 }

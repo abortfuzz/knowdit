@@ -28,7 +28,9 @@
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
 use knowdit_audit::harness::forge::ForgeBackend;
-use knowdit_audit::harness::solidity::{CodegenRegenInMemory, RegenOutcome, SolidityFuzzGenerator};
+use knowdit_audit::harness::solidity::{
+    CodegenRegenInMemory, RegenOutcome, SolidityHarnessGenerator,
+};
 use knowdit_audit::spec::{
     LinkSpecStatus, SpecGenOptions, SpecRegenInMemory, SpecRegenMode, SpecRegenRequest,
     SpecificationGenerator,
@@ -40,6 +42,9 @@ use knowdit_repo_model::{
 };
 use llmy::client::client::LLM;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use super::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
@@ -52,6 +57,16 @@ pub struct RegenSharedArgs {
     /// `0` = consume all.
     #[arg(long = "regen-max-pending", default_value_t = 0)]
     pub regen_max_pending: usize,
+
+    /// Worker count for pending-reflection regen. Each worker consumes
+    /// one pending reflection at a time; rows for the same `spec_id`
+    /// are kept serial inside the queue to avoid harness-file / cache
+    /// collisions on a shared spec. Defaults to `1` (serial) when
+    /// omitted. Typed `Option` so streamloop's
+    /// `--default-concurrency` can tell "user passed it" from
+    /// "default kicked in" — an explicit value wins over `-d`.
+    #[arg(long = "regen-concurrency")]
+    pub regen_concurrency: Option<usize>,
 
     /// Hard ceiling on `code_gen_regen` chain depth. When the chain
     /// hits this depth, the pending reflection is rerouted to spec
@@ -153,11 +168,17 @@ impl RegenArgs {
             repo_root: repo_root.to_path_buf(),
             default_cache_key: format!("{}-knowdit-regen", project_name),
             max_specs: 0,
-            concurrency: 1,
+            concurrency: shared.regen_concurrency.unwrap_or(1).max(1),
             regenerate: false,
             via_ir: harness.harness_via_ir,
         });
-        let fuzz_generator = SolidityFuzzGenerator::new(repo, llm, &fuzz_options, backend.clone());
+        let fuzz_generator = SolidityHarnessGenerator::new(
+            harness.harness_mode.into(),
+            repo,
+            llm,
+            &fuzz_options,
+            backend.clone(),
+        );
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
@@ -173,7 +194,68 @@ impl RegenArgs {
             shared.regen_max_chain_depth,
             shared.spec_regen_patch_threshold,
         );
-        runner.run(shared.regen_max_pending).await
+        runner
+            .dispatch_pending(
+                shared.regen_concurrency.unwrap_or(1).max(1),
+                shared.regen_max_pending,
+            )
+            .await
+    }
+
+    /// Scheduler entry: consume pending regen rows scoped to the supplied
+    /// `spec_ids` and return the newly-created child spec / code_gen ids.
+    /// Used by streaming schedulers to advance one link's lineage without
+    /// blocking on global pending queue completion.
+    pub async fn regen_specs(
+        repo: &RepoDatabase,
+        llm: &LLM,
+        project_name: &str,
+        repo_root: &Path,
+        harness: &HarnessSharedArgs,
+        shared: &RegenSharedArgs,
+        backend: &ForgeBackend,
+        spec_ids: &[i32],
+    ) -> Result<(RegenStats, Vec<i32>, Vec<i32>)> {
+        if spec_ids.is_empty() {
+            return Ok((RegenStats::default(), Vec::new(), Vec::new()));
+        }
+        let fuzz_options = harness.to_fuzz_options(FuzzOptionsBuild {
+            repo_root: repo_root.to_path_buf(),
+            default_cache_key: format!("{}-knowdit-regen", project_name),
+            max_specs: 0,
+            concurrency: shared.regen_concurrency.unwrap_or(1).max(1),
+            regenerate: false,
+            via_ir: harness.harness_via_ir,
+        });
+        let fuzz_generator = SolidityHarnessGenerator::new(
+            harness.harness_mode.into(),
+            repo,
+            llm,
+            &fuzz_options,
+            backend.clone(),
+        );
+        let spec_options = SpecGenOptions {
+            max_agent_steps: shared.spec_regen_max_agent_steps,
+            max_specs_per_link: shared.spec_regen_max_specs_per_link,
+            cache_key: format!("{}-knowdit-spec-regen", project_name),
+            debug_prefix: harness.harness_debug_prefix.clone(),
+            ..SpecGenOptions::default()
+        };
+        let runner = RegenRunner::new(
+            repo.clone(),
+            fuzz_generator,
+            llm.clone(),
+            spec_options,
+            shared.regen_max_chain_depth,
+            shared.spec_regen_patch_threshold,
+        );
+        runner
+            .dispatch_pending_for_specs(
+                shared.regen_concurrency.unwrap_or(1).max(1),
+                shared.regen_max_pending,
+                spec_ids,
+            )
+            .await
     }
 }
 
@@ -189,9 +271,37 @@ pub struct RegenStats {
     pub errors: usize,
 }
 
+impl RegenStats {
+    /// Fold one worker's counters into `self`. Used by the concurrent
+    /// dispatcher to merge per-task `RegenStats` back into the run-wide
+    /// total without holding a `&mut` across the async boundary.
+    fn merge(&mut self, other: Self) {
+        let Self {
+            examined,
+            codegen_regen,
+            spec_regen,
+            escalated_chain_depth,
+            skipped_no_pair,
+            skipped_abandoned_spec,
+            errors,
+        } = other;
+        self.examined += examined;
+        self.codegen_regen += codegen_regen;
+        self.spec_regen += spec_regen;
+        self.escalated_chain_depth += escalated_chain_depth;
+        self.skipped_no_pair += skipped_no_pair;
+        self.skipped_abandoned_spec += skipped_abandoned_spec;
+        self.errors += errors;
+    }
+}
+
+/// Per-invocation handler for one pending reflection. Knows nothing
+/// about concurrency or queue scheduling — that's the dispatcher's
+/// job (see [`dispatch_pending`] / [`dispatch_pending_for_specs`]).
+/// Cheap to wrap in `Arc` and share across worker tasks.
 struct RegenRunner {
     repo: RepoDatabase,
-    fuzz: SolidityFuzzGenerator,
+    fuzz: SolidityHarnessGenerator,
     llm: LLM,
     spec_options: SpecGenOptions,
     max_chain_depth: u32,
@@ -201,7 +311,7 @@ struct RegenRunner {
 impl RegenRunner {
     fn new(
         repo: RepoDatabase,
-        fuzz: SolidityFuzzGenerator,
+        fuzz: SolidityHarnessGenerator,
         llm: LLM,
         spec_options: SpecGenOptions,
         max_chain_depth: u32,
@@ -216,24 +326,156 @@ impl RegenRunner {
             spec_regen_patch_threshold,
         }
     }
+}
 
-    async fn run(&self, max_pending: usize) -> Result<RegenStats> {
-        let mut stats = RegenStats::default();
-        let pending = self.repo.pending_reflections().await?;
-        for r in pending {
-            if max_pending > 0 && stats.examined >= max_pending {
-                break;
-            }
-            stats.examined += 1;
-            if let Err(err) = self.handle(&r, &mut stats).await {
-                tracing::error!(reflection_id = r.reflection_id, "regen failed: {err:#}");
-                stats.errors += 1;
-            }
+/// Apply the `--regen-max-pending` cap in place and log if we dropped
+/// anything. `max_pending == 0` means no cap.
+fn truncate_pending(pending: &mut Vec<PendingReflection>, max_pending: usize, label: &str) {
+    if max_pending > 0 && pending.len() > max_pending {
+        tracing::info!(
+            "regen: truncating {} {} → {} (--regen-max-pending)",
+            label,
+            pending.len(),
+            max_pending
+        );
+        pending.truncate(max_pending);
+    }
+}
+
+impl RegenRunner {
+    /// Drain the *global* pending-reflection queue with a worker pool
+    /// of `concurrency` tasks. `max_pending = 0` means no cap. Consumes
+    /// `self` because the concurrent path needs `Arc::new(self)` to
+    /// share the runner across workers.
+    async fn dispatch_pending(self, concurrency: usize, max_pending: usize) -> Result<RegenStats> {
+        let mut pending = self.repo.pending_reflections().await?;
+        truncate_pending(&mut pending, max_pending, "pending reflections");
+        if pending.is_empty() {
+            return Ok(RegenStats::default());
         }
+        let (stats, _, _) = self.dispatch_inner(pending, concurrency, false).await?;
         Ok(stats)
     }
 
-    async fn handle(&self, r: &PendingReflection, stats: &mut RegenStats) -> Result<()> {
+    /// Drain only the pending reflections whose `spec_id` is in `spec_ids`,
+    /// returning the newly-created `(child_spec_ids, child_code_gen_ids)` so
+    /// the scheduler can advance the next reflect/regen iteration.
+    async fn dispatch_pending_for_specs(
+        self,
+        concurrency: usize,
+        max_pending: usize,
+        spec_ids: &[i32],
+    ) -> Result<(RegenStats, Vec<i32>, Vec<i32>)> {
+        let mut pending = self.repo.pending_reflections_for_specs(spec_ids).await?;
+        truncate_pending(&mut pending, max_pending, "scoped pending reflections");
+        if pending.is_empty() {
+            return Ok((RegenStats::default(), Vec::new(), Vec::new()));
+        }
+        self.dispatch_inner(pending, concurrency, true).await
+    }
+
+    /// Worker-pool dispatch — same shape as `learn::run_full`: workers
+    /// race on an MPMC `async_channel` for pending rows and stream
+    /// each row's `(RegenStats, RegenChildren)` back through an mpsc.
+    /// The main task waits and merges. Per-row independence is the
+    /// caller's invariant.
+    async fn dispatch_inner(
+        self,
+        pending: Vec<PendingReflection>,
+        concurrency: usize,
+        collect_children: bool,
+    ) -> Result<(RegenStats, Vec<i32>, Vec<i32>)> {
+        let total = pending.len();
+        let concurrency = concurrency.max(1).min(total);
+        tracing::info!(
+            total_pending = total,
+            concurrency,
+            "regen: starting pending-reflection dispatch"
+        );
+
+        if concurrency <= 1 {
+            let mut stats = RegenStats::default();
+            let mut child_specs = Vec::new();
+            let mut child_codegens = Vec::new();
+            for r in pending {
+                let (s, c) = self.handle_one(&r).await;
+                stats.merge(s);
+                if collect_children {
+                    child_specs.extend(c.child_spec_ids);
+                    child_codegens.extend(c.child_code_gen_ids);
+                }
+            }
+            return Ok((stats, child_specs, child_codegens));
+        }
+
+        let (tx, rx) = async_channel::bounded::<PendingReflection>(total + 1);
+        let (out_tx, mut out_rx) = mpsc::channel::<(RegenStats, RegenChildren)>(concurrency + 1);
+
+        let me = Arc::new(self);
+        let mut workers = JoinSet::new();
+        for _ in 0..concurrency {
+            let rx = rx.clone();
+            let out = out_tx.clone();
+            let me = me.clone();
+            workers.spawn(async move {
+                while let Ok(r) = rx.recv().await {
+                    let result = me.handle_one(&r).await;
+                    out.send(result)
+                        .await
+                        .expect("regen result receiver kept alive");
+                }
+            });
+        }
+        drop(out_tx);
+        drop(rx);
+
+        for r in pending {
+            tx.send(r).await.expect("workers kept alive");
+        }
+        drop(tx);
+
+        let mut stats = RegenStats::default();
+        let mut child_specs = Vec::new();
+        let mut child_codegens = Vec::new();
+        while let Some((s, c)) = out_rx.recv().await {
+            stats.merge(s);
+            if collect_children {
+                child_specs.extend(c.child_spec_ids);
+                child_codegens.extend(c.child_code_gen_ids);
+            }
+        }
+        while let Some(res) = workers.join_next().await {
+            if let Err(err) = res {
+                tracing::error!("regen worker task failed: {err:#}");
+            }
+        }
+        Ok((stats, child_specs, child_codegens))
+    }
+
+    /// Process one pending row. Errors from the handler are logged and
+    /// turned into `errors += 1` so the caller can keep accumulating
+    /// stats without short-circuiting the whole dispatch.
+    async fn handle_one(&self, r: &PendingReflection) -> (RegenStats, RegenChildren) {
+        let mut stats = RegenStats {
+            examined: 1,
+            ..RegenStats::default()
+        };
+        let children = match self.handle_with_children(r, &mut stats).await {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::error!(reflection_id = r.reflection_id, "regen failed: {err:#}");
+                stats.errors += 1;
+                RegenChildren::default()
+            }
+        };
+        (stats, children)
+    }
+
+    async fn handle_with_children(
+        &self,
+        r: &PendingReflection,
+        stats: &mut RegenStats,
+    ) -> Result<RegenChildren> {
         // Chain-depth escalation. If the codegen chain is already deep,
         // any further codegen retry is unlikely to converge — route the
         // SAME reflection through the spec-regen path instead. We don't
@@ -276,7 +518,11 @@ impl RegenRunner {
         }
     }
 
-    async fn codegen_regen(&self, r: &PendingReflection, stats: &mut RegenStats) -> Result<()> {
+    async fn codegen_regen(
+        &self,
+        r: &PendingReflection,
+        stats: &mut RegenStats,
+    ) -> Result<RegenChildren> {
         let feedback = format_prior_feedback(r);
         let outcome: RegenOutcome = self
             .fuzz
@@ -303,7 +549,10 @@ impl RegenRunner {
             any_violation = outcome.any_violation,
             "codegen regen complete"
         );
-        Ok(())
+        Ok(RegenChildren {
+            child_spec_ids: Vec::new(),
+            child_code_gen_ids: vec![outcome.new_code_gen_id],
+        })
     }
 
     /// Spec regen pathway: produces a new spec + new code_gen for the
@@ -311,7 +560,11 @@ impl RegenRunner {
     /// lineage rows. Crash anywhere in the agent loops below leaves
     /// zero dirty rows because nothing is persisted until the final
     /// `write_full_spec_regen` transaction commits.
-    async fn spec_regen(&self, r: &PendingReflection, stats: &mut RegenStats) -> Result<()> {
+    async fn spec_regen(
+        &self,
+        r: &PendingReflection,
+        stats: &mut RegenStats,
+    ) -> Result<RegenChildren> {
         let SpecRegenContext {
             extract_id,
             finding_id,
@@ -321,7 +574,7 @@ impl RegenRunner {
             Some(ctx) => ctx,
             None => {
                 stats.skipped_no_pair += 1;
-                return Ok(());
+                return Ok(RegenChildren::default());
             }
         };
         let mode = self
@@ -358,7 +611,7 @@ impl RegenRunner {
                     "spec regen agent finished without committing a spec; leaving pending row alone"
                 );
                 stats.skipped_abandoned_spec += 1;
-                return Ok(());
+                return Ok(RegenChildren::default());
             }
         };
 
@@ -412,7 +665,10 @@ impl RegenRunner {
             status = ?codegen.status,
             "spec regen complete"
         );
-        Ok(())
+        Ok(RegenChildren {
+            child_spec_ids: vec![ids.child_spec_id],
+            child_code_gen_ids: vec![ids.child_code_gen_id],
+        })
     }
 
     /// Look up the prior spec for a pending reflection. `None` means
@@ -466,6 +722,17 @@ impl RegenRunner {
             Ok(SpecRegenMode::FromScratch)
         }
     }
+}
+
+/// Children produced by one pending-reflection regen attempt.
+/// `codegen_regen` returns just the new code_gen id; `spec_regen` returns
+/// both the new spec id and its new code_gen id. Used by the scoped
+/// `run_for_specs` scheduler entry so callers can advance the link
+/// lineage they triggered.
+#[derive(Default)]
+struct RegenChildren {
+    child_spec_ids: Vec<i32>,
+    child_code_gen_ids: Vec<i32>,
 }
 
 /// Bundle of state the spec_regen path looks up once at the top of

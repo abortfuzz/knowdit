@@ -18,7 +18,6 @@ pub use knowdit_kg_model::{ExtractedFinding, ExtractedFunction, ExtractedSemanti
 use llmy::client::client::LLM;
 use llmy::client::context::TokenCursor;
 use llmy::client::model::OpenAIModel;
-use llmy::client::resp::RawExtensibleChatCompletionResponse;
 use llmy::tokenizer;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -392,10 +391,10 @@ impl ProjectData {
     fn load_readme(&self) -> Option<String> {
         for name in &["README.md", "readme.md", "Readme.md"] {
             let readme_path = self.root_dir().join(name);
-            if readme_path.exists() {
-                if let Ok(readme) = std::fs::read_to_string(&readme_path) {
-                    return Some(readme);
-                }
+            if readme_path.exists()
+                && let Ok(readme) = std::fs::read_to_string(&readme_path)
+            {
+                return Some(readme);
             }
         }
 
@@ -929,7 +928,7 @@ impl ProjectData {
 // ── Token counting utilities ────────────────────────────────────────
 
 pub(crate) fn count_tokens(model: &OpenAIModel, text: &str) -> usize {
-    tokenizer::count_tokens_for_model(model.model_id_str(), text).unwrap_or_else(|| text.len() / 4)
+    tokenizer::count_tokens_for_model(model.model_id_str(), text).unwrap_or(text.len() / 4)
 }
 
 pub(crate) fn get_context_budget(model: &OpenAIModel) -> usize {

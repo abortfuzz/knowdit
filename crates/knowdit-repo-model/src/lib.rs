@@ -4,6 +4,9 @@ pub mod inheritance;
 pub mod repo;
 pub mod storage;
 
+#[cfg(test)]
+mod tests;
+
 pub use inheritance::{ContractInherit, InheritanceGraph};
 
 pub use repo::{

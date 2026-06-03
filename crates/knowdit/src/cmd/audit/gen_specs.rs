@@ -93,9 +93,12 @@ pub struct GenSpecsSharedArgs {
     #[arg(long = "gen-specs-compact-context-threshold-tokens")]
     pub gen_specs_compact_context_threshold_tokens: Option<usize>,
 
-    /// Number of links processed in parallel. `1` = strict serial.
-    #[arg(long = "gen-specs-concurrency", default_value_t = 1)]
-    pub gen_specs_concurrency: usize,
+    /// Number of links processed in parallel. Defaults to `1`
+    /// (strict serial) when omitted. Typed `Option` so streamloop's
+    /// `--default-concurrency` can tell "user passed it" from
+    /// "default kicked in" — an explicit value wins over `-d`.
+    #[arg(long = "gen-specs-concurrency")]
+    pub gen_specs_concurrency: Option<usize>,
 
     /// Regenerate every spec from scratch. Default is to skip any
     /// `(semantic_id, finding_id)` pair that already has rows.
@@ -210,7 +213,7 @@ impl GenSpecsArgs {
                 .then_some(shared.gen_specs_max_findings_per_historical),
             max_links_per_extract: (shared.gen_specs_max_links_per_extract > 0)
                 .then_some(shared.gen_specs_max_links_per_extract),
-            concurrency: shared.gen_specs_concurrency.max(1),
+            concurrency: shared.gen_specs_concurrency.unwrap_or(1).max(1),
             regenerate: shared.gen_specs_regenerate,
             min_strength: shared.gen_specs_min_strength.into(),
             min_link_strength: shared.gen_specs_min_link_strength.into(),

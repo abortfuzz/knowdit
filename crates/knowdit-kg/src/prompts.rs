@@ -489,6 +489,32 @@ instantiate the semantic's described failure mode?
               of the semantic's specific failure mode
           Most "broad topic match" links land here.
 
+### Cross-domain replay calibration
+
+Replay and stale-authorization bugs often use different product nouns in
+different projects. Do not downgrade a link merely because one side talks
+about one business action and the other side talks about another business
+action. Judge the structural failure instead.
+
+If the finding's root cause is reusable signed authorization, missing or
+ineffective nonce/replay state, replay state rollback, a signature that
+does not bind the full intended action, or repeated consumption of a
+finite permission/resource, and the semantic centrally describes signed,
+delegated, forwarded, session-like, batched, or account-style execution
+with replay/nonce/authorization consumption as an invariant, the link is
+at least Medium. Promote it to High when violating that replay or
+authorization-consumption invariant is the finding's direct exploit path,
+even if the user-facing resource differs.
+
+Likewise, finite budget exhaustion caused by replay is the same failure
+family as repeated use of an allowance, quota, voting weight, session
+permission, or call authorization. Treat the consumed resource as the
+payload of the replay bug; do not classify the edge as merely Low because
+the resource name differs. Still avoid over-promoting generic "uses
+signatures" or "has delegated calls" overlap when the finding does not
+actually violate a replay, nonce, stale-authorization, binding, or
+consumption invariant.
+
 ### Calibrate deliberately
 
 Unwarranted `High` poisons downstream budgets — every future consumer of

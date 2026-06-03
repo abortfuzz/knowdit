@@ -432,8 +432,8 @@ impl SharedStorageEdges {
     async fn record(&self, fid: i32, sv: i32, is_write: bool, description: Option<String>) -> bool {
         let mut g = self.inner.lock().await;
         let key = (fid, sv, is_write);
-        if !g.contains_key(&key) {
-            g.insert(key, description);
+        if let std::collections::hash_map::Entry::Vacant(e) = g.entry(key) {
+            e.insert(description);
             true
         } else {
             // Keep first description if present; ignore further.

@@ -220,7 +220,11 @@ impl DbValidationRepairAction {
 }
 
 impl HistoricalDatabase {
-    /// Connect to the database and return a new handle.
+    /// Connect to the database and return a new handle. Runs the
+    /// in-place schema migrations (currently just
+    /// [`Self::migrate_schema`]) so opening a pre-existing KG that
+    /// predates a column addition silently upgrades to the current
+    /// shape before any read hits a missing column.
     pub async fn connect(url: &str) -> Result<Self> {
         use sea_orm::{Database, DatabaseBackend};
         tracing::info!(database_url = %redact_database_url(url), "Connecting to database");
@@ -229,15 +233,35 @@ impl HistoricalDatabase {
             db.execute_unprepared("PRAGMA journal_mode=WAL;").await?;
             db.execute_unprepared("PRAGMA foreign_keys=ON;").await?;
         }
-        Ok(Self { db })
+        let me = Self { db };
+        me.migrate_schema().await?;
+        Ok(me)
     }
 
     // ── Schema / init ───────────────────────────────────────────────
 
     pub async fn init(&self) -> Result<()> {
         self.create_tables(&self.db, true).await?;
+        // `connect()` also runs this, so on a fresh `init-db` against
+        // a pre-existing file this is a no-op (the columns exist) and
+        // on a brand-new file it's also a no-op (create_tables just
+        // built the table with the right shape). Keeping the call
+        // here documents intent: every DB lifecycle path runs the
+        // schema migrations.
+        self.migrate_schema().await?;
         self.seed_categories().await?;
         self.seed_finding_categories().await?;
+        Ok(())
+    }
+
+    /// Apply every idempotent in-place schema migration this crate
+    /// knows about. SQLite-only; no-op on other backends since
+    /// production deployments stick to SQLite for the historical KG.
+    /// Each individual migration is itself idempotent — calling
+    /// `migrate_schema` repeatedly is cheap (a few PRAGMA introspect
+    /// queries) and safe.
+    pub async fn migrate_schema(&self) -> Result<()> {
+        self.migrate_link_strength_columns().await?;
         Ok(())
     }
 
@@ -1760,13 +1784,13 @@ impl HistoricalDatabase {
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<Vec<_>>();
-            if categories.is_empty() {
-                if let Some(pid) = project_id_by_finding.get(&finding_id) {
-                    categories = project_categories_by_project
-                        .get(pid)
-                        .cloned()
-                        .unwrap_or_default();
-                }
+            if categories.is_empty()
+                && let Some(pid) = project_id_by_finding.get(&finding_id)
+            {
+                categories = project_categories_by_project
+                    .get(pid)
+                    .cloned()
+                    .unwrap_or_default();
             }
             if categories.is_empty() {
                 categories.push(DeFiCategory::Others);
@@ -2292,6 +2316,12 @@ impl HistoricalDatabase {
     }
 
     pub async fn clear_finding_link_progress(&self) -> Result<(u64, u64)> {
+        // Pre-v??? KGs (created before the Low/Medium/High rollout)
+        // are missing `semantic_finding_link.strength` and `.evidence`.
+        // Bringing them up to current schema BEFORE the relink (rather
+        // than after) lets `delete_many()` succeed even if seaorm
+        // wants to introspect every column for the DELETE.
+        self.migrate_link_strength_columns().await?;
         let txn = self.db.begin().await?;
 
         let deleted_links = semantic_finding_link::Entity::delete_many()
@@ -2303,6 +2333,81 @@ impl HistoricalDatabase {
 
         txn.commit().await?;
         Ok((deleted_links.rows_affected, deleted_statuses.rows_affected))
+    }
+
+    /// Idempotent migration: bring `semantic_finding_link` up to the
+    /// current schema by adding the `strength` and `evidence` columns
+    /// (introduced with the Low/Medium/High `LinkStrength` rollout) if
+    /// they aren't already present. SQLite-only — every existing
+    /// historical KG lives in SQLite, and `ALTER TABLE ... ADD COLUMN`
+    /// is the cheapest way to bolt the new columns onto pre-existing
+    /// tables without a full data migration.
+    ///
+    /// Safe to call from any DB lifecycle point: skips entirely on
+    /// non-SQLite backends or when both columns already exist. New DBs
+    /// created via `init()` get the columns directly through
+    /// `create_tables`, so this method is a no-op for them.
+    pub async fn migrate_link_strength_columns(&self) -> Result<()> {
+        if self.db.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+        use sea_orm::{FromQueryResult, Statement};
+        #[derive(FromQueryResult)]
+        struct ColInfo {
+            name: String,
+        }
+        let columns = ColInfo::find_by_statement(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "PRAGMA table_info(semantic_finding_link)".to_string(),
+        ))
+        .all(&self.db)
+        .await?;
+        if columns.is_empty() {
+            // Table doesn't exist yet — `init()` will create it with
+            // the right columns. Nothing to migrate.
+            return Ok(());
+        }
+        let has_strength = columns.iter().any(|c| c.name == "strength");
+        let has_evidence = columns.iter().any(|c| c.name == "evidence");
+        if has_strength && has_evidence {
+            return Ok(());
+        }
+        tracing::warn!(
+            has_strength,
+            has_evidence,
+            "semantic_finding_link is missing strength/evidence columns; \
+             migrating in place (LinkStrength rollout backfill)"
+        );
+        if !has_strength {
+            // Default 'Medium' is a placeholder for any rows that
+            // survive the migration; callers usually pair this with
+            // `clear_finding_link_progress` so all rows get wiped
+            // and re-graded.
+            self.db
+                .execute_unprepared(
+                    "ALTER TABLE semantic_finding_link \
+                     ADD COLUMN strength TEXT NOT NULL DEFAULT 'Medium'",
+                )
+                .await?;
+        }
+        if !has_evidence {
+            self.db
+                .execute_unprepared(
+                    "ALTER TABLE semantic_finding_link \
+                     ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",
+                )
+                .await?;
+        }
+        // Re-create the strength index. CREATE INDEX IF NOT EXISTS is
+        // safe even when create_tables ran earlier.
+        self.db
+            .execute_unprepared(
+                "CREATE INDEX IF NOT EXISTS \
+                 \"idx-semantic_finding_link-strength\" \
+                 ON semantic_finding_link(strength)",
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn validate_db(&self, repair: bool) -> Result<DbValidationReport> {

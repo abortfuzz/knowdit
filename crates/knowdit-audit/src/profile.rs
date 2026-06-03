@@ -89,19 +89,18 @@ impl ProjectProfileGenerator {
         llm: &LLM,
         repo_root: &Path,
     ) -> Result<ProjectProfile> {
-        if !self.options.regenerate {
-            if let Some(existing) = repo
+        if !self.options.regenerate
+            && let Some(existing) = repo
                 .get_project_profile()
                 .await
                 .wrap_err("profile-gen: failed to query existing project_profile row")?
-            {
-                tracing::info!(
-                    "ProjectProfileGenerator: reusing existing profile ({} subsystems, {} components)",
-                    existing.subsystems.len(),
-                    existing.core_components.len()
-                );
-                return Ok(existing);
-            }
+        {
+            tracing::info!(
+                "ProjectProfileGenerator: reusing existing profile ({} subsystems, {} components)",
+                existing.subsystems.len(),
+                existing.core_components.len()
+            );
+            return Ok(existing);
         }
 
         let attempt = ProfileAttemptHandle::new();

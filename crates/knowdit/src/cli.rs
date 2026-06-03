@@ -42,7 +42,7 @@ pub struct ProjectArgs {
 pub struct DatabaseArgs {
     /// Per-project SQLite path. Defaults to
     /// `<project_root>/knowdit.sqlite3`.
-    #[arg(long, env = "REPO_DATABASE_PATH")]
+    #[arg(short = 'r', long, env = "REPO_DATABASE_PATH")]
     pub database_path: Option<PathBuf>,
 }
 
@@ -71,7 +71,7 @@ pub struct FoundryCliOptions {
 
     /// Enable solc's IR-based codegen (`viaIR = true`). Required by
     /// projects that hit "Stack too deep" with the legacy codegen.
-    #[arg(long = "via-ir")]
+    #[arg(short = 'i', long = "via-ir")]
     pub via_ir: bool,
 
     /// Override the contracts source dir (relative to the project

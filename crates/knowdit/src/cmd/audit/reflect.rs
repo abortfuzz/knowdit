@@ -21,6 +21,7 @@
 //! `has_reflection(run_id)` skip + llmy cache hits.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use clap::Args;
@@ -90,9 +91,12 @@ pub struct ReflectSharedArgs {
     /// pipeline runs as its own task; with `>1` they execute in
     /// parallel against the shared `GraderPair` (one ProjectIndex +
     /// one LLM client). DB writes are atomic per-run, so concurrent
-    /// workers don't race. Defaults to `1` (serial).
-    #[arg(long = "reflect-concurrency", default_value_t = 1)]
-    pub reflect_concurrency: usize,
+    /// workers don't race. Defaults to `1` (serial) when omitted.
+    /// Typed `Option` so streamloop's `--default-concurrency` can
+    /// tell "user passed it" from "default kicked in" — an explicit
+    /// value wins over `-d`.
+    #[arg(long = "reflect-concurrency")]
+    pub reflect_concurrency: Option<usize>,
 }
 
 #[derive(Args)]
@@ -115,7 +119,7 @@ impl ReflectArgs {
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let stats = Self::reflect(&repo, llm, &spec.name, &self.shared).await?;
+        let stats = Self::reflect(&repo, llm, &spec.name, &spec.root, &self.shared).await?;
         println!(
             "Reflect finished: examined={} violated_runs={} graded={} valid_finding={} expected={} out_of_scope={} incomplete_step={} incomplete_spec={} severity_high={} severity_medium={} severity_low={} skipped_resumed={} skipped_non_completed={} skipped_unviolated={} verdict_errors={} severity_errors={}",
             stats.examined,
@@ -148,6 +152,7 @@ impl ReflectArgs {
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
+        repo_root: &Path,
         shared: &ReflectSharedArgs,
     ) -> Result<ReflectStats> {
         if shared.allow_redo_reflect {
@@ -171,13 +176,52 @@ impl ReflectArgs {
         };
         let runner = ReflectionRunner::load(
             repo.clone(),
+            repo_root,
             llm.clone(),
             grader_options,
             shared.reflect_skip_grader,
-            shared.reflect_concurrency,
+            shared.reflect_concurrency.unwrap_or(1).max(1),
         )
         .await?;
         runner.run(shared.reflect_max_runs).await
+    }
+
+    /// Scheduler entry: reflect only violated runs whose owning
+    /// `code_gen.id` is in `code_gen_ids`. This is the streaming
+    /// counterpart to [`Self::reflect`] — it skips the global pending
+    /// barrier so a scheduler can advance one link's lineage without
+    /// waiting for unrelated work to finish grading.
+    pub async fn reflect_code_gens(
+        repo: &RepoDatabase,
+        llm: &LLM,
+        project_name: &str,
+        repo_root: &Path,
+        shared: &ReflectSharedArgs,
+        code_gen_ids: &[i32],
+    ) -> Result<ReflectStats> {
+        if code_gen_ids.is_empty() {
+            return Ok(ReflectStats::default());
+        }
+        let grader_options = GraderOptions {
+            max_agent_steps: shared.grader_max_agent_steps,
+            compact_context_threshold_tokens: shared.grader_compact_context_threshold_tokens,
+            cache_key: shared
+                .reflect_cache_key
+                .clone()
+                .unwrap_or_else(|| format!("{}-knowdit-grader", project_name)),
+            debug_prefix: shared.reflect_debug_prefix.clone(),
+            llm_settings: None,
+        };
+        let runner = ReflectionRunner::load(
+            repo.clone(),
+            repo_root,
+            llm.clone(),
+            grader_options,
+            shared.reflect_skip_grader,
+            shared.reflect_concurrency.unwrap_or(1).max(1),
+        )
+        .await?;
+        runner.run_code_gens(code_gen_ids).await
     }
 }
 
@@ -272,6 +316,7 @@ struct ReflectionRunner {
 impl ReflectionRunner {
     async fn load(
         repo: RepoDatabase,
+        repo_root: &Path,
         llm: llmy::client::client::LLM,
         grader_options: GraderOptions,
         skip_grader: bool,
@@ -283,7 +328,7 @@ impl ReflectionRunner {
         let graders = if skip_grader {
             None
         } else {
-            Some(GraderPair::new(&repo, &llm, grader_options).await?)
+            Some(GraderPair::new(&repo, repo_root, &llm, grader_options).await?)
         };
         Ok(Self {
             repo,
@@ -342,7 +387,7 @@ impl ReflectionRunner {
         Ok(queue)
     }
 
-    async fn run(self: Self, max_runs: usize) -> Result<ReflectStats> {
+    async fn run(self, max_runs: usize) -> Result<ReflectStats> {
         let mut stats = ReflectStats::default();
         let queue = self.collect_work(max_runs, &mut stats).await?;
         let total = queue.len();
@@ -400,6 +445,111 @@ impl ReflectionRunner {
             let _ = h.await;
         }
         Ok(stats)
+    }
+
+    /// Streaming-scheduler entry: walk the runner's preloaded `code_gens`,
+    /// keep only the ones whose id appears in `code_gen_ids`, and run the
+    /// same concurrent grader dispatch as [`Self::run`]. Skip filters
+    /// (`skipped_non_completed` / `skipped_unviolated` / `skipped_resumed`)
+    /// still fire so callers can tell why scoped work was skipped.
+    async fn run_code_gens(self, code_gen_ids: &[i32]) -> Result<ReflectStats> {
+        let wanted: std::collections::HashSet<i32> = code_gen_ids.iter().copied().collect();
+        let mut stats = ReflectStats::default();
+        let queue = self.collect_work_for_code_gens(&wanted, &mut stats).await?;
+        let total = queue.len();
+        if total == 0 {
+            return Ok(stats);
+        }
+        let concurrency = self.concurrency.min(total);
+        tracing::info!(
+            total_to_grade = total,
+            concurrency,
+            "reflect: starting targeted grader dispatch"
+        );
+
+        let me = Arc::new(self);
+        if concurrency <= 1 {
+            for item in queue {
+                me.reflect_one_logged(&item, &mut stats).await;
+            }
+            return Ok(stats);
+        }
+
+        let queue: Arc<tokio::sync::Mutex<Vec<WorkItem>>> =
+            Arc::new(tokio::sync::Mutex::new(queue.into_iter().rev().collect()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ReflectOutcome>(concurrency * 2);
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let tx = tx.clone();
+            let me = me.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let next = {
+                        let mut q = queue.lock().await;
+                        q.pop()
+                    };
+                    let Some(item) = next else {
+                        break;
+                    };
+                    let outcome = me.reflect_one_for_pool(&item).await;
+                    if tx.send(outcome).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(tx);
+        while let Some(outcome) = rx.recv().await {
+            merge_outcome(&mut stats, outcome);
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        Ok(stats)
+    }
+
+    async fn collect_work_for_code_gens(
+        &self,
+        wanted: &std::collections::HashSet<i32>,
+        stats: &mut ReflectStats,
+    ) -> Result<Vec<WorkItem>> {
+        let mut queue = Vec::new();
+        for code_gen in &self.code_gens {
+            if !wanted.contains(&code_gen.id) {
+                continue;
+            }
+            if !matches!(code_gen.core.status, CodeGenStatus::Completed) {
+                stats.skipped_non_completed += 1;
+                continue;
+            }
+            let runs = self.repo.load_runs_for_code_gen(code_gen.id).await?;
+            for run in runs {
+                if !run.violated {
+                    stats.skipped_unviolated += 1;
+                    continue;
+                }
+                stats.violated_runs += 1;
+                if self.repo.has_reflection(run.id).await? {
+                    stats.skipped_resumed += 1;
+                    continue;
+                }
+                if self.graders.is_none() {
+                    tracing::debug!(
+                        run_id = run.id,
+                        code_id = code_gen.id,
+                        spec_id = code_gen.core.spec_id,
+                        "violated run; skip_grader=true, no row written"
+                    );
+                    continue;
+                }
+                queue.push(WorkItem {
+                    code_gen: code_gen.clone(),
+                    run,
+                });
+            }
+        }
+        Ok(queue)
     }
 
     /// Serial-path wrapper: drive `reflect_one` against the live
@@ -527,6 +677,10 @@ impl ReflectionRunner {
             run: run_summary_of(run),
             coverage_summary,
             prior_incomplete_step_count,
+            // `VerdictGrader::grade` fills the cached profile in if
+            // this is `None`; we leave it `None` here so callers
+            // without DB access don't need to load it themselves.
+            project_profile: None,
         })
     }
 

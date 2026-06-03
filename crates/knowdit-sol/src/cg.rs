@@ -267,12 +267,12 @@ pub fn extract_contracts_functions(
                 let mut cursor = body.walk();
                 let body_children = body.named_children(&mut cursor).collect::<Vec<_>>();
                 for child in body_children {
-                    let Some(callable_kind) = callable_kind_from_node(child, &source) else {
+                    let Some(callable_kind) = callable_kind_from_node(child, source) else {
                         continue;
                     };
-                    let callable_name = callable_name(child, callable_kind, &source)?;
-                    let args = callable_args(child, &source)?;
-                    let chunk = node_chunk(child, &source)?;
+                    let callable_name = callable_name(child, callable_kind, source)?;
+                    let args = callable_args(child, source)?;
+                    let chunk = node_chunk(child, source)?;
                     functions.push(ExtractedCallable {
                         id: next_function_id,
                         contract_id,
@@ -293,7 +293,7 @@ pub fn extract_contracts_functions(
                 name,
                 kind: contract_kind,
                 relative_file_path: relative_file_path.clone(),
-                chunk: node_chunk(contract_node, &source)?,
+                chunk: node_chunk(contract_node, source)?,
                 functions,
             });
         }

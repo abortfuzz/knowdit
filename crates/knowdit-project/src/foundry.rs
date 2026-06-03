@@ -607,20 +607,19 @@ fn collect_nested_remappings(sub_abs: &Path) -> Result<Vec<Remapping>> {
     // `<sub_name>/=<sub>/<src>/` so imports of the form
     // `<sub_name>/Foo.sol` resolve.
     let sub_src = toml.select("default").src.clone();
-    if let Some(src) = sub_src {
-        if !matches!(src.as_str(), "src" | "contracts" | "lib") {
-            if let Some(name) = sub_abs.file_name().and_then(|s| s.to_str()) {
-                let mut path = sub_abs.join(&src).to_string_lossy().into_owned();
-                if !path.ends_with('/') {
-                    path.push('/');
-                }
-                out.push(Remapping {
-                    context: None,
-                    name: format!("{name}/"),
-                    path,
-                });
-            }
+    if let Some(src) = sub_src
+        && !matches!(src.as_str(), "src" | "contracts" | "lib")
+        && let Some(name) = sub_abs.file_name().and_then(|s| s.to_str())
+    {
+        let mut path = sub_abs.join(&src).to_string_lossy().into_owned();
+        if !path.ends_with('/') {
+            path.push('/');
         }
+        out.push(Remapping {
+            context: None,
+            name: format!("{name}/"),
+            path,
+        });
     }
 
     Ok(out)
@@ -661,24 +660,28 @@ fn absolutize_remapping_path(base: &Path, raw: &str) -> String {
 /// legacy `[default]` block, and finally an empty profile.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct FoundryToml {
+pub struct FoundryToml {
     /// Legacy `[default]` block.
-    default: FoundryProfile,
+    pub default: FoundryProfile,
     /// All `[profile.<name>]` blocks. Unknown names are not an error
     /// — `select` decides what to do.
-    profile: BTreeMap<String, FoundryProfile>,
+    pub profile: BTreeMap<String, FoundryProfile>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default)]
-struct FoundryProfile {
+pub struct FoundryProfile {
     /// `src = "src"` — the contracts root.
-    src: Option<String>,
+    pub src: Option<String>,
     /// `libs = ["lib"]` — vendored dep dirs.
     #[allow(dead_code)]
-    libs: Vec<String>,
+    pub libs: Vec<String>,
     /// `remappings = ["@oz/=lib/openzeppelin-contracts/contracts/", ...]`.
-    remappings: Vec<String>,
+    pub remappings: Vec<String>,
+    /// `test = "test"` — Foundry test root. Consumers pick which
+    /// profile to read from (audit currently uses the conventional
+    /// default).
+    pub test: Option<String>,
 }
 
 impl FoundryToml {

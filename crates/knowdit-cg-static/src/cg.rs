@@ -323,12 +323,12 @@ impl<'a> CallGraphBuilder<'a> {
             },
         );
         self.function_id_by_node.insert(node_id, function_id);
-        if matches!(function.kind(), FunctionKind::Constructor) {
-            if let Some(scope) = function.scope {
-                self.constructor_node_by_contract
-                    .entry(scope as NodeID)
-                    .or_insert(node_id);
-            }
+        if matches!(function.kind(), FunctionKind::Constructor)
+            && let Some(scope) = function.scope
+        {
+            self.constructor_node_by_contract
+                .entry(scope as NodeID)
+                .or_insert(node_id);
         }
         self.callable_ast_by_node
             .insert(node_id, CallableAst::Function(Box::new(function.clone())));

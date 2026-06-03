@@ -29,6 +29,7 @@
 pub mod agent_loop;
 pub mod coverage_audit;
 pub mod grader;
+mod prompt;
 pub mod runtime_audit;
 pub mod severity_grader;
 
@@ -51,10 +52,19 @@ pub struct GraderPair {
 }
 
 impl GraderPair {
-    pub async fn new(repo: &RepoDatabase, llm: &LLM, options: GraderOptions) -> Result<Self> {
-        let verdict = VerdictGrader::new(repo, llm, options.clone()).await?;
-        let severity =
-            SeverityGrader::new_with_index(llm, verdict.project_index().clone(), options);
+    pub async fn new(
+        repo: &RepoDatabase,
+        repo_root: &std::path::Path,
+        llm: &LLM,
+        options: GraderOptions,
+    ) -> Result<Self> {
+        let verdict = VerdictGrader::new(repo, repo_root, llm, options.clone()).await?;
+        let severity = SeverityGrader::new_with_index(
+            llm,
+            repo_root,
+            verdict.project_index().clone(),
+            options,
+        );
         Ok(Self { verdict, severity })
     }
 }

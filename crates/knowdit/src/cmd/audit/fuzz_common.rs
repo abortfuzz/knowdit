@@ -18,7 +18,30 @@ use std::time::Duration;
 use clap::Args;
 use color_eyre::eyre::Result;
 use knowdit_audit::harness::forge::{ForgeBackend, ForgeRunner};
-use knowdit_audit::harness::solidity::FuzzOptions;
+use knowdit_audit::harness::solidity::{FuzzOptions, HarnessKind};
+
+/// CLI mirror of [`HarnessKind`] (kebab-cased on the command line).
+/// Two-variant `clap::ValueEnum` that we map to the audit-crate enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum HarnessModeCli {
+    /// Handler+invariant: Foundry handler contract + invariant test;
+    /// fuzzer drives input sequences (existing default).
+    Handler,
+    /// Deterministic PoC: agent writes a `test_…()` that reproduces
+    /// the attack deterministically and asserts post-attack with
+    /// `KNOWDIT_POST_ATTACK_REACHED:`.
+    Poc,
+}
+
+impl From<HarnessModeCli> for HarnessKind {
+    fn from(v: HarnessModeCli) -> Self {
+        match v {
+            HarnessModeCli::Handler => Self::Handler,
+            HarnessModeCli::Poc => Self::Poc,
+        }
+    }
+}
 
 /// Forge backend + harness-codegen-agent knobs. Flattened by
 /// `agentic fuzz`, `agentic regen`, and `workflow autoloop`. All
@@ -41,7 +64,7 @@ pub struct HarnessSharedArgs {
     /// cap — see `--forge-mem-cap-gb`). When unset (default), knowdit
     /// uses `docker run --rm <docker-image> forge ...` so a
     /// memory-runaway forge can't OOM the host.
-    #[arg(long = "forge-bin")]
+    #[arg(short = 'b', long = "forge-bin")]
     pub forge_bin: Option<PathBuf>,
 
     /// Docker image used when `--forge-bin` is not provided. The image
@@ -115,6 +138,20 @@ pub struct HarnessSharedArgs {
     /// `--via-ir` so the user doesn't have to pass it twice.
     #[arg(long = "harness-via-ir", default_value_t = false)]
     pub harness_via_ir: bool,
+
+    /// Pick which test-authoring mode the harness agent runs.
+    /// `handler` (default) is the Foundry handler + invariant pipeline;
+    /// `poc` writes a deterministic `test_…()` that asserts with
+    /// `KNOWDIT_POST_ATTACK_REACHED:`. The two modes are not mixed —
+    /// each invocation is one or the other.
+    #[arg(short = 'm', long = "harness-mode", value_enum, default_value_t = HarnessModeCli::Handler)]
+    pub harness_mode: HarnessModeCli,
+
+    /// Recursion budget for the `list_test_files` agent tool when it
+    /// scans the project's `test/` / `script/` / etc. directories.
+    /// 0 disables the scan entirely.
+    #[arg(long = "harness-list-test-files-max-depth", default_value_t = 6)]
+    pub harness_list_test_files_max_depth: usize,
 }
 
 /// Per-subcommand fields [`HarnessSharedArgs`] doesn't know about
@@ -187,12 +224,12 @@ impl HarnessSharedArgs {
             via_ir: false,
         });
         let harness_dir = opts.resolve_harness_dir();
-        tokio::fs::create_dir_all(&harness_dir)
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!(
+        tokio::fs::create_dir_all(&harness_dir).await.map_err(|e| {
+            color_eyre::eyre::eyre!(
                 "preflight: failed to create harness_dir {}: {e}",
                 harness_dir.display()
-            ))?;
+            )
+        })?;
         let harness_dir = std::fs::canonicalize(&harness_dir).unwrap_or(harness_dir);
         let forge_work_dir = if repo_root.join("foundry.toml").exists() {
             repo_root.to_path_buf()
@@ -202,11 +239,7 @@ impl HarnessSharedArgs {
         // Preflight harness is one trivial test; 60s is generous even
         // for slow docker pulls. Independent of `forge_timeout_secs`
         // (which the agent uses for real fuzz runs).
-        let runner = ForgeRunner::new(
-            backend.clone(),
-            forge_work_dir,
-            Duration::from_secs(60),
-        );
+        let runner = ForgeRunner::new(backend.clone(), forge_work_dir, Duration::from_secs(60));
         runner.preflight(&harness_dir).await
     }
 
@@ -240,6 +273,7 @@ impl HarnessSharedArgs {
             max_restarts: self.harness_max_restarts,
             gate2_fidelity_threshold: self.gate2_fidelity_threshold,
             via_ir: build.via_ir,
+            list_test_files_max_depth: self.harness_list_test_files_max_depth,
         }
     }
 }

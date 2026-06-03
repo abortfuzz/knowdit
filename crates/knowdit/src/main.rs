@@ -8,6 +8,14 @@ use std::io::IsTerminal;
 use clap::Parser;
 use knowdit::KnowditCommand;
 
+// Linux-only: switch the global allocator to tikv-jemalloc so the
+// fuzz/regen hot path (multi-MB CallGraph clones, forge output
+// buffers) doesn't accumulate fragmented RSS the way glibc malloc
+// does. Other targets fall back to the system allocator.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     let use_colors = std::io::stdout().is_terminal()
         && std::io::stderr().is_terminal()

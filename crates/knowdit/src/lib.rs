@@ -142,9 +142,6 @@ pub enum LearnCommands {
     /// the historical KG, before the regular `link` pass)
     RetroLink(cmd::learn::retro_link::RetroLinkArgs),
 
-    /// Clear historical finding-to-semantic linking progress for reruns
-    ResetLinking(cmd::learn::reset_linking::ResetLinkingArgs),
-
     /// Validate historical database referential integrity; optionally repair dangling rows
     ValidateDb(cmd::learn::validate_db::ValidateDbArgs),
 
@@ -351,7 +348,6 @@ impl LearnCommand {
             LearnCommands::Moves(args) => args.run(&db).await?,
             LearnCommands::Link(args) => args.run(&db).await?,
             LearnCommands::RetroLink(args) => args.run(&db).await?,
-            LearnCommands::ResetLinking(args) => args.run(&db).await?,
             LearnCommands::ValidateDb(args) => args.run(&db).await?,
             LearnCommands::SetPlatformId(args) => args.run(&db).await?,
             LearnCommands::ListSemantics(args) => args.run(&db).await?,

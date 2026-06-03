@@ -47,7 +47,10 @@ pub fn run(summary: &ForgeTestSummary, spec: &AuditSpecification) -> AuditOutcom
             ),
         };
     }
-    if summary.violated {
+    // PoC-mode violations have no fuzzer-produced counterexample
+    // sequence to validate against `spec.sequence` — they ARE the
+    // attack path, encoded by the agent. Skip the overlap gate.
+    if summary.violated && !summary.deterministic_test_failure {
         let spec_pairs: BTreeSet<(String, String)> = spec
             .sequence
             .iter()

@@ -205,26 +205,26 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
                 options.max_agent_steps,
             ));
         }
-        if let Some(tokens) = agent.approx_context_tokens(&llm.model.config) {
-            if tokens >= compact_threshold {
-                tracing::info!(
-                    cache_key_suffix,
-                    tokens,
-                    compact_threshold,
-                    "reflection agent compacting context"
-                );
-                agent = agent
-                    .compact(
-                        llm,
-                        debug_prefix
-                            .as_ref()
-                            .map(|p| format!("{p}-compact"))
-                            .as_deref(),
-                        options.llm_settings.clone(),
-                    )
-                    .await
-                    .wrap_err("reflection agent failed to compact context")?;
-            }
+        if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
+            && tokens >= compact_threshold
+        {
+            tracing::info!(
+                cache_key_suffix,
+                tokens,
+                compact_threshold,
+                "reflection agent compacting context"
+            );
+            agent = agent
+                .compact(
+                    llm,
+                    debug_prefix
+                        .as_ref()
+                        .map(|p| format!("{p}-compact"))
+                        .as_deref(),
+                    options.llm_settings.clone(),
+                )
+                .await
+                .wrap_err("reflection agent failed to compact context")?;
         }
         steps += 1;
         step = agent

@@ -58,8 +58,28 @@ impl ProjectScope {
                 repo_root.display()
             ));
         }
-        let mut paths = BTreeSet::new();
-        walk_collect(&repo_root, &repo_root, include, exclude, &mut paths)?;
+        // Dir-level exclude prunes whole subtrees (cheap); file-level
+        // checks both include + exclude on the repo-relative path.
+        // Paths that can't be stripped back to repo_root (shouldn't
+        // happen under a canonical root) are rejected on both filters.
+        let accept_dir = |dir: &Path| -> bool {
+            match dir.strip_prefix(&repo_root) {
+                Ok(rel) if !rel.as_os_str().is_empty() => !exclude.is_match(rel),
+                Ok(_) => true, // the root itself
+                Err(_) => false,
+            }
+        };
+        let accept_file = |file: &Path| -> bool {
+            let Ok(rel) = file.strip_prefix(&repo_root) else {
+                return false;
+            };
+            !exclude.is_match(rel) && include.is_match(rel)
+        };
+        let abs_paths = walk_files(&repo_root, &accept_dir, &accept_file, None)?;
+        let paths: BTreeSet<PathBuf> = abs_paths
+            .into_iter()
+            .filter_map(|p| p.strip_prefix(&repo_root).ok().map(Path::to_path_buf))
+            .collect();
         Ok(Self { repo_root, paths })
     }
 
@@ -286,20 +306,49 @@ fn compile_globs(patterns: &[&str]) -> Result<GlobSet> {
     builder.build().wrap_err("failed to build globset")
 }
 
-/// Recursive directory walker. Pushes every regular file whose
-/// repo-relative path passes the include/exclude filter into
-/// `out`. Symlinks are skipped to avoid loops, and directories are
-/// always descended into — exclusion is applied per-file using its
-/// relative path, so callers can write `lib/**` style rules without
-/// having to think about traversal order.
-fn walk_collect(
-    repo_root: &Path,
+/// Generic recursive directory walker. Returns every regular file path
+/// (absolute) under `root` for which `accept_file(path)` is true, never
+/// descending into a directory `dir` where `accept_dir(dir)` is false.
+/// Symlinks are skipped unconditionally to avoid loops. `max_depth` is
+/// a countdown: `None` is unbounded, `Some(0)` returns immediately.
+///
+/// Wrapping crates layer their own semantics on top:
+/// * `RepoSourceScope::build` adapts globset include/exclude — both
+///   filters compare the repo-relative path; the absolute paths
+///   returned here are stripped back down at the caller.
+/// * The audit harness's `list_test_files` tool uses an extension
+///   allowlist on files + a hardcoded vendored-dir blocklist on dirs
+///   + a depth budget.
+pub fn walk_files<F, G>(
+    root: &Path,
+    accept_dir: &F,
+    accept_file: &G,
+    max_depth: Option<usize>,
+) -> Result<BTreeSet<PathBuf>>
+where
+    F: Fn(&Path) -> bool,
+    G: Fn(&Path) -> bool,
+{
+    let mut out = BTreeSet::new();
+    if !root.is_dir() {
+        return Ok(out);
+    }
+    walk_files_inner(root, accept_dir, accept_file, max_depth, &mut out)?;
+    Ok(out)
+}
+
+fn walk_files_inner<F, G>(
     dir: &Path,
-    include: &GlobSet,
-    exclude: &GlobSet,
+    accept_dir: &F,
+    accept_file: &G,
+    depth_remaining: Option<usize>,
     out: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    if !dir.is_dir() {
+) -> Result<()>
+where
+    F: Fn(&Path) -> bool,
+    G: Fn(&Path) -> bool,
+{
+    if matches!(depth_remaining, Some(0)) {
         return Ok(());
     }
     let read = std::fs::read_dir(dir)
@@ -313,34 +362,24 @@ fn walk_collect(
             continue;
         }
         let path = entry.path();
-        let relative = path
-            .strip_prefix(repo_root)
-            .wrap_err_with(|| {
-                format!(
-                    "path {} escapes repo root {}",
-                    path.display(),
-                    repo_root.display()
-                )
-            })?
-            .to_path_buf();
-
         if file_type.is_dir() {
-            // If the directory itself matches the exclude set we can
-            // prune the whole subtree, saving a recursive call.
-            if exclude.is_match(&relative) {
+            if !accept_dir(&path) {
                 continue;
             }
-            walk_collect(repo_root, &path, include, exclude, out)?;
+            walk_files_inner(
+                &path,
+                accept_dir,
+                accept_file,
+                depth_remaining.map(|d| d - 1),
+                out,
+            )?;
             continue;
         }
         if !file_type.is_file() {
             continue;
         }
-        if exclude.is_match(&relative) {
-            continue;
-        }
-        if include.is_match(&relative) {
-            out.insert(relative);
+        if accept_file(&path) {
+            out.insert(path);
         }
     }
     Ok(())

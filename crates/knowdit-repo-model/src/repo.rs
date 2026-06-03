@@ -1132,7 +1132,7 @@ pub struct HistoricalSemanticRecord {
 /// One mapper-emitted match between a project extract and a historical
 /// semantic, with the v2 mapper's `strength` label and free-form
 /// `evidence` rationale.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SemanticMatch {
     pub extract_id: i32,
     pub historical_id: i32,
@@ -1523,17 +1523,18 @@ impl RepoDatabase {
     /// Append specification rows without clearing existing ones. Used by
     /// gen-specs to commit each link's results as soon as the link
     /// finishes, so a later cap or kill does not lose work.
-    pub async fn append_specifications(&self, records: &[SpecificationRecord]) -> Result<()> {
+    pub async fn append_specifications(&self, records: &[SpecificationRecord]) -> Result<Vec<i32>> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let txn = self
             .db
             .begin()
             .await
             .wrap_err("failed to begin specification append transaction")?;
+        let mut ids = Vec::with_capacity(records.len());
         for record in records {
-            specification_model::Entity::insert(specification_model::ActiveModel {
+            let inserted = specification_model::Entity::insert(specification_model::ActiveModel {
                 semantic_id: Set(record.semantic_id),
                 finding_id: Set(record.finding_id),
                 specification: Set(record.specification_json.clone()),
@@ -1547,11 +1548,12 @@ impl RepoDatabase {
                     record.semantic_id, record.finding_id
                 )
             })?;
+            ids.push(inserted.last_insert_id);
         }
         txn.commit()
             .await
             .wrap_err("failed to commit specification append transaction")?;
-        Ok(())
+        Ok(ids)
     }
 
     /// Insert a single specification row in one transaction and return
@@ -2309,67 +2311,221 @@ impl RepoDatabase {
     /// Consumed by `workflow autoloop` when dumping per-cycle valid
     /// findings to the output folder.
     pub async fn load_valid_findings(&self) -> Result<Vec<LoadedValidFinding>> {
-        use sea_orm::{FromQueryResult, Statement};
-        #[derive(FromQueryResult)]
-        struct Row {
-            reflection_id: i32,
-            run_id: i32,
-            spec_id: i32,
-            verdict_reason: String,
-            severity: String,
-            severity_reason: String,
-            specification_json: String,
-            harness_source: String,
-            harness_relative_path: String,
-            run_kind: String,
-            run_exit_code: Option<i32>,
-            run_violated: bool,
-            run_stdout: String,
-            run_sequence_json: Option<String>,
-        }
-        let backend = self.db.get_database_backend();
-        let stmt = Statement::from_string(
-            backend,
-            "SELECT r.id AS reflection_id, r.run_id AS run_id, r.spec_id AS spec_id, \
-                    r.reason AS verdict_reason, vf.severity AS severity, \
-                    vf.severity_reason AS severity_reason, \
-                    s.specification AS specification_json, \
-                    cg.harness_source AS harness_source, \
-                    cg.harness_relative_path AS harness_relative_path, \
-                    hr.kind AS run_kind, hr.exit_code AS run_exit_code, \
-                    hr.violated AS run_violated, hr.stdout AS run_stdout, \
-                    hr.sequence_json AS run_sequence_json \
-             FROM reflection r \
-             JOIN valid_finding vf ON vf.reflection_id = r.id \
-             JOIN harness_run hr ON hr.id = r.run_id \
-             JOIN code_gen cg ON cg.id = hr.code_id \
-             JOIN specification s ON s.id = r.spec_id \
-             ORDER BY r.id ASC"
-                .to_string(),
-        );
-        let rows = Row::find_by_statement(stmt)
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let reflections = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Result.eq(ReflectionResult::ValidFinding))
+            .order_by_asc(reflection_model::Column::Id)
             .all(&self.db)
             .await
-            .wrap_err("failed to load valid_finding join rows")?;
-        Ok(rows
+            .wrap_err("failed to load ValidFinding reflections")?;
+        if reflections.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let reflection_ids: Vec<i32> = reflections.iter().map(|r| r.id).collect();
+        let run_ids: Vec<i32> = reflections.iter().map(|r| r.run_id).collect();
+        let spec_ids: Vec<i32> = reflections.iter().map(|r| r.spec_id).collect();
+
+        let valid_findings = valid_finding_model::Entity::find()
+            .filter(valid_finding_model::Column::ReflectionId.is_in(reflection_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load valid_finding rows")?;
+        let mut vf_by_reflection: HashMap<i32, valid_finding_model::Model> = valid_findings
             .into_iter()
-            .map(|row| LoadedValidFinding {
-                reflection_id: row.reflection_id,
-                run_id: row.run_id,
-                spec_id: row.spec_id,
-                verdict_reason: row.verdict_reason,
-                severity: row.severity,
-                severity_reason: row.severity_reason,
-                specification_json: row.specification_json,
-                harness_source: row.harness_source,
-                harness_relative_path: row.harness_relative_path,
-                run_kind: row.run_kind,
-                run_exit_code: row.run_exit_code,
-                run_violated: row.run_violated,
-                run_stdout: row.run_stdout,
-                run_sequence_json: row.run_sequence_json,
-            })
-            .collect())
+            .map(|v| (v.reflection_id, v))
+            .collect();
+
+        let runs = harness_run_model::Entity::find()
+            .filter(harness_run_model::Column::Id.is_in(run_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load harness_run rows for valid findings")?;
+        let code_ids: Vec<i32> = runs.iter().map(|r| r.code_id).collect();
+        let runs_by_id: HashMap<i32, harness_run_model::Model> =
+            runs.into_iter().map(|r| (r.id, r)).collect();
+
+        let code_gens = code_gen_model::Entity::find()
+            .filter(code_gen_model::Column::Id.is_in(code_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load code_gen rows for valid findings")?;
+        let code_gens_by_id: HashMap<i32, code_gen_model::Model> =
+            code_gens.into_iter().map(|cg| (cg.id, cg)).collect();
+
+        let specs = specification_model::Entity::find()
+            .filter(specification_model::Column::Id.is_in(spec_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load specification rows for valid findings")?;
+        let specs_by_id: HashMap<i32, specification_model::Model> =
+            specs.into_iter().map(|s| (s.id, s)).collect();
+
+        let mut out = Vec::with_capacity(reflections.len());
+        for r in reflections {
+            let vf = vf_by_reflection.remove(&r.id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "reflection {} has result=ValidFinding but no valid_finding row",
+                    r.id
+                )
+            })?;
+            let run = runs_by_id.get(&r.run_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "reflection {} references missing harness_run {}",
+                    r.id,
+                    r.run_id
+                )
+            })?;
+            let cg = code_gens_by_id.get(&run.code_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "harness_run {} references missing code_gen {}",
+                    run.id,
+                    run.code_id
+                )
+            })?;
+            let spec = specs_by_id.get(&r.spec_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "reflection {} references missing specification {}",
+                    r.id,
+                    r.spec_id
+                )
+            })?;
+            out.push(LoadedValidFinding {
+                reflection_id: r.id,
+                run_id: r.run_id,
+                spec_id: r.spec_id,
+                verdict_reason: r.reason,
+                severity: vf.severity.as_str().to_string(),
+                severity_reason: vf.severity_reason,
+                specification_json: spec.specification.clone(),
+                harness_source: cg.harness_source.clone(),
+                harness_relative_path: cg.harness_relative_path.clone(),
+                run_kind: run.kind.as_str().to_string(),
+                run_exit_code: Some(run.exit_code),
+                run_violated: run.violated,
+                run_stdout: run.stdout.clone(),
+                run_sequence_json: run.sequence_json.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The mapper-side match + KG-side finding link that together
+    /// produced the given spec.
+    ///
+    /// Returns two existing types side-by-side rather than a fresh
+    /// wrapper:
+    ///
+    /// * [`SemanticMatch`] — the project's `semantic_matched` row
+    ///   linking the project extract to one historical semantic, with
+    ///   the mapper's strength label and rationale.
+    /// * [`knowdit_kg_model::db::semantic_finding_link::Model`] — the
+    ///   KG-native link row from historical_semantic to
+    ///   historical_finding, with the link agent's strength + evidence.
+    ///
+    /// Each spec is generated for exactly one such pair, but the
+    /// `specification` row only stores `(semantic_id, finding_id)` —
+    /// `historical_id` is recovered by joining through
+    /// `semantic_matched`. When more than one historical both matches
+    /// the extract and owns the finding, the SQL picks the strongest
+    /// candidate via `ORDER BY match_strength DESC, link_strength
+    /// DESC, historical_id ASC LIMIT 1`. Returns `None` only when the
+    /// link tables don't have a complete chain back to this spec.
+    ///
+    /// Implementation note: the row is read entirely from
+    /// project-DB tables (`specification`, `semantic_matched`,
+    /// `historical_semantic_finding_link`). The KG's
+    /// `semantic_finding_link` Model is constructed locally from those
+    /// mirror columns — `Model::find_by_statement` is not pointed at a
+    /// KG table.
+    pub async fn load_link_for_spec(
+        &self,
+        spec_id: i32,
+    ) -> Result<
+        Option<(
+            SemanticMatch,
+            knowdit_kg_model::db::semantic_finding_link::Model,
+        )>,
+    > {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let Some(spec) = specification_model::Entity::find_by_id(spec_id)
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| format!("failed to load specification {spec_id}"))?
+        else {
+            return Ok(None);
+        };
+
+        // All historicals the mapper matched to this extract.
+        let matches = semantic_matched_model::Entity::find()
+            .filter(semantic_matched_model::Column::ExtractId.eq(spec.semantic_id))
+            .all(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to load semantic_matched rows for extract {} (spec {spec_id})",
+                    spec.semantic_id
+                )
+            })?;
+
+        // For each matched historical, see if it actually owns this
+        // spec's finding via the KG-mirrored link table. (`semantic_id`
+        // / `finding_id` form the composite PK on the mirror, so at
+        // most one row per historical.)
+        let mut candidates: Vec<(
+            semantic_matched_model::Model,
+            historical_semantic_finding_link_model::Model,
+        )> = Vec::new();
+        for matched in matches {
+            let link = historical_semantic_finding_link_model::Entity::find()
+                .filter(
+                    historical_semantic_finding_link_model::Column::HistoricalSemanticId
+                        .eq(matched.historical_id),
+                )
+                .filter(
+                    historical_semantic_finding_link_model::Column::HistoricalFindingId
+                        .eq(spec.finding_id),
+                )
+                .one(&self.db)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to load historical_semantic_finding_link for hist={}, finding={}",
+                        matched.historical_id, spec.finding_id
+                    )
+                })?;
+            if let Some(link) = link {
+                candidates.push((matched, link));
+            }
+        }
+
+        // One spec ↔ one logical link by design, but the DB drops
+        // `historical_id` from the spec row. When multiple historicals
+        // survive the joins, pick the strongest by `(match_strength,
+        // link_strength)` rank with lowest `historical_id` as a
+        // deterministic tiebreak.
+        candidates.sort_by(|(am, al), (bm, bl)| {
+            bm.strength
+                .rank()
+                .cmp(&am.strength.rank())
+                .then_with(|| bl.strength.rank().cmp(&al.strength.rank()))
+                .then_with(|| am.historical_id.cmp(&bm.historical_id))
+        });
+
+        let Some((matched, link)) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            SemanticMatch {
+                extract_id: matched.extract_id,
+                historical_id: matched.historical_id,
+                strength: matched.strength,
+                evidence: matched.evidence,
+            },
+            link.into(),
+        )))
     }
 
     /// True if this `harness_run` already has a reflection row.
@@ -2434,81 +2590,189 @@ impl RepoDatabase {
     /// `triggered_by_reflection_id`, the reflection drops out of this
     /// query.
     pub async fn pending_reflections(&self) -> Result<Vec<PendingReflection>> {
-        use sea_orm::{FromQueryResult, Statement};
-        #[derive(FromQueryResult)]
-        struct Row {
-            id: i32,
-            run_id: i32,
-            code_id: i32,
-            spec_id: i32,
-            result: String,
-            reason: String,
-        }
-        let backend = self.db.get_database_backend();
-        let stmt = Statement::from_string(
-            backend,
-            // reflection is per-run; the regen scheduler still drives
-            // off code_gen lineage, so we join harness_run to recover
-            // each reflection's owning code_gen.id.
-            "SELECT r.id AS id, r.run_id AS run_id, hr.code_id AS code_id, \
-                    r.spec_id AS spec_id, r.result AS result, r.reason AS reason \
-             FROM reflection r \
-             JOIN harness_run hr ON hr.id = r.run_id \
-             WHERE r.result IN ('Suspect','IncompleteStep','IncompleteSpecification') \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM code_gen_regen \
-                  WHERE triggered_by_reflection_id = r.id \
-               ) \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM specification_regen \
-                  WHERE triggered_by_reflection_id = r.id \
-               ) \
-             ORDER BY r.id"
-                .to_string(),
-        );
-        let rows = Row::find_by_statement(stmt)
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        // reflection is per-run; the regen scheduler still drives off
+        // code_gen lineage, so we look up each reflection's owning
+        // harness_run to recover `code_id`.
+        let candidates = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Result.is_in([
+                ReflectionResult::Suspect,
+                ReflectionResult::IncompleteStep,
+                ReflectionResult::IncompleteSpecification,
+            ]))
+            .order_by_asc(reflection_model::Column::Id)
             .all(&self.db)
             .await
-            .wrap_err("failed to query pending reflections")?;
-        rows.into_iter()
-            .map(|row| {
-                let result = parse_reflection_result(&row.result)?;
-                Ok(PendingReflection {
-                    reflection_id: row.id,
-                    run_id: row.run_id,
-                    code_id: row.code_id,
-                    spec_id: row.spec_id,
-                    result,
-                    reason: row.reason,
-                })
-            })
-            .collect()
+            .wrap_err("failed to load candidate reflections for pending_reflections")?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidate_ids: Vec<i32> = candidates.iter().map(|r| r.id).collect();
+        let run_ids: Vec<i32> = candidates.iter().map(|r| r.run_id).collect();
+
+        let runs = harness_run_model::Entity::find()
+            .filter(harness_run_model::Column::Id.is_in(run_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load harness_run rows for pending_reflections")?;
+        let runs_by_id: HashMap<i32, harness_run_model::Model> =
+            runs.into_iter().map(|r| (r.id, r)).collect();
+
+        // A reflection drops out of the queue the moment a `*_regen`
+        // row references it via `triggered_by_reflection_id`. Two
+        // bulk fetches + two HashSet membership checks replace the
+        // original `NOT EXISTS (... )` correlated subqueries.
+        let consumed_by_codegen: std::collections::HashSet<i32> =
+            code_gen_regen_model::Entity::find()
+                .filter(
+                    code_gen_regen_model::Column::TriggeredByReflectionId
+                        .is_in(candidate_ids.clone()),
+                )
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load code_gen_regen consumption rows")?
+                .into_iter()
+                .map(|r| r.triggered_by_reflection_id)
+                .collect();
+        let consumed_by_spec: std::collections::HashSet<i32> =
+            specification_regen_model::Entity::find()
+                .filter(
+                    specification_regen_model::Column::TriggeredByReflectionId.is_in(candidate_ids),
+                )
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load specification_regen consumption rows")?
+                .into_iter()
+                .map(|r| r.triggered_by_reflection_id)
+                .collect();
+
+        let mut out = Vec::new();
+        for r in candidates {
+            if consumed_by_codegen.contains(&r.id) || consumed_by_spec.contains(&r.id) {
+                continue;
+            }
+            let run = runs_by_id.get(&r.run_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "reflection {} references missing harness_run {}",
+                    r.id,
+                    r.run_id
+                )
+            })?;
+            out.push(PendingReflection {
+                reflection_id: r.id,
+                run_id: r.run_id,
+                code_id: run.code_id,
+                spec_id: r.spec_id,
+                result: r.result,
+                reason: r.reason,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Pending regen rows scoped to one or more specification ids. Used by
+    /// streaming schedulers to keep one link's regen lineage moving without
+    /// draining unrelated global work.
+    pub async fn pending_reflections_for_specs(
+        &self,
+        spec_ids: &[i32],
+    ) -> Result<Vec<PendingReflection>> {
+        if spec_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let rows = reflection_model::Entity::find()
+            .filter(reflection_model::Column::SpecId.is_in(spec_ids.iter().copied()))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to query scoped pending reflections")?;
+        let mut out = Vec::new();
+        for row in rows {
+            if !row.result.requires_regen() {
+                continue;
+            }
+            let consumed_codegen = code_gen_regen_model::Entity::find()
+                .filter(code_gen_regen_model::Column::TriggeredByReflectionId.eq(row.id))
+                .one(&self.db)
+                .await?
+                .is_some();
+            let consumed_spec = specification_regen_model::Entity::find()
+                .filter(specification_regen_model::Column::TriggeredByReflectionId.eq(row.id))
+                .one(&self.db)
+                .await?
+                .is_some();
+            if consumed_codegen || consumed_spec {
+                continue;
+            }
+            let run = harness_run_model::Entity::find_by_id(row.run_id)
+                .one(&self.db)
+                .await?
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "reflection {} references missing run_id={}",
+                        row.id,
+                        row.run_id
+                    )
+                })?;
+            out.push(PendingReflection {
+                reflection_id: row.id,
+                run_id: row.run_id,
+                code_id: run.code_id,
+                spec_id: row.spec_id,
+                result: row.result,
+                reason: row.reason,
+            });
+        }
+        out.sort_by_key(|r| r.reflection_id);
+        Ok(out)
     }
 
     /// How deep the codegen regen chain is at this code_gen — i.e. how
     /// many parents you'd visit walking `parent_code_gen_id` links until
     /// a row with no parent. A fresh code_gen returns 0.
+    ///
+    /// Implementation walks the `code_gen_regen` table one hop at a
+    /// time via the typed entity API. The lineage is tree-shaped (PK
+    /// on `child_code_gen_id` ensures each code_gen has at most one
+    /// parent), so depth = number of regen rows on the upward path.
     pub async fn code_gen_chain_depth(&self, code_id: i32) -> Result<u32> {
-        chain_depth(
-            &self.db,
-            "code_gen_regen",
-            "child_code_gen_id",
-            "parent_code_gen_id",
-            code_id,
-        )
-        .await
+        use sea_orm::{ColumnTrait, QueryFilter};
+        let mut depth = 0u32;
+        let mut current = code_id;
+        loop {
+            let parent = code_gen_regen_model::Entity::find()
+                .filter(code_gen_regen_model::Column::ChildCodeGenId.eq(current))
+                .one(&self.db)
+                .await
+                .wrap_err_with(|| format!("failed to load code_gen_regen for child {current}"))?;
+            let Some(parent) = parent else { break };
+            depth += 1;
+            current = parent.parent_code_gen_id;
+        }
+        Ok(depth)
     }
 
-    /// How deep the spec regen chain is at this spec.
+    /// How deep the spec regen chain is at this spec. Same walk as
+    /// [`Self::code_gen_chain_depth`] but over `specification_regen`.
     pub async fn spec_chain_depth(&self, spec_id: i32) -> Result<u32> {
-        chain_depth(
-            &self.db,
-            "specification_regen",
-            "child_spec_id",
-            "parent_spec_id",
-            spec_id,
-        )
-        .await
+        use sea_orm::{ColumnTrait, QueryFilter};
+        let mut depth = 0u32;
+        let mut current = spec_id;
+        loop {
+            let parent = specification_regen_model::Entity::find()
+                .filter(specification_regen_model::Column::ChildSpecId.eq(current))
+                .one(&self.db)
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to load specification_regen for child {current}")
+                })?;
+            let Some(parent) = parent else { break };
+            depth += 1;
+            current = parent.parent_spec_id;
+        }
+        Ok(depth)
     }
 
     /// Count `IncompleteStep` reflections written against any
@@ -2516,317 +2780,54 @@ impl RepoDatabase {
     /// the Gate 3 grader's "two strikes → escalate to spec regen" rule
     /// (`prior_incomplete_step_count >= 2 → IncompleteSpecification`).
     /// Returns 0 when this code_gen has no parent (chain root).
+    ///
+    /// Three typed queries:
+    /// 1. Walk `code_gen_regen` upward from `code_id`, collecting
+    ///    ancestor ids.
+    /// 2. Load every `harness_run` whose `code_id` is in that set.
+    /// 3. Count `reflection` rows with `RunId IN runs` and
+    ///    `result = IncompleteStep`.
     pub async fn prior_incomplete_step_count(&self, code_id: i32) -> Result<u32> {
-        use sea_orm::{FromQueryResult, Statement};
-        #[derive(FromQueryResult)]
-        struct Row {
-            n: i64,
+        use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
+
+        let mut ancestors: Vec<i32> = Vec::new();
+        let mut current = code_id;
+        loop {
+            let parent = code_gen_regen_model::Entity::find()
+                .filter(code_gen_regen_model::Column::ChildCodeGenId.eq(current))
+                .one(&self.db)
+                .await
+                .wrap_err_with(|| format!("failed to load code_gen_regen for child {current}"))?;
+            let Some(parent) = parent else { break };
+            ancestors.push(parent.parent_code_gen_id);
+            current = parent.parent_code_gen_id;
         }
-        // Walk parent_code_gen_id upward from `code_id` and sum
-        // reflections on ancestors whose result = IncompleteStep.
-        // Reflection is per-run, so we go reflection → harness_run →
-        // ancestor code_gen.
-        let sql = "\
-            WITH RECURSIVE ancestors(id) AS ( \
-              SELECT parent_code_gen_id FROM code_gen_regen WHERE child_code_gen_id = ? \
-              UNION ALL \
-              SELECT cgr.parent_code_gen_id \
-              FROM code_gen_regen cgr JOIN ancestors a ON cgr.child_code_gen_id = a.id \
-            ) \
-            SELECT COUNT(*) AS n \
-              FROM reflection r \
-              JOIN harness_run hr ON hr.id = r.run_id \
-              JOIN ancestors a ON hr.code_id = a.id \
-             WHERE r.result = 'IncompleteStep'";
-        let stmt =
-            Statement::from_sql_and_values(self.db.get_database_backend(), sql, [code_id.into()]);
-        let row = Row::find_by_statement(stmt)
-            .one(&self.db)
+        if ancestors.is_empty() {
+            return Ok(0);
+        }
+
+        let ancestor_runs = harness_run_model::Entity::find()
+            .filter(harness_run_model::Column::CodeId.is_in(ancestors))
+            .all(&self.db)
             .await
             .wrap_err_with(|| {
-                format!("failed to count IncompleteStep ancestors for code_id={code_id}")
+                format!("failed to load harness_runs for ancestors of code {code_id}")
             })?;
-        Ok(row.map(|r| r.n as u32).unwrap_or(0))
-    }
-}
-
-/// Walk a lineage table from `start_id` upward, counting hops. Returns 0
-/// when the row has no parent (i.e. it's the chain root or has never
-/// been regenerated). Implementation uses a recursive CTE so the round
-/// trip is one query regardless of chain length.
-async fn chain_depth(
-    db: &DatabaseConnection,
-    table: &str,
-    child_col: &str,
-    parent_col: &str,
-    start_id: i32,
-) -> Result<u32> {
-    use sea_orm::{FromQueryResult, Statement};
-    #[derive(FromQueryResult)]
-    struct Row {
-        depth: i64,
-    }
-    let sql = format!(
-        "WITH RECURSIVE chain(id, depth) AS ( \
-           SELECT {child_col}, 1 FROM {table} WHERE {child_col} = ? \
-           UNION ALL \
-           SELECT r.{child_col}, chain.depth + 1 \
-           FROM {table} r JOIN chain ON r.{child_col} = ( \
-             SELECT {parent_col} FROM {table} WHERE {child_col} = chain.id \
-           ) \
-         ) \
-         SELECT COALESCE(MAX(depth), 0) AS depth FROM chain"
-    );
-    let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, [start_id.into()]);
-    let row = Row::find_by_statement(stmt)
-        .one(db)
-        .await
-        .wrap_err_with(|| format!("failed to query chain depth in {table}"))?;
-    Ok(row.map(|r| r.depth as u32).unwrap_or(0))
-}
-
-fn parse_reflection_result(raw: &str) -> Result<ReflectionResult> {
-    Ok(match raw {
-        "OutOfScope" => ReflectionResult::OutOfScope,
-        "IncompleteSpecification" => ReflectionResult::IncompleteSpecification,
-        "IncompleteStep" => ReflectionResult::IncompleteStep,
-        "ExpectedViolation" => ReflectionResult::ExpectedViolation,
-        "ValidFinding" => ReflectionResult::ValidFinding,
-        "Suspect" => ReflectionResult::Suspect,
-        other => {
-            return Err(color_eyre::eyre::eyre!(
-                "unknown ReflectionResult variant: {other}"
-            ));
+        if ancestor_runs.is_empty() {
+            return Ok(0);
         }
-    })
-}
+        let run_ids: Vec<i32> = ancestor_runs.into_iter().map(|r| r.id).collect();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cg::{FileLocation, FunctionCall};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDb {
-        repo: RepoDatabase,
-        path: PathBuf,
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(self.path.with_extension("sqlite3-shm"));
-            let _ = std::fs::remove_file(self.path.with_extension("sqlite3-wal"));
-        }
-    }
-
-    async fn temp_db() -> TempDb {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "knowdit-repo-db-test-{}-{unique}.sqlite3",
-            std::process::id()
-        ));
-        let repo = RepoDatabase::open_sqlite(path.clone())
+        let n = reflection_model::Entity::find()
+            .filter(reflection_model::Column::RunId.is_in(run_ids))
+            .filter(reflection_model::Column::Result.eq(ReflectionResult::IncompleteStep))
+            .count(&self.db)
             .await
-            .expect("test repo database should connect");
-        TempDb { repo, path }
-    }
-
-    #[tokio::test]
-    async fn ensure_project_records_current_project_when_empty() {
-        let temp = temp_db().await;
-        temp.repo
-            .init_schema()
-            .await
-            .expect("schema should initialize");
-
-        temp.repo
-            .ensure_project("current-project")
-            .await
-            .expect("empty project database should accept current project");
-
-        let projects = project_model::Entity::find()
-            .all(temp.repo.connection())
-            .await
-            .expect("project rows should load");
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].name, "current-project");
-    }
-
-    #[tokio::test]
-    async fn ensure_project_rejects_multiple_projects() {
-        let temp = temp_db().await;
-        temp.repo
-            .init_schema()
-            .await
-            .expect("schema should initialize");
-        project_model::Entity::insert_many([
-            project_model::ActiveModel {
-                name: Set("one".to_string()),
-                status: Set("completed".to_string()),
-                ..Default::default()
-            },
-            project_model::ActiveModel {
-                name: Set("two".to_string()),
-                status: Set("completed".to_string()),
-                ..Default::default()
-            },
-        ])
-        .exec(temp.repo.connection())
-        .await
-        .expect("test projects should insert");
-
-        let err = temp
-            .repo
-            .ensure_project("one")
-            .await
-            .expect_err("multiple projects should be rejected")
-            .to_string();
-        assert!(err.contains("project database contains multiple projects"));
-    }
-
-    fn loc(start_line: usize, start_column: usize, end_column: usize) -> FileLocation {
-        FileLocation {
-            start_line,
-            start_column,
-            end_line: start_line,
-            end_column,
-        }
-    }
-
-    fn chunk(
-        content: &str,
-        start_line: usize,
-        start_column: usize,
-        end_column: usize,
-    ) -> FileChunk {
-        FileChunk {
-            loc: loc(start_line, start_column, end_column),
-            content: content.to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn writes_and_reads_call_graph_database() {
-        let temp = temp_db().await;
-        temp.repo
-            .init_schema()
-            .await
-            .expect("schema should initialize");
-
-        let call_graph = CallGraph {
-            contracts: BTreeMap::from([(
-                1,
-                Contract {
-                    id: 1,
-                    name: "Vault".to_string(),
-                    relative_file_path: PathBuf::from("src/Vault.sol"),
-                    chunk: chunk("contract Vault {}", 1, 0, 8),
-                    functions: vec![
-                        Function {
-                            id: 1,
-                            name: "deposit".to_string(),
-                            args: "uint256 amount".to_string(),
-                            relative_file_path: PathBuf::from("src/Vault.sol"),
-                            loc: loc(2, 4, 40),
-                            content: Some("function deposit(uint256 amount) {}".to_string()),
-                            calls: vec![FunctionCall {
-                                id: 1,
-                                from_id: 1,
-                                to_id: 2,
-                                description: Some("updates accounting".to_string()),
-                            }],
-                            description: Some("deposit entrypoint".to_string()),
-                        },
-                        Function {
-                            id: 2,
-                            name: "account".to_string(),
-                            args: "uint256 amount".to_string(),
-                            relative_file_path: PathBuf::from("src/Vault.sol"),
-                            loc: loc(3, 4, 40),
-                            content: Some("function account(uint256 amount) {}".to_string()),
-                            calls: Vec::new(),
-                            description: Some("accounting helper".to_string()),
-                        },
-                    ],
-                    description: Some("Vault contract".to_string()),
-                },
-            )]),
-            interfaces: BTreeMap::from([(
-                10,
-                Interface {
-                    id: 10,
-                    name: "IERC20".to_string(),
-                    relative_file_path: PathBuf::from("src/IERC20.sol"),
-                    chunk: chunk("interface IERC20 {}", 1, 0, 19),
-                    functions: vec![Function {
-                        id: 10,
-                        name: "transfer".to_string(),
-                        args: "address to, uint256 amount".to_string(),
-                        relative_file_path: PathBuf::from("src/IERC20.sol"),
-                        loc: loc(2, 4, 70),
-                        content: None,
-                        calls: Vec::new(),
-                        description: Some("interface declaration".to_string()),
-                    }],
-                    description: Some("IERC20 interface".to_string()),
-                },
-            )]),
-        };
-
-        temp.repo
-            .write_call_graph(&call_graph)
-            .await
-            .expect("callgraph should write");
-        temp.repo
-            .replace_project_semantics(&[ExtractedSemantic {
-                name: "Token Transfer".to_string(),
-                category: knowdit_kg_model::category::DeFiCategory::Services,
-                definition: "Moves ERC20 balances between accounts".to_string(),
-                description: "Tracks project-specific token transfer semantics".to_string(),
-                functions: vec![ExtractedFunction {
-                    name: "transfer".to_string(),
-                    contract: "src/IERC20.sol".to_string(),
-                    signature: Some("transfer(address,uint256)".to_string()),
-                }],
-            }])
-            .await
-            .expect("project semantics should write");
-        let restored = temp
-            .repo
-            .load_call_graph()
-            .await
-            .expect("callgraph should read back");
-        let restored_semantics = temp
-            .repo
-            .load_project_semantics()
-            .await
-            .expect("project semantics should read back");
-
-        let contract = restored
-            .contracts
-            .get(&1)
-            .expect("contract should be restored");
-        assert_eq!(contract.relative_file_path, PathBuf::from("src/Vault.sol"));
-        assert_eq!(contract.functions.len(), 2);
-        assert_eq!(contract.functions[0].calls.len(), 1);
-        assert_eq!(contract.functions[0].calls[0].to_id, 2);
-        assert_eq!(
-            contract.functions[0].calls[0].description.as_deref(),
-            Some("updates accounting")
-        );
-        let interface = restored
-            .interfaces
-            .get(&10)
-            .expect("interface should be restored");
-        assert_eq!(interface.name, "IERC20");
-        assert_eq!(interface.functions.len(), 1);
-        assert_eq!(interface.functions[0].content, None);
-        assert_eq!(restored_semantics.len(), 1);
-        assert_eq!(restored_semantics[0].functions.len(), 1);
-        assert_eq!(restored_semantics[0].functions[0].name, "transfer");
+            .wrap_err_with(|| {
+                format!(
+                    "failed to count IncompleteStep reflections for ancestors of code {code_id}"
+                )
+            })?;
+        Ok(n as u32)
     }
 }

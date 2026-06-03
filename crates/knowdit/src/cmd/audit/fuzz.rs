@@ -12,7 +12,7 @@ use std::path::Path;
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
 use knowdit_audit::harness::forge::ForgeBackend;
-use knowdit_audit::harness::solidity::{FuzzOutcome, SolidityFuzzGenerator};
+use knowdit_audit::harness::solidity::{FuzzOutcome, SolidityHarnessGenerator};
 use knowdit_repo_model::RepoDatabase;
 use llmy::client::client::LLM;
 
@@ -27,9 +27,12 @@ pub struct FuzzSharedArgs {
     #[arg(long = "fuzz-max-specs", default_value_t = 0)]
     pub fuzz_max_specs: usize,
 
-    /// Number of specs processed in parallel.
-    #[arg(long = "fuzz-concurrency", default_value_t = 1)]
-    pub fuzz_concurrency: usize,
+    /// Number of specs processed in parallel. Defaults to `1`
+    /// (strict serial) when omitted. Typed `Option` so streamloop's
+    /// `--default-concurrency` can tell "user passed it" from
+    /// "default kicked in" — an explicit value wins over `-d`.
+    #[arg(long = "fuzz-concurrency")]
+    pub fuzz_concurrency: Option<usize>,
 
     /// Regenerate every harness from scratch — clears `code_gen`,
     /// `harness_run`, and `line_coverage` at the start. Default is
@@ -112,12 +115,18 @@ impl FuzzArgs {
             repo_root: repo_root.to_path_buf(),
             default_cache_key: format!("{}-knowdit-fuzz", project_name),
             max_specs: shared.fuzz_max_specs,
-            concurrency: shared.fuzz_concurrency,
+            concurrency: shared.fuzz_concurrency.unwrap_or(1).max(1),
             regenerate: shared.fuzz_regenerate,
             via_ir: harness.harness_via_ir,
         });
-        SolidityFuzzGenerator::new(repo, llm, &options, backend.clone())
-            .run()
-            .await
+        SolidityHarnessGenerator::new(
+            harness.harness_mode.into(),
+            repo,
+            llm,
+            &options,
+            backend.clone(),
+        )
+        .run()
+        .await
     }
 }

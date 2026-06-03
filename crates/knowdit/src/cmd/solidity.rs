@@ -79,12 +79,11 @@ impl SolidityAnalysisScopeCliArgs {
         if !self.analysis_scope_globs.is_empty() {
             return Ok(self.analysis_scope_globs.clone());
         }
-        if !self.ignore_scope_file {
-            if let Some(scope_globs) = knowdit_project::read_scope_txt(repo_root)? {
-                if !scope_globs.is_empty() {
-                    return Ok(scope_globs);
-                }
-            }
+        if !self.ignore_scope_file
+            && let Some(scope_globs) = knowdit_project::read_scope_txt(repo_root)?
+            && !scope_globs.is_empty()
+        {
+            return Ok(scope_globs);
         }
         Ok(vec!["**/*.sol".to_string()])
     }

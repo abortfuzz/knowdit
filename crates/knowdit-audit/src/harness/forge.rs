@@ -19,7 +19,15 @@
 //! daemon-managed container.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Monotonically increasing process-local counter, used to uniquify
+/// concurrent preflight directories (`_knowdit_preflight_{pid}_{nanos}_{ctr}`)
+/// so two preflights in the same nanosecond bucket still get distinct
+/// dirs. `Ordering::Relaxed` is fine — we only need uniqueness, not
+/// ordering between writes.
+static PREFLIGHT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Last `max_bytes` of `s`, snapped to a UTF-8 boundary. Used for
 /// embedding forge output tails in error messages without risking
@@ -404,17 +412,16 @@ impl ForgeRunner {
         for line in s.lines() {
             // Format: `Uid:\t<real>\t<effective>\t<saved>\t<filesystem>`
             if let Some(rest) = line.strip_prefix("Uid:") {
-                if let Some(real) = rest.split_whitespace().next() {
-                    if let Ok(v) = real.parse() {
-                        uid = v;
-                    }
+                if let Some(real) = rest.split_whitespace().next()
+                    && let Ok(v) = real.parse()
+                {
+                    uid = v;
                 }
-            } else if let Some(rest) = line.strip_prefix("Gid:") {
-                if let Some(real) = rest.split_whitespace().next() {
-                    if let Ok(v) = real.parse() {
-                        gid = v;
-                    }
-                }
+            } else if let Some(rest) = line.strip_prefix("Gid:")
+                && let Some(real) = rest.split_whitespace().next()
+                && let Ok(v) = real.parse()
+            {
+                gid = v;
             }
         }
         (uid, gid)
@@ -468,7 +475,7 @@ impl ForgeRunner {
     /// `--match-path` agree. Same `forge_test_runs=1` flag — this
     /// isn't a fuzz, just a discoverability + compile check.
     pub async fn preflight(&self, harness_dir: &Path) -> Result<()> {
-        const PREFLIGHT_DIRNAME: &str = "_knowdit_preflight";
+        const PREFLIGHT_DIR_PREFIX: &str = "_knowdit_preflight";
         const PREFLIGHT_HARNESS: &str = r#"// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
@@ -481,7 +488,13 @@ contract KnowditPreflight is Test {
 }
 "#;
 
-        let preflight_dir = harness_dir.join(PREFLIGHT_DIRNAME);
+        let preflight_id = PREFLIGHT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let preflight_dir = harness_dir.join(format!(
+            "{PREFLIGHT_DIR_PREFIX}_{}_{}_{}",
+            std::process::id(),
+            Self::nanos_now(),
+            preflight_id
+        ));
         tokio::fs::create_dir_all(&preflight_dir)
             .await
             .wrap_err_with(|| {
@@ -614,13 +627,13 @@ contract KnowditPreflight is Test {
                     .wrap_err_with(|| {
                         format!("failed to spawn `{} {:?}`", binary.display(), args)
                     })?;
-                if let Some(pid) = child.id() {
-                    if let Err(e) = scoped.add_pid(pid) {
-                        tracing::warn!(
-                            "ForgeRunner: failed to attach pid {pid} to cgroup; \
+                if let Some(pid) = child.id()
+                    && let Err(e) = scoped.add_pid(pid)
+                {
+                    tracing::warn!(
+                        "ForgeRunner: failed to attach pid {pid} to cgroup; \
                              memory cap won't apply: {e}"
-                        );
-                    }
+                    );
                 }
                 Ok(ForgeHandle::LocalCgroup {
                     child: Some(child),

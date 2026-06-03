@@ -343,12 +343,11 @@ pub fn list_contest_ids(dataset_dir: &Path) -> Result<Vec<u32>> {
         .wrap_err_with(|| format!("failed to read {}", contracts_dir.display()))?
     {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(id) = name.parse::<u32>() {
-                    ids.push(id);
-                }
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(name) = entry.file_name().to_str()
+            && let Ok(id) = name.parse::<u32>()
+        {
+            ids.push(id);
         }
     }
     ids.sort();

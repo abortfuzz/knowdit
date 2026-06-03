@@ -252,7 +252,8 @@ impl AutoloopArgs {
             );
 
             let reflect_stats: ReflectStats =
-                ReflectArgs::reflect(&repo, &reflect_llm, &spec_name, &self.reflect).await?;
+                ReflectArgs::reflect(&repo, &reflect_llm, &spec_name, &repo_root, &self.reflect)
+                    .await?;
             tracing::info!(
                 "Cycle {cycle} reflect: graded={} valid={} expected={} oos={} incomplete={}",
                 reflect_stats.graded,

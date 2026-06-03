@@ -370,9 +370,18 @@ impl ProjectSpec {
         if name.trim().is_empty() || root.trim().is_empty() {
             return Err(eyre!("project name and path must be non-empty: `{}`", spec));
         }
+        // Shells only tilde-expand at the start of a word, so
+        // `--project name:~/path` leaves the literal `~` in the spec
+        // string (the shell sees one word starting with `n`).
+        // `shellexpand::tilde` does the expansion: `~` / `~/...` →
+        // `$HOME` / `$HOME/...`. `~user/...` is also handled when the
+        // platform supports it. If `$HOME` is unset, the path comes
+        // back unchanged — at which point the eventual filesystem
+        // open will fail with the literal path in the error, which is
+        // the right signal.
         Ok(ProjectSpec {
             name: name.trim().to_string(),
-            root: PathBuf::from(root.trim()),
+            root: PathBuf::from(shellexpand::tilde(root.trim()).as_ref()),
             platform_id: platform_id
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -458,5 +467,37 @@ mod tests {
     fn project_spec_parse_rejects_garbage() {
         assert!(ProjectSpec::parse("foo").is_err());
         assert!(ProjectSpec::parse(":/x").is_err());
+    }
+
+    #[test]
+    fn project_spec_parse_expands_leading_tilde() {
+        // Shells don't tilde-expand inside `name:~/path` (the `~` is
+        // not at the start of a word), so the parser delegates to
+        // `shellexpand::tilde`. Read the test environment's current
+        // `$HOME` rather than mutating it — `set_var` races between
+        // concurrent tests.
+        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let p = ProjectSpec::parse("foo:~/megaeth/normal-account").unwrap();
+        assert_eq!(p.root, PathBuf::from(home).join("megaeth/normal-account"));
+    }
+
+    #[test]
+    fn project_spec_parse_leaves_non_tilde_paths_alone() {
+        assert_eq!(
+            ProjectSpec::parse("foo:/abs/path").unwrap().root,
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            ProjectSpec::parse("foo:rel/path").unwrap().root,
+            PathBuf::from("rel/path")
+        );
+        // `bar/~/baz` is not a leading `~/` — leave untouched. This
+        // is `shellexpand::tilde`'s contract, not our own logic, but
+        // worth pinning to catch the day someone swaps in a different
+        // expander.
+        assert_eq!(
+            ProjectSpec::parse("foo:bar/~/baz").unwrap().root,
+            PathBuf::from("bar/~/baz")
+        );
     }
 }

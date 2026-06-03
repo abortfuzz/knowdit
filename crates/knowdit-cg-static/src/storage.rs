@@ -492,10 +492,8 @@ impl<'a> FunctionWalker<'a> {
                 }
             }
             Expression::TupleExpression(te) => {
-                for component in &te.components {
-                    if let Some(c) = component {
-                        self.walk_expression(c, is_write, is_read);
-                    }
+                for c in te.components.iter().flatten() {
+                    self.walk_expression(c, is_write, is_read);
                 }
             }
             Expression::BinaryOperation(bo) => {
@@ -539,10 +537,8 @@ impl<'a> FunctionWalker<'a> {
             }
             Expression::TupleExpression(te) => {
                 let mut all = HashSet::new();
-                for c in &te.components {
-                    if let Some(e) = c {
-                        all.extend(self.resolve_storage_alias(e));
-                    }
+                for e in te.components.iter().flatten() {
+                    all.extend(self.resolve_storage_alias(e));
                 }
                 all
             }

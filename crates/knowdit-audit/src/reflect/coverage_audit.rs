@@ -177,19 +177,17 @@ fn resolve_function(callgraph: &CallGraph, step: &SuqenceCallStep) -> Option<Fun
         .contracts
         .values()
         .find(|c| c.name == step.contract)
+        && let Some(f) = c.functions.iter().find(|f| f.name == step.function)
     {
-        if let Some(f) = c.functions.iter().find(|f| f.name == step.function) {
-            return Some(f.clone());
-        }
+        return Some(f.clone());
     }
     if let Some(i) = callgraph
         .interfaces
         .values()
         .find(|i| i.name == step.contract)
+        && let Some(f) = i.functions.iter().find(|f| f.name == step.function)
     {
-        if let Some(f) = i.functions.iter().find(|f| f.name == step.function) {
-            return Some(f.clone());
-        }
+        return Some(f.clone());
     }
     // Loose fallback: any function with this name in any contract /
     // interface, regardless of contract.name. Spec.sequence sometimes

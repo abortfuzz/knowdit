@@ -18,11 +18,13 @@
 //! `crate::spec`; the shared agent-loop driver lives in
 //! [`super::agent_loop`].
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
-use knowdit_repo_model::{ReflectionResult, RepoDatabase};
+use knowdit_repo_model::{ProjectProfile, ReflectionResult, RepoDatabase};
 use llmy::agent::tool::ToolBox;
+use llmy::agent::tools::files::{FindFileTool, GrepDirectoryTool, ListDirectoryTool, ReadFileTool};
 use llmy::client::client::LLM;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,7 @@ use crate::types::AuditSpecification;
 use super::agent_loop::{
     AttemptHandle, CoverageSummary, GraderOptions, RunSummary, drive_agent_loop,
 };
+use super::prompt::VERDICT_SYSTEM;
 
 /// Single per-`harness_run` grading task. All fields owned so the
 /// input crosses async boundaries by clone — no lifetime params on
@@ -53,6 +56,13 @@ pub struct VerdictInput {
     /// lineage already classified `IncompleteStep`. Drives the
     /// "two strikes → escalate to IncompleteSpecification" rule.
     pub prior_incomplete_step_count: u32,
+    /// Snapshot of the project profile (subsystems + core components)
+    /// when the profile phase has already run for this project, else
+    /// `None`. The grader uses it as the cheapest source of design
+    /// intent when deciding `ExpectedViolation` — a reached
+    /// `post_attack` state that conflicts with a documented invariant
+    /// in the profile is evidence AGAINST `ExpectedViolation`.
+    pub project_profile: Option<ProjectProfile>,
 }
 
 /// Verdict captured by [`EmitVerdictTool`]. The 5-class
@@ -73,6 +83,14 @@ pub struct VerdictOutput {
 pub struct VerdictGrader {
     llm: LLM,
     project_index: Arc<ProjectIndex>,
+    /// Repository root on disk. Threaded into [`build_verdict_toolbox`]
+    /// so the agent's `read_file` / `list_dir` / `find_file` / `grep`
+    /// tools sandbox to this directory.
+    repo_root: PathBuf,
+    /// Loaded once on grader construction, then cloned into every
+    /// [`VerdictInput`] handed to the agent. `None` when the profile
+    /// phase hasn't run yet (older DBs).
+    project_profile: Option<ProjectProfile>,
     options: GraderOptions,
 }
 
@@ -80,7 +98,12 @@ impl VerdictGrader {
     /// Build a grader. Loads the project call graph + storage graph
     /// once; subsequent [`Self::grade`] calls are pure compute over
     /// already-resident state.
-    pub async fn new(repo: &RepoDatabase, llm: &LLM, options: GraderOptions) -> Result<Self> {
+    pub async fn new(
+        repo: &RepoDatabase,
+        repo_root: &Path,
+        llm: &LLM,
+        options: GraderOptions,
+    ) -> Result<Self> {
         let call_graph = repo
             .load_call_graph()
             .await
@@ -98,9 +121,15 @@ impl VerdictGrader {
             storage_graph,
             inheritance_graph,
         ));
+        let project_profile = repo
+            .get_project_profile()
+            .await
+            .wrap_err("verdict grader: failed to read project profile")?;
         Ok(Self {
             llm: llm.clone(),
             project_index,
+            repo_root: repo_root.to_path_buf(),
+            project_profile,
             options,
         })
     }
@@ -119,8 +148,16 @@ impl VerdictGrader {
     /// the run back up and llmy cache reuses prior agent steps).
     pub async fn grade(&self, input: &VerdictInput) -> Result<VerdictOutput> {
         let attempt: AttemptHandle<RawVerdict> = AttemptHandle::new();
-        let tools = build_verdict_toolbox(&self.project_index, &attempt);
-        let user_prompt = serde_json::to_string_pretty(input)
+        let tools = build_verdict_toolbox(&self.project_index, &self.repo_root, &attempt);
+        // Inject the cached profile so VerdictInputs constructed by
+        // callers without DB access still carry the project's design
+        // intent — saves an extra DB round-trip and keeps the agent
+        // input one self-contained JSON blob.
+        let mut input = input.clone();
+        if input.project_profile.is_none() {
+            input.project_profile = self.project_profile.clone();
+        }
+        let user_prompt = serde_json::to_string_pretty(&input)
             .wrap_err("verdict grader: failed to serialize VerdictInput")?;
         let cache_suffix = format!("verdict-r{:06}-s{:06}", input.run_id, input.spec_id);
         let steps = drive_agent_loop(
@@ -148,6 +185,7 @@ impl VerdictGrader {
 
 fn build_verdict_toolbox(
     project_index: &Arc<ProjectIndex>,
+    repo_root: &Path,
     attempt: &AttemptHandle<RawVerdict>,
 ) -> ToolBox {
     let mut tools = ToolBox::new();
@@ -163,6 +201,14 @@ fn build_verdict_toolbox(
     tools.add_tool(ReadFunctionSourceTool {
         project: project_index.clone(),
     });
+    // Repository-level IO so the agent can survey READMEs, docs/,
+    // interface NatSpec, audit reports, test sidecar notes, etc. —
+    // anything the KG doesn't index. All four are sandboxed to
+    // `repo_root` by llmy.
+    tools.add_tool(ReadFileTool::new(repo_root.to_path_buf()));
+    tools.add_tool(ListDirectoryTool::new_root(repo_root.to_path_buf()));
+    tools.add_tool(FindFileTool::new(repo_root.to_path_buf()));
+    tools.add_tool(GrepDirectoryTool::new(repo_root.to_path_buf()));
     tools.add_tool(EmitVerdictTool {
         attempt: attempt.clone(),
     });
@@ -246,89 +292,6 @@ impl EmitVerdictTool {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// System prompt
-// ---------------------------------------------------------------------------
-
-/// Methodology-rich system prompt. Ordered so the cheapest-to-confirm
-/// verdict (`IncompleteSpecification`) is checked first, saving agent
-/// steps on the common "spec references nonexistent contract" case.
-const VERDICT_SYSTEM: &str = r#"You are the Reflector verdict agent — a multi-turn code auditor that classifies one violated harness_run against the project under audit.
-
-You will be given a JSON document with:
-- `run_id`, `spec_id`: row identifiers for tracing
-- `spec`: the AuditSpecification this harness was supposed to validate (setup contracts/state, pre_attack/post_attack states, ordered call sequence)
-- `harness_source`: the .sol file the fuzz agent committed
-- `finding_title`: optional historical-finding label that motivated the spec
-- `run`: this single harness_run's digest (kind, exit_code, violated, stdout_tail, decoded counter-example)
-- `coverage_summary`: hit/expected count of spec.sequence functions and missed-step labels (when a coverage run was issued for this code_gen)
-- `prior_incomplete_step_count`: how many ancestor reflections in this code_gen's regen lineage are already `IncompleteStep`
-
-You have inspection tools to verify against the actual project source — USE them; do NOT classify from harness_source / spec text alone:
-
-- `lookup_call_graph(contract, function?)` — confirm a contract/function exists; see incoming/outgoing edges
-- `lookup_state_variable_xrefs(state_variable)` — find readers/writers of a state var
-- `read_contract_source(contract)` — full source of one contract
-- `read_function_source(contract, function)` — focused source for one function
-- `emit_verdict(classification, rationale)` — finalize the agent run
-
-# Verdicts (evaluate in this order; first match wins)
-
-## 1. IncompleteSpecification — verify FIRST, cheap to confirm
-
-Methodology:
-- For each name in `spec.setup.contracts`: call `lookup_call_graph(name)`. If ANY response is "no contract or interface named `X` found", classify `IncompleteSpecification`.
-- For each entry in `spec.sequence`: call `lookup_call_graph(contract, function)`. If the function isn't on the named contract OR isn't on any contract in the project, classify `IncompleteSpecification`.
-- If `prior_incomplete_step_count >= 2`: the codegen has tried at least twice to reach this spec and failed. Spec is at fault — escalate to `IncompleteSpecification` regardless of other signals.
-
-## 2. IncompleteStep
-
-Methodology:
-- The counter-example's `(contract_name, func_name)` set has NO overlap with `spec.sequence` — the harness fired a violation in some other path → `IncompleteStep`.
-- `coverage_summary.missed_step_labels` lists spec.sequence functions: `read_function_source` on those — if their bodies show the path was avoidable from the harness's setUp, classify `IncompleteStep`.
-- `run.stdout_tail` mentions reverts on access-control / preconditions / paused state that the spec did NOT instruct the harness to satisfy → `IncompleteStep`.
-
-## 3. OutOfScope
-
-Methodology:
-- For each `contract_name` in counter-example: call `lookup_call_graph`. If a name fails to resolve, that contract is locally defined inside `harness_source` — scaffolding (Mock*, Stub*, Fake*, Handler*, custom test contract).
-- If the violation chain is dominated by such scaffolding (no project contracts in counter-example or coverage hit functions), classify `OutOfScope`.
-- `read_contract_source` on a counter-example contract: a "no contract found" response confirms scaffolding.
-- The violation's failing assertion is on harness-authored test-only state, not on project state → `OutOfScope`.
-
-## 4. ExpectedViolation
-
-Methodology:
-- The spec's `post_attack` state matches what the violation actually demonstrates — the spec was a "validate this attack reaches state X" demonstration and the violation IS state X.
-- `read_function_source` on the spec.sequence functions; verify the executed path produces `spec.post_attack` exactly.
-- The harness's invariant body asserts the negation of `spec.post_attack` and that's what failed — this is the spec being satisfied, not a bug.
-
-## 5. ValidFinding
-
-Methodology:
-- Counter-example's `(contract_name, func_name)` set CONTAINS at least one project contract (verify with `lookup_call_graph`).
-- `read_function_source` on the violating function — the path produces a state change that exceeds `spec.post_attack` (overflow, access-control bypass, accounting mismatch, reentrancy, mass slashing, etc.) and is attributable to a real bug, not a misuse the harness fabricated.
-- The bug would still trigger if invoked from a normal external caller with the same calldata (i.e. it's not gated by the harness's scaffolding).
-
-(Severity tier — High / Medium / Low — is decided by a SEPARATE downstream agent. Do not include it here.)
-
-# Hard rules
-
-- Call `emit_verdict` EXACTLY once. It ends your run.
-- `classification` must be one of the five `GraderVerdict` variants. Serde rejects unknown strings.
-- `rationale` must cite specific function or contract names from the counter-example or spec.sequence (e.g. `"PanopticPool.dispatch reverts on s_paused; spec.setup did not unpause"`). Vague phrasing is rejected by reviewers.
-- Treat any contract authored INSIDE `harness_source` (Mock*, Stub*, Fake*, Vulnerable*, Handler*, Test*) as untrusted scaffolding. `ValidFinding` requires the violation chain to traverse contracts found in the project's call graph.
-- If your other evidence still points to `IncompleteStep` BUT `prior_incomplete_step_count >= 2`, escalate to `IncompleteSpecification`.
-- Translate older 4-class verdicts: `valid_vuln` → `ValidFinding`; `expected_revert` → `ExpectedViolation`; `incomplete_attacking_scenario` → `IncompleteStep` (or `IncompleteSpecification` if spec is at fault); `invalid_vuln` → `OutOfScope`.
-
-# Workflow tips
-
-- Burn cheap calls first: `lookup_call_graph` on every name in `spec.setup.contracts` and `spec.sequence`. This usually settles `IncompleteSpecification` immediately.
-- Then `lookup_call_graph` on every `contract_name` in the counter-example. Names that fail to resolve = scaffolding = `OutOfScope` evidence.
-- Only fall into `read_function_source` when choosing between `IncompleteStep` / `ExpectedViolation` / `ValidFinding`.
-- Don't dump every contract you can think of; the agent step budget is finite.
-"#;
 
 #[cfg(test)]
 mod tests {

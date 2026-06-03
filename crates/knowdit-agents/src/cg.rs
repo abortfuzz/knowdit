@@ -267,8 +267,7 @@ impl FunctionAgentRunner {
             .map(|contract| (contract.id, contract))
             .collect::<BTreeMap<_, _>>();
         let source_manifest = render_source_manifest(&source_files, &analysis_source_files);
-        let terminal_store =
-            SharedTerminalNodes::with_initial(index.automatic_terminal_nodes().into_iter());
+        let terminal_store = SharedTerminalNodes::with_initial(index.automatic_terminal_nodes());
 
         Self {
             config,
@@ -538,27 +537,27 @@ impl FunctionAgentRunner {
                 function_str
             );
 
-            if let Some(tokens) = agent.approx_context_tokens(&llm.model.config) {
-                if tokens >= self.compact_threshold {
-                    tracing::info!("We are going to compact our agent...");
-                    agent = agent
-                        .compact(
-                            llm,
-                            debug_prefix
-                                .clone()
-                                .map(|v| format!("{}-compact", v))
-                                .as_deref(),
-                            self.config.llm_settings.clone(),
+            if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
+                && tokens >= self.compact_threshold
+            {
+                tracing::info!("We are going to compact our agent...");
+                agent = agent
+                    .compact(
+                        llm,
+                        debug_prefix
+                            .clone()
+                            .map(|v| format!("{}-compact", v))
+                            .as_deref(),
+                        self.config.llm_settings.clone(),
+                    )
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "callgraph agent failed to compact context for {}",
+                            function_str
                         )
-                        .await
-                        .wrap_err_with(|| {
-                            format!(
-                                "callgraph agent failed to compact context for {}",
-                                function_str
-                            )
-                        })?;
-                    compact_count += 1;
-                }
+                    })?;
+                compact_count += 1;
             }
 
             steps += 1;
@@ -686,14 +685,14 @@ impl RecordTerminalNodeTool {
         ) {
             return Ok(message);
         }
-        if matches.is_empty() {
-            if let Some(message) = location_filtered_endpoint_message(
+        if matches.is_empty()
+            && let Some(message) = location_filtered_endpoint_message(
                 "terminal node",
                 &args.node,
                 &matches_without_location,
-            ) {
-                return Ok(message);
-            }
+            )
+        {
+            return Ok(message);
         }
         let target = match matches.as_slice() {
             [node] => match reason {
@@ -769,30 +768,29 @@ impl RecordTerminalNodeTool {
                 description: args.description,
             })
             .await;
-        if reason == TerminalNodeReason::NoExternalCall {
-            if let CallGraphNode::Known(function_id) = &target {
-                if self.calls.has_outgoing(*function_id).await {
-                    self.terminals
-                        .remove(&CallGraphNode::Known(*function_id))
-                        .await;
-                    let target = self
-                        .index
-                        .function(*function_id)
-                        .map(FunctionIndexEntry::label)
-                        .unwrap_or_else(|| format!("known function id {function_id}"));
-                    let message = format!(
-                        "terminal node not recorded: {} already has outgoing call edges",
-                        target
-                    );
-                    tracing::warn!(
-                        target = %target,
-                        reason = reason.as_str(),
-                        instruction = %message,
-                        "record_terminal_node returned repair instruction"
-                    );
-                    return Ok(message);
-                }
-            }
+        if reason == TerminalNodeReason::NoExternalCall
+            && let CallGraphNode::Known(function_id) = &target
+            && self.calls.has_outgoing(*function_id).await
+        {
+            self.terminals
+                .remove(&CallGraphNode::Known(*function_id))
+                .await;
+            let target = self
+                .index
+                .function(*function_id)
+                .map(FunctionIndexEntry::label)
+                .unwrap_or_else(|| format!("known function id {function_id}"));
+            let message = format!(
+                "terminal node not recorded: {} already has outgoing call edges",
+                target
+            );
+            tracing::warn!(
+                target = %target,
+                reason = reason.as_str(),
+                instruction = %message,
+                "record_terminal_node returned repair instruction"
+            );
+            return Ok(message);
         }
         Ok(format!(
             "terminal node {}: {} ({})",
@@ -857,21 +855,21 @@ impl RecordCallRelationTool {
             );
             return Ok(message);
         }
-        if caller_matches.is_empty() {
-            if let Some(message) = location_filtered_endpoint_message(
+        if caller_matches.is_empty()
+            && let Some(message) = location_filtered_endpoint_message(
                 "caller",
                 &args.caller,
                 &caller_matches_without_location,
-            ) {
-                tracing::warn!(
-                    reason = "caller_location_mismatch",
-                    caller = %args.caller.label(),
-                    callee = %args.callee.label(),
-                    instruction = %message,
-                    "record_call_relation returned repair instruction"
-                );
-                return Ok(message);
-            }
+            )
+        {
+            tracing::warn!(
+                reason = "caller_location_mismatch",
+                caller = %args.caller.label(),
+                callee = %args.callee.label(),
+                instruction = %message,
+                "record_call_relation returned repair instruction"
+            );
+            return Ok(message);
         }
         let caller = match caller_matches.as_slice() {
             [caller] => caller.clone(),
@@ -919,21 +917,21 @@ impl RecordCallRelationTool {
             );
             return Ok(message);
         }
-        if callee_matches.is_empty() {
-            if let Some(message) = location_filtered_endpoint_message(
+        if callee_matches.is_empty()
+            && let Some(message) = location_filtered_endpoint_message(
                 "callee",
                 &args.callee,
                 &callee_matches_without_location,
-            ) {
-                tracing::warn!(
-                    reason = "callee_location_mismatch",
-                    caller = %args.caller.label(),
-                    callee = %args.callee.label(),
-                    instruction = %message,
-                    "record_call_relation returned repair instruction"
-                );
-                return Ok(message);
-            }
+            )
+        {
+            tracing::warn!(
+                reason = "callee_location_mismatch",
+                caller = %args.caller.label(),
+                callee = %args.callee.label(),
+                instruction = %message,
+                "record_call_relation returned repair instruction"
+            );
+            return Ok(message);
         }
         let (target, callee_label, callee_found_in_callable_index, callee_is_analyzed) =
             match callee_matches.as_slice() {

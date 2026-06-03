@@ -20,10 +20,10 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
-use knowdit_kg_model::ExtractedSemantic;
 use knowdit_kg_model::audit_finding::FindingSeverity;
 use knowdit_kg_model::db::audit_finding;
 use knowdit_kg_model::db::semantic_node;
+use knowdit_kg_model::{ExtractedFunction, ExtractedSemantic};
 use knowdit_repo_model::cg::{CallGraph, Contract, Function, FunctionCall, Interface};
 use knowdit_repo_model::inheritance::{ContractInherit, InheritanceGraph};
 use knowdit_repo_model::storage::{
@@ -127,6 +127,9 @@ impl Default for SpecGenOptions {
 /// Outcome of one link's spec-generation run.
 #[derive(Debug, Clone)]
 pub struct LinkSpecOutcome {
+    /// 1-based ordinal in the planned link stream — useful for progress
+    /// reporting and for schedulers that need a stable cross-batch label.
+    pub ordinal: usize,
     /// `project_semantic.id` from the project DB.
     pub extract_id: i32,
     /// Historical semantic id, mirrored into the project DB.
@@ -137,6 +140,10 @@ pub struct LinkSpecOutcome {
     pub status: LinkSpecStatus,
     /// Specs the agent committed before finalizing.
     pub specifications: Vec<AuditSpecification>,
+    /// DB ids of `specifications` after the commit transaction succeeds.
+    /// Populated by `commit_link_outcome`; empty on commit failure or when
+    /// `specifications` was empty.
+    pub specification_ids: Vec<i32>,
     /// Reason the agent reported for abandoning, when `status == Abandoned`.
     pub abort_reason: Option<String>,
     /// Free-form summary from the agent's final tool call.
@@ -218,6 +225,27 @@ impl SpecGenStream {
         self.queue.is_empty()
     }
 
+    /// Claim one link from the stream **without** running it. Lets an
+    /// external scheduler keep a bounded number of full link pipelines
+    /// active at once: claim → gen-spec → fuzz → reflect → regen →
+    /// snapshot. The returned [`PlannedLinkWork`] carries everything
+    /// `process_link` needs, so the scheduler can run it on its own
+    /// task. Note: `processed_links` is bumped on claim, so the
+    /// scheduler must guarantee the claimed work is either run or
+    /// dropped — there is no `unpop`.
+    pub fn pop_next_work(&mut self) -> Option<PlannedLinkWork> {
+        let link = self.queue.pop_front()?;
+        let ordinal = self.processed_links + 1;
+        self.processed_links += 1;
+        Some(PlannedLinkWork {
+            ordinal,
+            total_links: self.total_links,
+            link,
+            project_index: self.project_index.clone(),
+            options: self.options.clone(),
+        })
+    }
+
     /// Process exactly one pending link, appending any committed specs to the
     /// project DB before returning. Returns `Ok(None)` when the queue is empty.
     pub async fn run_next(
@@ -229,7 +257,7 @@ impl SpecGenStream {
             return Ok(None);
         };
         let ordinal = self.processed_links + 1;
-        let outcome = process_link(
+        let mut outcome = process_link(
             &link,
             &self.project_index,
             llm,
@@ -238,7 +266,7 @@ impl SpecGenStream {
             self.total_links,
         )
         .await;
-        commit_link_outcome(repo, &outcome).await;
+        outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
         self.processed_links += 1;
         Ok(Some(outcome))
     }
@@ -254,6 +282,26 @@ impl SpecGenStream {
         llm: &LLM,
         batch_size: usize,
     ) -> Result<Vec<LinkSpecOutcome>> {
+        self.run_next_batch_with_hook(repo, llm, batch_size, |_| Ok(()))
+            .await
+    }
+
+    /// Like [`Self::run_next_batch`], but invokes `on_committed` immediately
+    /// after each worker outcome has been serialized into the DB. The
+    /// callback runs on the calling task, so it can write local progress
+    /// snapshots in actual completion order without waiting for slower
+    /// links in the same batch. If the hook returns `Err`, the remaining
+    /// in-flight tasks still finish but the error is propagated up.
+    pub async fn run_next_batch_with_hook<F>(
+        &mut self,
+        repo: &RepoDatabase,
+        llm: &LLM,
+        batch_size: usize,
+        mut on_committed: F,
+    ) -> Result<Vec<LinkSpecOutcome>>
+    where
+        F: FnMut(&LinkSpecOutcome) -> Result<()>,
+    {
         if self.queue.is_empty() {
             return Ok(Vec::new());
         }
@@ -270,7 +318,7 @@ impl SpecGenStream {
 
         if batch.len() == 1 {
             let (ordinal, link) = batch.into_iter().next().unwrap();
-            let outcome = process_link(
+            let mut outcome = process_link(
                 &link,
                 &self.project_index,
                 llm,
@@ -279,8 +327,9 @@ impl SpecGenStream {
                 self.total_links,
             )
             .await;
-            commit_link_outcome(repo, &outcome).await;
+            outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
             self.processed_links += 1;
+            on_committed(&outcome)?;
             return Ok(vec![outcome]);
         }
 
@@ -301,15 +350,61 @@ impl SpecGenStream {
         drop(tx);
 
         let mut results = Vec::with_capacity(handles.len());
-        while let Some(outcome) = rx.recv().await {
-            commit_link_outcome(repo, &outcome).await;
+        while let Some(mut outcome) = rx.recv().await {
+            outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
             self.processed_links += 1;
+            on_committed(&outcome)?;
             results.push(outcome);
         }
         for h in handles {
             let _ = h.await;
         }
         Ok(results)
+    }
+}
+
+/// One claimed link ready to be run by an external scheduler. Carries
+/// everything `process_link` needs (the link itself plus a cheap
+/// `Arc<ProjectIndex>` clone), so the scheduler can spawn `.run(repo, llm)`
+/// on its own task and interleave the link's fuzz/reflect/regen lifecycle
+/// without holding the [`SpecGenStream`] borrow.
+#[derive(Clone)]
+pub struct PlannedLinkWork {
+    ordinal: usize,
+    total_links: usize,
+    link: LinkInput,
+    project_index: Arc<ProjectIndex>,
+    options: SpecGenOptions,
+}
+
+impl PlannedLinkWork {
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub fn total_links(&self) -> usize {
+        self.total_links
+    }
+
+    pub fn link_key(&self) -> LinkKey {
+        self.link.key()
+    }
+
+    /// Run the claimed link end-to-end and commit any built specs to the
+    /// project DB. Returns the populated `LinkSpecOutcome` with
+    /// `specification_ids` filled in on success.
+    pub async fn run(self, repo: &RepoDatabase, llm: &LLM) -> LinkSpecOutcome {
+        let mut outcome = process_link(
+            &self.link,
+            &self.project_index,
+            llm,
+            &self.options,
+            self.ordinal,
+            self.total_links,
+        )
+        .await;
+        outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
+        outcome
     }
 }
 
@@ -356,9 +451,9 @@ impl SpecificationGenerator {
         let outcomes: Vec<LinkSpecOutcome> = if concurrency == 1 {
             let mut outcomes: Vec<LinkSpecOutcome> = Vec::with_capacity(total_links);
             for (idx, link) in links.iter().enumerate() {
-                let outcome =
+                let mut outcome =
                     process_link(link, &project_index, llm, options, idx + 1, total_links).await;
-                commit_link_outcome(repo, &outcome).await;
+                outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
                 outcomes.push(outcome);
             }
             outcomes
@@ -405,10 +500,10 @@ impl SpecificationGenerator {
 
             let mut collected: Vec<Option<LinkSpecOutcome>> =
                 (0..total_links).map(|_| None).collect();
-            while let Some((idx, outcome)) = rx.recv().await {
+            while let Some((idx, mut outcome)) = rx.recv().await {
                 // Commit on the main task so all writes go through one DB
                 // handle in serialized order; SQLite handles small txns well.
-                commit_link_outcome(repo, &outcome).await;
+                outcome.specification_ids = commit_link_outcome(repo, &outcome).await;
                 if idx < collected.len() {
                     collected[idx] = Some(outcome);
                 }
@@ -620,15 +715,15 @@ impl SpecificationGenerator {
             );
         }
 
-        if let Some(cap) = options.max_links.filter(|n| *n > 0) {
-            if links.len() > cap {
-                tracing::info!(
-                    "Specification Generator truncating from {} to {} link(s) for this run",
-                    links.len(),
-                    cap
-                );
-                links.truncate(cap);
-            }
+        if let Some(cap) = options.max_links.filter(|n| *n > 0)
+            && links.len() > cap
+        {
+            tracing::info!(
+                "Specification Generator truncating from {} to {} link(s) for this run",
+                links.len(),
+                cap
+            );
+            links.truncate(cap);
         }
 
         links = interleave_by_extract(links);
@@ -820,9 +915,13 @@ fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str) -> String 
     }
 }
 
-async fn commit_link_outcome(repo: &RepoDatabase, outcome: &LinkSpecOutcome) {
+/// Commit the link's specs to the project DB and return the new
+/// `specification.id`s in `outcome.specifications` order. An empty Vec
+/// means either the link committed nothing, or the commit failed (which
+/// is logged) — callers should treat it the same way.
+async fn commit_link_outcome(repo: &RepoDatabase, outcome: &LinkSpecOutcome) -> Vec<i32> {
     if outcome.specifications.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut payload = Vec::with_capacity(outcome.specifications.len());
     for spec in &outcome.specifications {
@@ -838,17 +937,21 @@ async fn commit_link_outcome(repo: &RepoDatabase, outcome: &LinkSpecOutcome) {
                     outcome.extract_id,
                     outcome.finding_id
                 );
-                return;
+                return Vec::new();
             }
         }
     }
-    if let Err(err) = repo.append_specifications(&payload).await {
-        tracing::error!(
-            "failed to append {} spec(s) for extract={} finding={}: {err:#}",
-            payload.len(),
-            outcome.extract_id,
-            outcome.finding_id,
-        );
+    match repo.append_specifications(&payload).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::error!(
+                "failed to append {} spec(s) for extract={} finding={}: {err:#}",
+                payload.len(),
+                outcome.extract_id,
+                outcome.finding_id,
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -889,11 +992,13 @@ async fn process_link(
                 "{label}: agent run failed, abandoning link without committing — {err:#}"
             );
             LinkSpecOutcome {
+                ordinal: link_idx_1based,
                 extract_id: link.extract_id,
                 historical_id: link.historical_id,
                 finding_id: link.finding_id,
                 status: LinkSpecStatus::Abandoned,
                 specifications: Vec::new(),
+                specification_ids: Vec::new(),
                 abort_reason: Some(format!("agent error: {err:#}")),
                 final_summary: None,
                 steps: 0,
@@ -915,22 +1020,6 @@ fn aggregate(by_link: Vec<LinkSpecOutcome>) -> SpecGenOutcome {
     }
     out.by_link = by_link;
     out
-}
-
-fn persist_payload(outcome: &SpecGenOutcome) -> Result<Vec<SpecificationRecord>> {
-    let mut out = Vec::with_capacity(outcome.total_specs);
-    for record in &outcome.by_link {
-        for spec in &record.specifications {
-            let json = serde_json::to_string(spec)
-                .wrap_err("failed to JSON-serialize an AuditSpecification")?;
-            out.push(SpecificationRecord {
-                semantic_id: record.extract_id,
-                finding_id: record.finding_id,
-                specification_json: json,
-            });
-        }
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,23 +1154,28 @@ pub(crate) fn interleave_by_extract(links: Vec<LinkInput>) -> Vec<LinkInput> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub(crate) struct ProjectIndex {
-    pub(crate) call_graph: CallGraph,
-    pub(crate) storage_graph: StorageGraph,
-    pub(crate) inheritance_graph: InheritanceGraph,
+pub struct ProjectIndex {
+    /// Held by `Arc` so downstream consumers (e.g. the harness
+    /// `RunForgeTool` that needs a `&CallGraph` for the coverage gate)
+    /// can keep a cheap reference instead of triggering a full
+    /// `CallGraph::clone()` per spec — which over thousands of specs
+    /// fragmented glibc malloc badly enough to OOM the orchestrator.
+    pub call_graph: Arc<CallGraph>,
+    pub storage_graph: StorageGraph,
+    pub inheritance_graph: InheritanceGraph,
     /// `function.id -> (relative_file_path, contract_or_interface_name, kind)`
-    pub(crate) function_owner: BTreeMap<i32, FunctionOwner>,
+    pub function_owner: BTreeMap<i32, FunctionOwner>,
     /// Lower-cased contract name -> contract ids (multiple files may reuse).
-    pub(crate) contract_ids_by_name: BTreeMap<String, Vec<i32>>,
+    pub contract_ids_by_name: BTreeMap<String, Vec<i32>>,
     /// Lower-cased interface name -> interface ids.
-    pub(crate) interface_ids_by_name: BTreeMap<String, Vec<i32>>,
+    pub interface_ids_by_name: BTreeMap<String, Vec<i32>>,
     /// state_variable_id -> declaring contract id (from contract_variable).
-    pub(crate) declaring_contract_for_var: BTreeMap<i32, i32>,
+    pub declaring_contract_for_var: BTreeMap<i32, i32>,
     /// contract_id -> all state-variable ids (own + inherited via the
     /// transitive closure of contract_inherits).
-    pub(crate) visible_state_vars: BTreeMap<i32, BTreeSet<i32>>,
+    pub visible_state_vars: BTreeMap<i32, BTreeSet<i32>>,
     /// Lower-cased state-variable name -> state_variable ids.
-    pub(crate) state_var_ids_by_name: BTreeMap<String, Vec<i32>>,
+    pub state_var_ids_by_name: BTreeMap<String, Vec<i32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1113,6 +1207,11 @@ impl ProjectIndex {
         storage_graph: StorageGraph,
         inheritance_graph: InheritanceGraph,
     ) -> Self {
+        // Wrap the call graph in an `Arc` up front so every downstream
+        // hand-off (including the per-spec `RunForgeTool::callgraph`)
+        // is a refcount bump rather than a deep clone of every contract
+        // / function / source body.
+        let call_graph = Arc::new(call_graph);
         let mut function_owner: BTreeMap<i32, FunctionOwner> = BTreeMap::new();
         let mut contract_ids_by_name: BTreeMap<String, Vec<i32>> = BTreeMap::new();
         let mut interface_ids_by_name: BTreeMap<String, Vec<i32>> = BTreeMap::new();
@@ -1400,24 +1499,24 @@ async fn run_link(
             break;
         }
 
-        if let Some(tokens) = agent.approx_context_tokens(&llm.model.config) {
-            if tokens >= compact_threshold {
-                tracing::info!(
-                    "Spec generator compacting agent context (tokens={tokens}, threshold={compact_threshold})"
-                );
-                agent = agent
-                    .compact(
-                        llm,
-                        debug_prefix
-                            .as_ref()
-                            .map(|prefix| format!("{prefix}-compact"))
-                            .as_deref(),
-                        options.llm_settings.clone(),
-                    )
-                    .await
-                    .wrap_err("spec generator agent failed to compact context")?;
-                compact_count += 1;
-            }
+        if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
+            && tokens >= compact_threshold
+        {
+            tracing::info!(
+                "Spec generator compacting agent context (tokens={tokens}, threshold={compact_threshold})"
+            );
+            agent = agent
+                .compact(
+                    llm,
+                    debug_prefix
+                        .as_ref()
+                        .map(|prefix| format!("{prefix}-compact"))
+                        .as_deref(),
+                    options.llm_settings.clone(),
+                )
+                .await
+                .wrap_err("spec generator agent failed to compact context")?;
+            compact_count += 1;
         }
 
         steps += 1;
@@ -1430,11 +1529,13 @@ async fn run_link(
     let snapshot = draft.snapshot().await;
     let status = snapshot.final_status.unwrap_or(LinkSpecStatus::Abandoned);
     Ok(LinkSpecOutcome {
+        ordinal: link_serial,
         extract_id: link.extract_id,
         historical_id: link.historical_id,
         finding_id: link.finding_id,
         status,
         specifications: snapshot.completed.clone(),
+        specification_ids: Vec::new(),
         abort_reason: snapshot.abort_reason.clone(),
         final_summary: snapshot.final_summary.clone(),
         steps,
@@ -1512,10 +1613,10 @@ pub(crate) fn render_contract_memory(contract: &Contract, project_index: &Projec
         contract.name,
         contract.relative_file_path.display()
     ));
-    if let Some(desc) = &contract.description {
-        if !desc.trim().is_empty() {
-            out.push_str(&format!("Description: {}\n\n", desc.trim()));
-        }
+    if let Some(desc) = &contract.description
+        && !desc.trim().is_empty()
+    {
+        out.push_str(&format!("Description: {}\n\n", desc.trim()));
     }
     out.push_str("## State variables (own + inherited)\n");
     let visible_ids = project_index
@@ -1606,10 +1707,10 @@ pub(crate) fn render_interface_memory(interface: &Interface) -> String {
 /// content. Falls back to the bare `name(args)` form when no body content
 /// was captured (rare, but possible for some interface declarations).
 fn render_function_signature(function: &Function) -> String {
-    if let Some(source) = function.content.as_deref() {
-        if let Some(sig) = extract_signature_head(source) {
-            return format!("`{sig}`");
-        }
+    if let Some(source) = function.content.as_deref()
+        && let Some(sig) = extract_signature_head(source)
+    {
+        return format!("`{sig}`");
     }
     format!("`{}({})`", function.name, function.args)
 }
@@ -1667,6 +1768,7 @@ fn build_system_prompt(link: &LinkInput) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let finding = &link.finding;
+    let extract_functions = render_extracted_functions(&extract.functions);
     format!(
         r#"You are the Specification Generator agent for a knowledge-driven smart-contract auditing pipeline.
 
@@ -1682,6 +1784,10 @@ You operate per-link. The link below stays in your system prompt for the entire 
 - name: {extract_name}
 - definition: {extract_definition}
 - description: {extract_description}
+
+### Project semantic function anchors (real names from this project)
+Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
+{extract_functions}
 
 ## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
 - id: {historical_id}
@@ -1783,7 +1889,9 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
 
 - You MUST end with `finalize`. Without it the runtime records the link as abandoned.
 - Be specific about state variables: prefer `Contract.fieldName` keys when the same field name exists on multiple contracts.
-- Specs must reference *real* functions and state variables you actually read in this project — never invent fictional ones to make a spec stick.
+- Specs must reference *real* contracts, functions, and state variables you actually read in this project — never invent fictional names to make a spec stick.
+- In `setup.contracts`, use real contract or interface names from the project source. Do not use role/instance labels such as `EntryPoint`, `WalletProxy`, `SmartAccount`, `Stage2Module wallet`, `AttackerContract`, or `HookExtension` unless that exact contract/interface exists in the project. Put role descriptions inside the value text instead.
+- In `sequence`, use exact project contract/function names from the function anchors or `lookup_call_graph` results. If the runtime object is a proxy or module-composed wallet, name the concrete module function that actually appears in source, such as `ERC4337v07.executeUserOp`, `Calls.selfExecute`, `Hooks.fallback`, or `Implementation.updateImplementation`.
 - A committed spec must be *defensible*: you can name the project functions in its sequence and the state variables in its invariants. But it does NOT need to be a verbatim reproduction of the historical finding — `related to` is enough.
 "#,
         extract_id = link.extract_id,
@@ -1791,6 +1899,7 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
         extract_name = extract.name,
         extract_definition = extract.definition.trim(),
         extract_description = extract.description.trim(),
+        extract_functions = extract_functions,
         historical_id = link.historical_id,
         historical_category = historical.category.as_str(),
         historical_name = historical.name,
@@ -1952,14 +2061,18 @@ mod post_attack_shape_tests {
 fn build_user_prompt(link: &LinkInput, project_index: &ProjectIndex) -> String {
     let contract_count = project_index.call_graph.contracts.len();
     let interface_count = project_index.call_graph.interfaces.len();
+    let extract_functions = render_extracted_functions(&link.extract.functions);
     format!(
         r#"Explore the matched project semantic for any issue *related to* the historical finding in your system prompt, then commit AuditSpecification(s) for what you find.
 
 Project static-analysis short-term memory: {contract_count} contract entr(ies), {interface_count} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.
 
+Matched semantic function anchors:
+{extract_functions}
+
 Suggested first moves:
 1. `list_memories` to see what's available.
-2. `read_memory` on the contracts named in the project semantic's `functions` list — that is your anchor.
+2. `read_memory` on the contracts listed in "Matched semantic function anchors" — that is your anchor.
 3. From there, follow `lookup_call_graph` edges and `lookup_state_variable_xrefs` to surface every function in or near the semantic that could share the historical finding's failure mode (same root-cause family, same kind of state corruption, same exploit class).
 4. `read_function_source(contract, function)` for the bodies you actually need to reason about. Avoid loading the same big file twice — the signature index already tells you what each function calls.
 5. Commit one spec per plausibly-related issue you find. The spec only needs to be *related to* the historical finding, not a verbatim reproduction.
@@ -1970,10 +2083,36 @@ Link summary: extract_id={extract}, historical_id={historical}, finding_id={find
 "#,
         contract_count = contract_count,
         interface_count = interface_count,
+        extract_functions = extract_functions,
         extract = link.extract_id,
         historical = link.historical_id,
         finding = link.finding_id,
     )
+}
+
+/// Render `link.extract.functions` as the anchor list embedded in the
+/// gen-specs prompts. Each line is `- \`{contract}\`.\`{name}\` —
+/// \`{signature or "(no recorded signature)"}\``. Empty input emits a
+/// single fallback bullet so the prompt slot is never blank.
+fn render_extracted_functions(functions: &[ExtractedFunction]) -> String {
+    if functions.is_empty() {
+        return "- (none recorded; use lookup_call_graph before naming contracts/functions)\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    for f in functions {
+        let signature = f
+            .signature
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no recorded signature)");
+        out.push_str(&format!(
+            "- `{}`.`{}` — `{}`\n",
+            f.contract, f.name, signature
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,10 +2200,7 @@ impl SpecStage {
     }
 }
 
-fn stage_field_mut<'a>(
-    draft: &'a mut SpecDraft,
-    stage: SpecStage,
-) -> &'a mut AuditStateSpecification {
+fn stage_field_mut(draft: &mut SpecDraft, stage: SpecStage) -> &mut AuditStateSpecification {
     match stage {
         SpecStage::Setup => &mut draft.setup,
         SpecStage::PreAttack => &mut draft.pre_attack,
@@ -2829,10 +2965,10 @@ impl LookupStateVariableXrefsTool {
                 args.state_variable
             ));
         }
-        let scope_contract_ids: Option<Vec<i32>> = args.contract.as_deref().map(|name| {
-            let ids = self.project.lookup_contract(name);
-            ids
-        });
+        let scope_contract_ids: Option<Vec<i32>> = args
+            .contract
+            .as_deref()
+            .map(|name| self.project.lookup_contract(name));
 
         let mut out = String::new();
         for var_id in &candidate_ids {

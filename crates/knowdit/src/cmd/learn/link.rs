@@ -20,6 +20,17 @@ pub struct LinkSharedArgs {
     /// still has no semantic links.
     #[arg(long = "link-include-unlinked", default_value_t = false)]
     pub link_include_unlinked: bool,
+
+    /// **Destructive**: before linking, drop every existing
+    /// `semantic_finding_link` + `finding_link_status` row so all
+    /// findings go back to "pending" and are re-graded by the
+    /// current link rubric. Use after upgrading the linker (e.g. the
+    /// Low/Medium/High `LinkStrength` rollout) to retrofit older
+    /// KG databases that pre-date the change. Leaves
+    /// `historical_finding` / `historical_semantic` /
+    /// `pending_semantic` untouched — only link rows are wiped.
+    #[arg(long = "link-reset-existing", default_value_t = false)]
+    pub link_reset_existing: bool,
 }
 
 #[derive(Args)]
@@ -52,6 +63,15 @@ impl LinkArgs {
         finding_link: &FindingLinkCliArgs,
         shared: &LinkSharedArgs,
     ) -> Result<()> {
+        if shared.link_reset_existing {
+            let (deleted_links, deleted_statuses) = db.clear_finding_link_progress().await?;
+            tracing::warn!(
+                deleted_links,
+                deleted_statuses,
+                "--link-reset-existing: wiped existing finding links; \
+                 every finding will be re-graded by the current rubric"
+            );
+        }
         let mut options = finding_link.to_options(shared.link_concurrency);
         options.include_unlinked = shared.link_include_unlinked;
         knowdit_kg::learn::link_pending_findings(db, llm, options).await?;

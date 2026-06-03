@@ -3,16 +3,13 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.2.0"
 edition = "2024"
 authors = [
     "Ziqiao Kong <mio@lazym.io>"
 ]
 license = "GPL-2.0-only"
-readme = "Readme.md"
-description = "State-of-art Agentic Smart Contract Auditing"
-homepage = "https://github.com/abortfuzz/knowdit"
-repository = "https://github.com/abortfuzz/knowdit"
+description = "Smart contract auditing framework."
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -21,7 +18,7 @@ dotenvy = "0"
 color-eyre = "0"
 tracing = "0"
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
-llmy = "0.12"
+llmy = "0.14"
 thiserror = "2"
 async-channel = "2"
 url = "2"
@@ -33,7 +30,7 @@ clap = {version = "4", features = ["env", "derive"] }
 ropey = "1.6"
 globset = "0.4"
 glob = "0.3"
-schemars = "0.9"
+schemars = "1"
 tree-sitter = "0.25"
 tree-sitter-solidity = "1.2.13"
 
@@ -41,13 +38,15 @@ foundry-compilers = { version = "0.19", features = ["svm-solc"] }
 foundry-compilers-artifacts = "0.19"
 alloy-serde = "1"
 toml = "0.8"
+shellexpand = "3"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-knowdit-kg-model = { version = "0.3.1", path = "./crates/knowdit-kg-model" }
-knowdit-repo-model = { version = "0.3.1", path = "./crates/knowdit-repo-model" }
-knowdit-kg = { version = "0.3.1", path = "./crates/knowdit-kg" }
-knowdit-sol = { version = "0.3.1", path = "./crates/knowdit-sol" }
-knowdit = {version = "0.3.1", path = "./crates/knowdit"}
-knowdit-agents = { version = "0.3.1", path = "./crates/knowdit-agents" }
-knowdit-audit = { version = "0.3.1", path = "./crates/knowdit-audit" }
-knowdit-cg-static = { version = "0.3.1", path = "./crates/knowdit-cg-static" }
-knowdit-project = { version = "0.3.1", path = "./crates/knowdit-project" }
+knowdit-kg-model = { version = "0.2.0", path = "./crates/knowdit-kg-model" }
+knowdit-repo-model = { version = "0.2.0", path = "./crates/knowdit-repo-model" }
+knowdit-kg = { version = "0.2.0", path = "./crates/knowdit-kg" }
+knowdit-sol = { version = "0.2.0", path = "./crates/knowdit-sol" }
+knowdit = {version = "0.2.0", path = "./crates/knowdit"}
+knowdit-agents = { version = "0.2.0", path = "./crates/knowdit-agents" }
+knowdit-audit = { version = "0.2.0", path = "./crates/knowdit-audit" }
+knowdit-cg-static = { version = "0.2.0", path = "./crates/knowdit-cg-static" }
+knowdit-project = { version = "0.2.0", path = "./crates/knowdit-project" }

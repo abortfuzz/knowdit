@@ -393,12 +393,3 @@ fn extracted_function_returns(function: &knowdit_repo_model::cg::Function) -> St
         .map(|(_, returns)| returns.to_string())
         .unwrap_or_default()
 }
-
-fn default_project_name(package_root: &PathBuf) -> String {
-    package_root
-        .file_name()
-        .map(|name| name.to_os_string())
-        .and_then(|name| name.into_string().ok())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "move-project".to_string())
-}
