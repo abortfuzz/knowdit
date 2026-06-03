@@ -122,13 +122,7 @@ jobs:
           TOKEN: ${{ secrets.CRATES_IO_KEY }}
         run: |
           cargo login $TOKEN
-          # Publish in dependency order. cargo refuses to re-upload an already-published
-          # version, so we tolerate that one failure mode and keep going.
-          for crate in knowdit-kg-model knowdit-repo-model knowdit-cg-static knowdit-sol knowdit-project knowdit-kg knowdit-agents knowdit-audit; do
-            echo "::group::publish $crate"
-            cargo publish -p "$crate" || echo "::warning::$crate publish failed (likely already published)"
-            echo "::endgroup::"
-            sleep 15
-          done
-          # The leaf crate must succeed; failure here fails the job.
-          cargo publish -p knowdit
+          cargo install cargo-release
+          git config --global user.email "mio@lazym.io"
+          git config --global user.name "lazymio"
+          cargo release --execute --allow-branch '*' --no-confirm --no-push
