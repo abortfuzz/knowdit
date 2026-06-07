@@ -23,7 +23,7 @@ async-channel.workspace = true
 sea-orm.workspace = true
 url.workspace = true
 globset.workspace = true
-chrono.workspace = true
+humantime.workspace = true
 
 knowdit-kg.workspace = true
 knowdit-kg-model.workspace = true

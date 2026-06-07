@@ -567,6 +567,7 @@ impl RegenRunner {
     ) -> Result<RegenChildren> {
         let SpecRegenContext {
             extract_id,
+            historical_id,
             finding_id,
             prior_spec,
             prior_spec_id,
@@ -585,6 +586,7 @@ impl RegenRunner {
         // Phase 1: agent → new spec (in memory).
         let spec_request = SpecRegenRequest {
             extract_id,
+            historical_id,
             finding_id,
             mode,
             prior_feedback: feedback.clone(),
@@ -638,6 +640,7 @@ impl RegenRunner {
         // every row lands or none.
         let new_spec_record = SpecificationRecord {
             semantic_id: extract_id,
+            historical_id,
             finding_id,
             specification_json: serde_json::to_string(&new_spec)
                 .wrap_err("failed to serialize regenerated spec to JSON")?,
@@ -695,6 +698,7 @@ impl RegenRunner {
             })?;
         Ok(Some(SpecRegenContext {
             extract_id: prior_row.semantic_id,
+            historical_id: prior_row.historical_id,
             finding_id: prior_row.finding_id,
             prior_spec,
             prior_spec_id: r.spec_id,
@@ -740,6 +744,7 @@ struct RegenChildren {
 /// data flow rather than a string of dependent .await chains.
 struct SpecRegenContext {
     extract_id: i32,
+    historical_id: i32,
     finding_id: i32,
     prior_spec: AuditSpecification,
     prior_spec_id: i32,

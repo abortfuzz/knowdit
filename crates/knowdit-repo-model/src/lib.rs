@@ -11,8 +11,8 @@ pub use inheritance::{ContractInherit, InheritanceGraph};
 
 pub use repo::{
     CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, FullSpecRegenIds, HarnessRunRecord,
-    HistoricalLinkedFinding, HistoricalSemanticRecord, LoadedCodeGen, LoadedHarnessRun,
-    LoadedSpecification, LoadedValidFinding, METADATA_KEY_PROFILE, MatchStrength,
+    HistoricalLinkedFinding, HistoricalSemanticRecord, LinkResumeState, LoadedCodeGen,
+    LoadedHarnessRun, LoadedSpecification, LoadedValidFinding, METADATA_KEY_PROFILE, MatchStrength,
     PendingReflection, ProjectComponent, ProjectProfile, ProjectSubsystem, ReflectionRecord,
     ReflectionResult, ReflectionWipeStats, RegenEventRecord, RepoDatabase, RunKind, SemanticMatch,
     SemanticMatchSet, ValidFindingRecord,

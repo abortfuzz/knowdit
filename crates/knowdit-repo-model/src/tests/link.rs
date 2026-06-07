@@ -1,12 +1,13 @@
 //! Integration-style tests for [`RepoDatabase::load_link_for_spec`].
 //!
-//! Each test stands up a fresh on-disk SQLite via `temp_db`, calls
-//! `init_schema`, seeds the FK-required parent rows
-//! (`project_semantic` / `historical_semantic` / `historical_finding`)
-//! before any `specification` / `semantic_matched` /
-//! `historical_semantic_finding_link` insert, and asserts on the
-//! `(SemanticMatch, semantic_finding_link::Model)` pair the loader
-//! returns.
+//! Post-Tier-2 the spec row carries its `historical_id` directly, so
+//! `load_link_for_spec` just reads the triple off the spec and joins
+//! to `semantic_matched` + `historical_semantic_finding_link` for the
+//! two strength / evidence pairs — no "pick strongest candidate"
+//! heuristic. These tests cover the four boundary conditions of that
+//! join: full chain present, spec missing, match missing, link
+//! missing, plus the negative case where a link row exists but under
+//! a *different* historical than the spec's stored one.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,9 +99,15 @@ async fn insert_finding(repo: &RepoDatabase, id: i32) {
     .expect("historical_finding parent row should insert");
 }
 
-async fn insert_spec(repo: &RepoDatabase, semantic_id: i32, finding_id: i32) -> i32 {
+async fn insert_spec(
+    repo: &RepoDatabase,
+    semantic_id: i32,
+    historical_id: i32,
+    finding_id: i32,
+) -> i32 {
     let res = specification_model::Entity::insert(specification_model::ActiveModel {
         semantic_id: Set(semantic_id),
+        historical_id: Set(historical_id),
         finding_id: Set(finding_id),
         specification: Set("{}".to_string()),
         ..Default::default()
@@ -157,7 +164,7 @@ async fn returns_pair_when_chain_exists() {
     insert_extract(&temp.repo, 101).await;
     insert_historical(&temp.repo, 555).await;
     insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
+    let spec_id = insert_spec(&temp.repo, 101, 555, 7).await;
     insert_match(&temp.repo, 101, 555, MatchStrength::High, "mapper says yes").await;
     insert_link(&temp.repo, 555, 7, LinkStrength::Medium, "linker says ok").await;
 
@@ -193,9 +200,10 @@ async fn returns_none_when_spec_missing() {
 async fn returns_none_when_no_match() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 101).await;
+    insert_historical(&temp.repo, 555).await;
     insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
-    // No semantic_matched row at all.
+    let spec_id = insert_spec(&temp.repo, 101, 555, 7).await;
+    // No semantic_matched row.
 
     let pair = temp
         .repo
@@ -211,7 +219,7 @@ async fn returns_none_when_match_but_no_link() {
     insert_extract(&temp.repo, 101).await;
     insert_historical(&temp.repo, 555).await;
     insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
+    let spec_id = insert_spec(&temp.repo, 101, 555, 7).await;
     insert_match(&temp.repo, 101, 555, MatchStrength::High, "mapper says yes").await;
     // No historical_semantic_finding_link row.
 
@@ -224,20 +232,24 @@ async fn returns_none_when_match_but_no_link() {
 }
 
 #[tokio::test]
-async fn picks_strongest_match_strength_first() {
+async fn returns_exactly_the_h_recorded_on_the_spec() {
+    // Post-Tier-2 sanity check: with TWO historicals matching the
+    // extract and both linking to the finding, the spec row's stored
+    // `historical_id` is the sole driver of which pair gets returned.
+    // No "strongest of multiple candidates" heuristic involved.
     let temp = temp_db().await;
     insert_extract(&temp.repo, 101).await;
     insert_historical(&temp.repo, 500).await;
     insert_historical(&temp.repo, 600).await;
     insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
-    // Two historicals both match the extract; both own the finding.
-    // 600 has a stronger MATCH (High vs Low) — should win even
-    // though its LINK is weaker.
-    insert_match(&temp.repo, 101, 500, MatchStrength::Low, "weak match").await;
-    insert_match(&temp.repo, 101, 600, MatchStrength::High, "strong match").await;
-    insert_link(&temp.repo, 500, 7, LinkStrength::High, "strong link").await;
-    insert_link(&temp.repo, 600, 7, LinkStrength::Low, "weak link").await;
+    // Spec authored under H=600.
+    let spec_id = insert_spec(&temp.repo, 101, 600, 7).await;
+    // Both H's have matches + links — deliberately giving H=500 the
+    // stronger labels to prove the heuristic isn't being applied.
+    insert_match(&temp.repo, 101, 500, MatchStrength::High, "strong h500").await;
+    insert_match(&temp.repo, 101, 600, MatchStrength::Low, "weak h600").await;
+    insert_link(&temp.repo, 500, 7, LinkStrength::High, "strong link 500").await;
+    insert_link(&temp.repo, 600, 7, LinkStrength::Low, "weak link 600").await;
 
     let (m, link) = temp
         .repo
@@ -245,74 +257,26 @@ async fn picks_strongest_match_strength_first() {
         .await
         .expect("query should succeed")
         .expect("pair");
-    assert_eq!(m.historical_id, 600);
-    assert_eq!(m.strength, MatchStrength::High);
+    assert_eq!(m.historical_id, 600, "must return the H stored on the spec");
+    assert_eq!(m.strength, MatchStrength::Low);
     assert_eq!(link.semantic_node_id, 600);
     assert_eq!(link.strength, LinkStrength::Low);
 }
 
 #[tokio::test]
-async fn breaks_match_tie_with_link_strength() {
-    let temp = temp_db().await;
-    insert_extract(&temp.repo, 101).await;
-    insert_historical(&temp.repo, 700).await;
-    insert_historical(&temp.repo, 800).await;
-    insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
-    // Both matches are Medium → tied. Link strength decides:
-    // historical 800 has High link, 700 has Low.
-    insert_match(&temp.repo, 101, 700, MatchStrength::Medium, "med a").await;
-    insert_match(&temp.repo, 101, 800, MatchStrength::Medium, "med b").await;
-    insert_link(&temp.repo, 700, 7, LinkStrength::Low, "weak").await;
-    insert_link(&temp.repo, 800, 7, LinkStrength::High, "strong").await;
-
-    let (m, link) = temp
-        .repo
-        .load_link_for_spec(spec_id)
-        .await
-        .expect("query should succeed")
-        .expect("pair");
-    assert_eq!(m.historical_id, 800);
-    assert_eq!(link.strength, LinkStrength::High);
-}
-
-#[tokio::test]
-async fn breaks_full_tie_with_lowest_historical_id() {
-    let temp = temp_db().await;
-    insert_extract(&temp.repo, 101).await;
-    insert_historical(&temp.repo, 111).await;
-    insert_historical(&temp.repo, 999).await;
-    insert_finding(&temp.repo, 7).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
-    // All strengths identical → lowest historical_id wins.
-    insert_match(&temp.repo, 101, 999, MatchStrength::High, "high a").await;
-    insert_match(&temp.repo, 101, 111, MatchStrength::High, "high b").await;
-    insert_link(&temp.repo, 999, 7, LinkStrength::High, "link a").await;
-    insert_link(&temp.repo, 111, 7, LinkStrength::High, "link b").await;
-
-    let (m, link) = temp
-        .repo
-        .load_link_for_spec(spec_id)
-        .await
-        .expect("query should succeed")
-        .expect("pair");
-    assert_eq!(m.historical_id, 111);
-    assert_eq!(link.semantic_node_id, 111);
-}
-
-#[tokio::test]
-async fn ignores_links_under_other_historicals() {
+async fn returns_none_when_links_exist_but_not_for_specs_historical() {
+    // A neighbouring historical has a link for the finding, but the
+    // spec was authored under a DIFFERENT historical that has no link
+    // row. Post-Tier-2 we don't cross-pollinate: returns None.
     let temp = temp_db().await;
     insert_extract(&temp.repo, 101).await;
     insert_historical(&temp.repo, 555).await;
     insert_historical(&temp.repo, 777).await;
     insert_finding(&temp.repo, 7).await;
-    insert_finding(&temp.repo, 8).await;
-    let spec_id = insert_spec(&temp.repo, 101, 7).await;
+    // Spec stored under 555.
+    let spec_id = insert_spec(&temp.repo, 101, 555, 7).await;
     insert_match(&temp.repo, 101, 555, MatchStrength::High, "matched").await;
-    // 555 owns no link for finding 7 — only finding 8.
-    insert_link(&temp.repo, 555, 8, LinkStrength::High, "wrong finding").await;
-    // Another historical owns finding 7 but wasn't matched to this extract.
+    // No link row for (555, 7) — only (777, 7).
     insert_link(&temp.repo, 777, 7, LinkStrength::High, "wrong historical").await;
 
     let pair = temp

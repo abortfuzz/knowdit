@@ -9,19 +9,27 @@
 //! as one finishes the scheduler advances the next planned link onto
 //! the freed worker slot.
 //!
-//! Resume safety lives at two layers:
+//! Resume is **DB-driven**. The project DB is the single source of
+//! truth for "what work this project has done". On every run,
+//! [`SpecGenStream::prepare_stream`] consults
+//! [`RepoDatabase::link_resume_state`] per candidate link:
 //!
-//! * **Project DB**: every phase (spec gen, fuzz, reflect, regen) already
-//!   has its own skip-if-done logic, so re-running the same streamloop
-//!   never replays committed work.
-//! * **On-disk snapshots**: written atomically per link into
-//!   `<output>/summaries/link_summary_NNNN.json` (4-digit zero-padded
-//!   ordinal for natural `ls` order). The file appears only after
-//!   the link's pipeline converged or hit `--max-inner-cycles-per-batch`.
-//!   A crash mid-link leaves the DB consistent and at most a
-//!   `link_summary_NNNN.json.tmp` file (ignored by the next run).
-//!   Already-snapshotted links short-circuit on resume so we don't
-//!   spend LLM tokens re-running converged work.
+//! * `NotStarted` (no spec rows for this `(extract, finding)`) →
+//!   keep in the queue, run gen-spec from scratch.
+//! * `Partial` (spec rows exist but no code_gen yet) → keep,
+//!   tagged with the existing `spec_ids` so the gen-spec agent is
+//!   skipped and the inner fuzz/reflect/regen cycle picks up from
+//!   those rows.
+//! * `Built` (≥1 code_gen exists for any spec of this link) → drop
+//!   from the queue. Standalone `audit reflect / regen` can still
+//!   drive any remaining pending state.
+//!
+//! The on-disk `<output>/summaries/link_summary_e{E}_h{H}_f{F}.json`
+//! files are per-link reports — written atomically (tmp + rename) so
+//! a crash mid-write leaves at most a `.tmp` sibling — but streamloop
+//! never reads them back. Stale summary files from earlier code (the
+//! old ordinal-named layout) are harmless and can be deleted at any
+//! time.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -286,11 +294,10 @@ impl StreamloopArgs {
         };
         let stats = scheduler.run(stream).await?;
         tracing::info!(
-            "Streamloop finished: processed_links={} built_specs={} abandoned_links={} skipped_resumed={}",
+            "Streamloop finished: processed_links={} built_specs={} abandoned_links={}",
             stats.processed_links,
             stats.built_specs,
             stats.abandoned_links,
-            stats.skipped_resumed,
         );
         Ok(())
     }
@@ -387,23 +394,20 @@ struct LinkContext {
 }
 
 impl LinkContext {
-    /// Drive one claimed link end-to-end. Short-circuits at the top
-    /// if the per-link snapshot already exists for that ordinal — a
-    /// previous run already converged it, and re-running would burn
-    /// LLM tokens for no new output.
+    /// Drive one claimed link end-to-end. Resume is now DB-driven:
+    /// [`SpecGenStream::prepare_stream`] already filtered out
+    /// previously-built links and tagged previously-partial ones with
+    /// their existing `spec_ids`, so every claim reaching `run_link`
+    /// is either fresh (`NotStarted`) or resuming the inner cycle
+    /// (`Partial`). The on-disk `summaries/link_summary_*.json` file
+    /// is just a per-link report, not a resume marker.
+    /// Returns a tiny [`LinkTally`] so the scheduler can roll up
+    /// `StreamStats` without the full [`LinkSpecOutcome`] crossing
+    /// the JoinSet boundary.
     async fn run_link(self: Arc<Self>, work: PlannedLinkWork) -> Result<LinkTally> {
         let key = work.link_key();
         let ordinal = work.ordinal();
         let total = work.total_links();
-        let snapshot_path = self.snapshot_path(ordinal);
-
-        if snapshot_path.exists() {
-            tracing::info!(
-                "[streamloop link {ordinal:04}/{total}] resume hit: {} already exists — skipping",
-                snapshot_path.display(),
-            );
-            return Ok(LinkTally::skipped());
-        }
 
         let link_started = std::time::Instant::now();
         tracing::info!(
@@ -415,19 +419,22 @@ impl LinkContext {
         let gen_specs_started = std::time::Instant::now();
         let outcome = work.run(&self.repo, &self.primary_llm).await;
         tracing::info!(
-            "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) committed, {} step(s), {} compaction(s) ({})",
+            "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) usable, {} step(s), {} compaction(s) ({})",
             snapshot_status(outcome.status),
-            outcome.specifications.len(),
+            outcome.specification_ids.len(),
             outcome.steps,
             outcome.compact_count,
-            fmt_elapsed(gen_specs_started.elapsed()),
+            humantime::format_duration(gen_specs_started.elapsed()),
         );
 
         let mut drain = LinkDrainCounts::default();
         let mut code_gen_ids: Vec<i32> = Vec::new();
         let mut cycles_run = 0usize;
 
-        if !outcome.specifications.is_empty() {
+        // Gate on `specification_ids` rather than `specifications`:
+        // resumed Partial links arrive with empty parsed specs but
+        // non-empty ids — those ids drive the cycle.
+        if !outcome.specification_ids.is_empty() {
             let mut active: Vec<i32> = outcome.specification_ids.clone();
             for cycle in 1..=self.max_inner_cycles {
                 if active.is_empty() {
@@ -456,9 +463,12 @@ impl LinkContext {
             drain.reflect_graded,
             drain.regen_codegen,
             drain.regen_spec,
-            fmt_elapsed(link_started.elapsed()),
+            humantime::format_duration(link_started.elapsed()),
         );
-        Ok(LinkTally::from_outcome(&outcome))
+        Ok(LinkTally {
+            specs: outcome.specification_ids.len(),
+            abandoned: matches!(outcome.status, LinkSpecStatus::Abandoned),
+        })
     }
 
     /// Mirror every `valid_finding` row in the DB to disk under
@@ -543,7 +553,7 @@ impl LinkContext {
             "[streamloop link {ordinal:04}] cycle {cycle}/{}: finished — {} spec(s) feed into next cycle ({} total)",
             self.max_inner_cycles,
             children.len(),
-            fmt_elapsed(cycle_started.elapsed()),
+            humantime::format_duration(cycle_started.elapsed()),
         );
         Ok(children)
     }
@@ -603,7 +613,7 @@ impl LinkContext {
                     fuzzed.code_gen_id,
                     fuzzed.status,
                     fuzzed.any_violation,
-                    fmt_elapsed(spec_started.elapsed()),
+                    humantime::format_duration(spec_started.elapsed()),
                 );
             } else {
                 tracing::info!(
@@ -611,7 +621,7 @@ impl LinkContext {
                     self.max_inner_cycles,
                     idx + 1,
                     total,
-                    fmt_elapsed(spec_started.elapsed()),
+                    humantime::format_duration(spec_started.elapsed()),
                 );
             }
         }
@@ -623,7 +633,7 @@ impl LinkContext {
             violated,
             total,
             produced.len(),
-            fmt_elapsed(phase_started.elapsed()),
+            humantime::format_duration(phase_started.elapsed()),
         );
         Ok(produced)
     }
@@ -672,7 +682,7 @@ impl LinkContext {
             stats.severity_high,
             stats.severity_medium,
             stats.severity_low,
-            fmt_elapsed(phase_started.elapsed()),
+            humantime::format_duration(phase_started.elapsed()),
         );
         Ok(())
     }
@@ -717,24 +727,24 @@ impl LinkContext {
             stats.errors,
             child_specs.len(),
             child_code_gens.len(),
-            fmt_elapsed(phase_started.elapsed()),
+            humantime::format_duration(phase_started.elapsed()),
         );
         Ok((child_specs, child_code_gens))
     }
 
-    /// On-disk path for one link's summary file. Deterministic on
-    /// the link's 1-based queue ordinal — flat layout under
-    /// `summaries/` instead of one directory per `(extract, hist,
-    /// find)` triple. The `(extract, hist, find)` triple itself is
-    /// still serialized INSIDE the JSON for traceability.
+    /// On-disk path for one link's summary file. Content-keyed on
+    /// the link's `(extract, historical, finding)` identity so the
+    /// same link lands at the same path across runs regardless of
+    /// resume-induced ordinal drift.
     ///
-    /// 4-digit zero pad makes `ls` sort the files in queue order
-    /// without `sort -n`. With >9999 links the names still sort
-    /// correctly lexicographically — they just grow a digit.
-    fn snapshot_path(&self, ordinal: usize) -> PathBuf {
-        self.output_folder
-            .join("summaries")
-            .join(format!("link_summary_{ordinal:04}.json"))
+    /// Streamloop only ever WRITES this file — resume decisions come
+    /// from the DB via [`RepoDatabase::link_resume_state`]. The file
+    /// is a per-link report for humans, not a resume marker.
+    fn snapshot_path(&self, key: &LinkKey) -> PathBuf {
+        self.output_folder.join("summaries").join(format!(
+            "link_summary_e{}_h{}_f{}.json",
+            key.extract_id, key.historical_id, key.finding_id
+        ))
     }
 
     /// Atomic write: serialize →
@@ -761,7 +771,7 @@ impl LinkContext {
             historical_id: key.historical_id,
             finding_id: key.finding_id,
             status: snapshot_status(outcome.status),
-            committed_spec_count: outcome.specifications.len(),
+            committed_spec_count: outcome.specification_ids.len(),
             specification_ids: outcome.specification_ids.clone(),
             code_gen_ids: code_gen_ids.to_vec(),
             abort_reason: outcome.abort_reason.clone(),
@@ -769,7 +779,7 @@ impl LinkContext {
             compact_count: outcome.compact_count,
             drain: drain.clone(),
         };
-        let final_path = self.snapshot_path(ordinal);
+        let final_path = self.snapshot_path(key);
         let tmp_path = final_path.with_extension("json.tmp");
         let body = serde_json::to_string_pretty(&snapshot)
             .wrap_err("failed to JSON-serialize link snapshot")?;
@@ -783,29 +793,6 @@ impl LinkContext {
             )
         })?;
         Ok(())
-    }
-}
-
-/// Human-readable elapsed duration via `chrono::Duration`. Picks the
-/// right unit bucket so a 2-minute phase reads as `2m07s` instead of
-/// `127.3s`. Backed by chrono because we already pull it transitively
-/// — keeps the arithmetic on a real duration type.
-///
-/// - sub-minute: `"12.345s"`
-/// - sub-hour:   `"2m07s"`
-/// - longer:     `"1h05m12s"`
-fn fmt_elapsed(d: std::time::Duration) -> String {
-    let cd = chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::zero());
-    let h = cd.num_hours();
-    let m = cd.num_minutes() % 60;
-    let s = cd.num_seconds() % 60;
-    let ms = (cd.num_milliseconds() % 1000).abs();
-    if h > 0 {
-        format!("{h}h{m:02}m{s:02}s")
-    } else if cd.num_minutes() > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}.{ms:03}s")
     }
 }
 
@@ -823,7 +810,7 @@ fn snapshot_status(s: LinkSpecStatus) -> &'static str {
 /// Bounded-concurrency dispatcher. Pops one `PlannedLinkWork` at a time
 /// from the shared stream, spawns a task per claim, and keeps up to
 /// `concurrency` tasks active via [`JoinSet`]. Stats roll up from each
-/// per-link `LinkTally` as workers finish.
+/// `(specs_built, abandoned)` per worker as they finish.
 struct LinkScheduler {
     ctx: Arc<LinkContext>,
     concurrency: usize,
@@ -833,6 +820,11 @@ impl LinkScheduler {
     async fn run(self, stream: SpecGenStream) -> Result<StreamStats> {
         let total = stream.total_links();
         let stream = Arc::new(Mutex::new(stream));
+        // Per-link return = [`LinkTally`]. The full
+        // `LinkSpecOutcome` carries `Vec<AuditSpecification>` plus
+        // other heavy fields the scheduler doesn't need, so
+        // `run_link` collapses it to the two counters this loop cares
+        // about before crossing the JoinSet boundary.
         let mut tasks: JoinSet<Result<LinkTally>> = JoinSet::new();
         let mut stats = StreamStats::default();
         let mut launched = 0usize;
@@ -855,7 +847,13 @@ impl LinkScheduler {
                 break;
             };
             match joined {
-                Ok(Ok(tally)) => stats.merge(tally),
+                Ok(Ok(tally)) => {
+                    stats.processed_links += 1;
+                    stats.built_specs += tally.specs;
+                    if tally.abandoned {
+                        stats.abandoned_links += 1;
+                    }
+                }
                 Ok(Err(err)) => {
                     tracing::error!("link pipeline failed: {err:#}");
                     stats.errors += 1;
@@ -867,9 +865,8 @@ impl LinkScheduler {
             }
         }
         tracing::info!(
-            "[streamloop scheduler] launched {launched} link pipeline(s); processed_links={} skipped_resumed={}",
+            "[streamloop scheduler] launched {launched} link pipeline(s); processed_links={}",
             stats.processed_links,
-            stats.skipped_resumed,
         );
         Ok(stats)
     }
@@ -879,52 +876,25 @@ impl LinkScheduler {
 // Stats / snapshot types
 // ---------------------------------------------------------------------------
 
+/// Resume is DB-driven now: links the scheduler dispatches always run
+/// some real work (gen-spec or, for resumed Partial links, the inner
+/// cycle from the existing specs). So there's no "skipped" bucket —
+/// `processed_links` is also the launch count.
 #[derive(Default, Debug)]
 struct StreamStats {
     processed_links: usize,
-    skipped_resumed: usize,
     built_specs: usize,
     abandoned_links: usize,
     errors: usize,
 }
 
-impl StreamStats {
-    fn merge(&mut self, tally: LinkTally) {
-        match tally {
-            LinkTally::Resumed => {
-                self.skipped_resumed += 1;
-            }
-            LinkTally::Ran { specs, abandoned } => {
-                self.processed_links += 1;
-                self.built_specs += specs;
-                if abandoned {
-                    self.abandoned_links += 1;
-                }
-            }
-        }
-    }
-}
-
-/// Per-link outcome surfaced to the scheduler. `Resumed` = snapshot
-/// already on disk, no LLM work done; `Ran` = link's pipeline actually
-/// executed and `specs` / `abandoned` reflect what the gen-spec phase
-/// produced.
-enum LinkTally {
-    Resumed,
-    Ran { specs: usize, abandoned: bool },
-}
-
-impl LinkTally {
-    fn skipped() -> Self {
-        Self::Resumed
-    }
-
-    fn from_outcome(outcome: &LinkSpecOutcome) -> Self {
-        Self::Ran {
-            specs: outcome.specifications.len(),
-            abandoned: matches!(outcome.status, LinkSpecStatus::Abandoned),
-        }
-    }
+/// Minimal per-link summary returned by [`LinkContext::run_link`] —
+/// just the two counters the scheduler folds into `StreamStats`.
+/// Lives as its own struct (rather than a `(usize, bool)` tuple) so
+/// the field names show up at every read site.
+struct LinkTally {
+    specs: usize,
+    abandoned: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

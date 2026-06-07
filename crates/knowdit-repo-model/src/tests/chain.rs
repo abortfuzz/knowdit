@@ -19,9 +19,9 @@ use sea_orm::{ActiveValue::Set, EntityTrait};
 
 use crate::db::{
     code_gen as code_gen_model, code_gen_regen as code_gen_regen_model,
-    harness_run as harness_run_model, project_semantic as project_semantic_model,
-    reflection as reflection_model, specification as specification_model,
-    specification_regen as specification_regen_model,
+    harness_run as harness_run_model, historical_semantic as historical_semantic_model,
+    project_semantic as project_semantic_model, reflection as reflection_model,
+    specification as specification_model, specification_regen as specification_regen_model,
 };
 use crate::repo::{CodeGenStatus, ReflectionResult, RepoDatabase, RunKind};
 
@@ -94,9 +94,24 @@ async fn insert_extract(repo: &RepoDatabase, id: i32) {
     .expect("project_semantic row should insert");
 }
 
-async fn insert_spec(repo: &RepoDatabase, extract_id: i32) -> i32 {
+async fn insert_historical(repo: &RepoDatabase, id: i32) {
+    historical_semantic_model::Entity::insert(historical_semantic_model::ActiveModel {
+        id: Set(id),
+        name: Set(format!("hist_{id}")),
+        definition: Set(String::new()),
+        description: Set(String::new()),
+        category: Set(DeFiCategory::Lending),
+        ..Default::default()
+    })
+    .exec(repo.connection())
+    .await
+    .expect("historical_semantic row should insert");
+}
+
+async fn insert_spec(repo: &RepoDatabase, extract_id: i32, historical_id: i32) -> i32 {
     let res = specification_model::Entity::insert(specification_model::ActiveModel {
         semantic_id: Set(extract_id),
+        historical_id: Set(historical_id),
         finding_id: Set(1),
         specification: Set("{}".to_string()),
         ..Default::default()
@@ -243,7 +258,8 @@ async fn spec_chain_depth_counts_multi_hop() {
 async fn prior_incomplete_step_count_zero_when_no_lineage() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1).await;
     let code_id = insert_code_gen(&temp.repo, spec_id).await;
     let run_id = insert_harness_run(&temp.repo, code_id).await;
     // A reflection on the code_gen itself with IncompleteStep — but the
@@ -268,7 +284,8 @@ async fn prior_incomplete_step_count_zero_when_no_lineage() {
 async fn prior_incomplete_step_count_counts_ancestor_incomplete_step() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1).await;
     let parent_code = insert_code_gen(&temp.repo, spec_id).await;
     let child_code = insert_code_gen(&temp.repo, spec_id).await;
     insert_code_gen_regen(&temp.repo, child_code, parent_code).await;
@@ -293,7 +310,8 @@ async fn prior_incomplete_step_count_counts_ancestor_incomplete_step() {
 async fn prior_incomplete_step_count_ignores_non_incomplete_step_results() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1).await;
     let parent_code = insert_code_gen(&temp.repo, spec_id).await;
     let child_code = insert_code_gen(&temp.repo, spec_id).await;
     insert_code_gen_regen(&temp.repo, child_code, parent_code).await;
@@ -319,7 +337,8 @@ async fn prior_incomplete_step_count_ignores_non_incomplete_step_results() {
 async fn prior_incomplete_step_count_sums_across_deeper_lineage() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1).await;
     // Lineage: grand <- middle <- leaf.
     let grand_code = insert_code_gen(&temp.repo, spec_id).await;
     let middle_code = insert_code_gen(&temp.repo, spec_id).await;

@@ -147,6 +147,7 @@ impl RepoDatabase {
     /// pre-inline-gates artifacts and are not worth migrating.
     pub async fn init_schema(&self) -> Result<()> {
         self.drop_legacy_reflection_if_present().await?;
+        self.drop_legacy_specification_if_present().await?;
 
         let schema = Schema::new(self.db.get_database_backend());
         let tables = vec![
@@ -208,6 +209,24 @@ impl RepoDatabase {
             .await
             .wrap_err("failed to create UNIQUE index on semantic_matched")?;
 
+        // Compound INDEX (NOT UNIQUE — multiple rows per
+        // (E, H, F) is legitimate: one gen-spec call can emit
+        // multiple AuditSpecifications, and regen children share
+        // their parent's triple) on `specification` for fast
+        // `link_resume_state` lookups.
+        let spec_link_idx = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("ix_specification_extract_historical_finding")
+            .table(specification_model::Entity)
+            .col(specification_model::Column::SemanticId)
+            .col(specification_model::Column::HistoricalId)
+            .col(specification_model::Column::FindingId)
+            .to_owned();
+        self.db
+            .execute(&spec_link_idx)
+            .await
+            .wrap_err("failed to create compound index on specification")?;
+
         Ok(())
     }
 
@@ -248,6 +267,72 @@ impl RepoDatabase {
             ] {
                 self.db.execute_unprepared(sql).await.wrap_err_with(|| {
                     format!("failed to drop legacy table during migration: {sql}")
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Detect the pre-v? `specification` schema (no `historical_id`
+    /// column). If found, drop `specification` and **every table that
+    /// transitively references a spec** so the new schema can be
+    /// created cleanly. Mirrors [`Self::drop_legacy_reflection_if_present`]
+    /// in spirit: a one-time destructive SQLite-only migration; MySQL
+    /// deployments don't have legacy rows.
+    ///
+    /// Tables dropped (downstream-of-spec):
+    /// * `valid_finding` (FK → reflection)
+    /// * `code_gen_regen` (refs code_gen)
+    /// * `specification_regen` (refs specification)
+    /// * `reflection` (FK → spec + harness_run)
+    /// * `line_coverage` (FK → harness_run)
+    /// * `harness_run` (FK → code_gen)
+    /// * `code_gen` (FK → spec)
+    /// * `specification` (the table we're migrating)
+    ///
+    /// Upstream tables (`project_semantic`, `semantic_matched`,
+    /// `historical_*`, call graph / storage / inheritance) are
+    /// preserved — they're pre-spec-phase, not affected by the column
+    /// addition.
+    async fn drop_legacy_specification_if_present(&self) -> Result<()> {
+        if self.db.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+        use sea_orm::{FromQueryResult, Statement};
+        #[derive(FromQueryResult)]
+        struct ColInfo {
+            name: String,
+        }
+        let columns = ColInfo::find_by_statement(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "PRAGMA table_info(specification)".to_string(),
+        ))
+        .all(&self.db)
+        .await
+        .wrap_err("failed to introspect specification table for legacy schema check")?;
+        let has_historical_id = columns.iter().any(|c| c.name == "historical_id");
+        if !columns.is_empty() && !has_historical_id {
+            tracing::warn!(
+                "specification table lacks `historical_id` column; dropping it together with \
+                 every table that references a spec (code_gen / harness_run / reflection / \
+                 valid_finding / *_regen / line_coverage). One-time SQLite-only migration — the \
+                 next run will repopulate these tables from scratch via the streamloop pipeline."
+            );
+            // Order matters where FKs are enforced: children before
+            // parents. SQLite is permissive but we keep the order
+            // consistent with FK ordering for clarity.
+            for sql in [
+                "DROP TABLE IF EXISTS valid_finding",
+                "DROP TABLE IF EXISTS code_gen_regen",
+                "DROP TABLE IF EXISTS specification_regen",
+                "DROP TABLE IF EXISTS reflection",
+                "DROP TABLE IF EXISTS line_coverage",
+                "DROP TABLE IF EXISTS harness_run",
+                "DROP TABLE IF EXISTS code_gen",
+                "DROP TABLE IF EXISTS specification",
+            ] {
+                self.db.execute_unprepared(sql).await.wrap_err_with(|| {
+                    format!("failed to drop legacy table during specification migration: {sql}")
                 })?;
             }
         }
@@ -1466,10 +1551,18 @@ impl RepoDatabase {
 }
 
 /// One audit specification row, ready to be written to the project DB.
+///
+/// Carries the full `(extract, historical, finding)` triple of the
+/// link that produced the spec — writers persist all three so the
+/// link's identity survives across runs (see the doc on
+/// [`super::db::specification::Model`] for the design rationale).
 #[derive(Debug, Clone)]
 pub struct SpecificationRecord {
     /// `project_semantic.id`.
     pub semantic_id: i32,
+    /// `historical_semantic.id` — which historical the gen-spec agent
+    /// used as its prompt context.
+    pub historical_id: i32,
     /// `historical_finding.id` (cross-DB; not enforced).
     pub finding_id: i32,
     /// JSON-serialized `AuditSpecification` payload.
@@ -1481,8 +1574,28 @@ pub struct SpecificationRecord {
 pub struct LoadedSpecification {
     pub id: i32,
     pub semantic_id: i32,
+    pub historical_id: i32,
     pub finding_id: i32,
     pub specification_json: String,
+}
+
+/// Resume state of a streamloop link, derived purely from DB rows.
+/// Returned by [`RepoDatabase::link_resume_state`].
+///
+/// streamloop / autoloop consult this once per candidate link and
+/// dispatch accordingly:
+///
+/// * [`Self::NotStarted`] — run the gen-spec agent from scratch.
+/// * [`Self::Partial`] — skip gen-spec, feed `spec_ids` straight into
+///   the fuzz / reflect / regen inner cycle.
+/// * [`Self::Built`] — drop the link end-to-end; nothing more to do
+///   in streamloop's view (standalone `audit reflect / regen` can
+///   still drive any remaining pending state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkResumeState {
+    NotStarted,
+    Partial { spec_ids: Vec<i32> },
+    Built,
 }
 
 impl RepoDatabase {
@@ -1501,6 +1614,7 @@ impl RepoDatabase {
         for record in records {
             specification_model::Entity::insert(specification_model::ActiveModel {
                 semantic_id: Set(record.semantic_id),
+                historical_id: Set(record.historical_id),
                 finding_id: Set(record.finding_id),
                 specification: Set(record.specification_json.clone()),
                 ..Default::default()
@@ -1620,6 +1734,7 @@ impl RepoDatabase {
         // 1. Insert new specification.
         let spec_inserted = specification_model::Entity::insert(specification_model::ActiveModel {
             semantic_id: Set(new_spec.semantic_id),
+            historical_id: Set(new_spec.historical_id),
             finding_id: Set(new_spec.finding_id),
             specification: Set(new_spec.specification_json.clone()),
             ..Default::default()
@@ -1759,6 +1874,71 @@ impl RepoDatabase {
             .collect())
     }
 
+    /// Per-link resume state for one `(extract, historical, finding)`
+    /// triple. Used by streamloop / autoloop to decide whether a link
+    /// needs gen-spec from scratch, can skip straight into the
+    /// fuzz/reflect/regen cycle with existing spec rows, or has
+    /// already been fully processed.
+    ///
+    /// The three states are derived from rows in `specification` and
+    /// `code_gen`:
+    ///
+    /// * No spec rows                       → [`LinkResumeState::NotStarted`]
+    /// * Spec rows but no code_gen rows     → [`LinkResumeState::Partial`]
+    /// * Spec rows AND ≥1 code_gen for any  → [`LinkResumeState::Built`]
+    ///
+    /// "Built" here means "the link was given a fair fuzz attempt".
+    /// Downstream regen / reflect can still drive these links via
+    /// their own pending queues; streamloop won't re-enter the link
+    /// at gen-spec.
+    ///
+    /// Keyed on the full `(E, H, F)` triple so sibling LinkInputs that
+    /// share `(E, F)` but differ in `H` get independent states — each
+    /// sibling resumes only the spec rows IT authored, no
+    /// cross-contamination of cycle work.
+    pub async fn link_resume_state(
+        &self,
+        extract_id: i32,
+        historical_id: i32,
+        finding_id: i32,
+    ) -> Result<LinkResumeState> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let specs = specification_model::Entity::find()
+            .filter(specification_model::Column::SemanticId.eq(extract_id))
+            .filter(specification_model::Column::HistoricalId.eq(historical_id))
+            .filter(specification_model::Column::FindingId.eq(finding_id))
+            .order_by_asc(specification_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to load specification rows for ({extract_id}, {historical_id}, {finding_id})"
+                )
+            })?;
+        if specs.is_empty() {
+            return Ok(LinkResumeState::NotStarted);
+        }
+        let spec_ids: Vec<i32> = specs.iter().map(|s| s.id).collect();
+
+        let any_codegen = code_gen_model::Entity::find()
+            .filter(code_gen_model::Column::SpecId.is_in(spec_ids.clone()))
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to query code_gen rows for specs of ({extract_id}, {historical_id}, {finding_id})"
+                )
+            })?
+            .is_some();
+
+        Ok(if any_codegen {
+            LinkResumeState::Built
+        } else {
+            LinkResumeState::Partial { spec_ids }
+        })
+    }
+
     /// Read every specification row from the project database.
     pub async fn load_specifications(&self) -> Result<Vec<LoadedSpecification>> {
         let rows = specification_model::Entity::find()
@@ -1771,6 +1951,7 @@ impl RepoDatabase {
             .map(|row| LoadedSpecification {
                 id: row.id,
                 semantic_id: row.semantic_id,
+                historical_id: row.historical_id,
                 finding_id: row.finding_id,
                 specification_json: row.specification,
             })
@@ -2424,21 +2605,14 @@ impl RepoDatabase {
     ///   KG-native link row from historical_semantic to
     ///   historical_finding, with the link agent's strength + evidence.
     ///
-    /// Each spec is generated for exactly one such pair, but the
-    /// `specification` row only stores `(semantic_id, finding_id)` —
-    /// `historical_id` is recovered by joining through
-    /// `semantic_matched`. When more than one historical both matches
-    /// the extract and owns the finding, the SQL picks the strongest
-    /// candidate via `ORDER BY match_strength DESC, link_strength
-    /// DESC, historical_id ASC LIMIT 1`. Returns `None` only when the
-    /// link tables don't have a complete chain back to this spec.
+    /// Returns `None` only when the link tables don't have a
+    /// complete chain back to this spec (e.g. `semantic_matched` was
+    /// wiped without also wiping the specs).
     ///
-    /// Implementation note: the row is read entirely from
-    /// project-DB tables (`specification`, `semantic_matched`,
-    /// `historical_semantic_finding_link`). The KG's
-    /// `semantic_finding_link` Model is constructed locally from those
-    /// mirror columns — `Model::find_by_statement` is not pointed at a
-    /// KG table.
+    /// The spec row carries `historical_id` directly — no heuristic
+    /// "pick strongest candidate" guess. We look up the two
+    /// strength/evidence pairs by the spec's exact triple:
+    /// `(extract, historical, finding)`.
     pub async fn load_link_for_spec(
         &self,
         spec_id: i32,
@@ -2458,65 +2632,42 @@ impl RepoDatabase {
             return Ok(None);
         };
 
-        // All historicals the mapper matched to this extract.
-        let matches = semantic_matched_model::Entity::find()
+        let matched = semantic_matched_model::Entity::find()
             .filter(semantic_matched_model::Column::ExtractId.eq(spec.semantic_id))
-            .all(&self.db)
+            .filter(semantic_matched_model::Column::HistoricalId.eq(spec.historical_id))
+            .one(&self.db)
             .await
             .wrap_err_with(|| {
                 format!(
-                    "failed to load semantic_matched rows for extract {} (spec {spec_id})",
-                    spec.semantic_id
+                    "failed to load semantic_matched row for (extract={}, historical={}) (spec {spec_id})",
+                    spec.semantic_id, spec.historical_id
                 )
             })?;
-
-        // For each matched historical, see if it actually owns this
-        // spec's finding via the KG-mirrored link table. (`semantic_id`
-        // / `finding_id` form the composite PK on the mirror, so at
-        // most one row per historical.)
-        let mut candidates: Vec<(
-            semantic_matched_model::Model,
-            historical_semantic_finding_link_model::Model,
-        )> = Vec::new();
-        for matched in matches {
-            let link = historical_semantic_finding_link_model::Entity::find()
-                .filter(
-                    historical_semantic_finding_link_model::Column::HistoricalSemanticId
-                        .eq(matched.historical_id),
-                )
-                .filter(
-                    historical_semantic_finding_link_model::Column::HistoricalFindingId
-                        .eq(spec.finding_id),
-                )
-                .one(&self.db)
-                .await
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to load historical_semantic_finding_link for hist={}, finding={}",
-                        matched.historical_id, spec.finding_id
-                    )
-                })?;
-            if let Some(link) = link {
-                candidates.push((matched, link));
-            }
-        }
-
-        // One spec ↔ one logical link by design, but the DB drops
-        // `historical_id` from the spec row. When multiple historicals
-        // survive the joins, pick the strongest by `(match_strength,
-        // link_strength)` rank with lowest `historical_id` as a
-        // deterministic tiebreak.
-        candidates.sort_by(|(am, al), (bm, bl)| {
-            bm.strength
-                .rank()
-                .cmp(&am.strength.rank())
-                .then_with(|| bl.strength.rank().cmp(&al.strength.rank()))
-                .then_with(|| am.historical_id.cmp(&bm.historical_id))
-        });
-
-        let Some((matched, link)) = candidates.into_iter().next() else {
+        let Some(matched) = matched else {
             return Ok(None);
         };
+
+        let link = historical_semantic_finding_link_model::Entity::find()
+            .filter(
+                historical_semantic_finding_link_model::Column::HistoricalSemanticId
+                    .eq(spec.historical_id),
+            )
+            .filter(
+                historical_semantic_finding_link_model::Column::HistoricalFindingId
+                    .eq(spec.finding_id),
+            )
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to load historical_semantic_finding_link for (hist={}, finding={})",
+                    spec.historical_id, spec.finding_id
+                )
+            })?;
+        let Some(link) = link else {
+            return Ok(None);
+        };
+
         Ok(Some((
             SemanticMatch {
                 extract_id: matched.extract_id,

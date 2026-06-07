@@ -14,9 +14,10 @@ use sea_orm::{ActiveValue::Set, EntityTrait};
 
 use crate::db::{
     code_gen as code_gen_model, code_gen_regen as code_gen_regen_model,
-    harness_run as harness_run_model, project_semantic as project_semantic_model,
-    reflection as reflection_model, specification as specification_model,
-    specification_regen as specification_regen_model, valid_finding as valid_finding_model,
+    harness_run as harness_run_model, historical_semantic as historical_semantic_model,
+    project_semantic as project_semantic_model, reflection as reflection_model,
+    specification as specification_model, specification_regen as specification_regen_model,
+    valid_finding as valid_finding_model,
 };
 use crate::repo::{CodeGenStatus, ReflectionResult, RepoDatabase, RunKind};
 
@@ -63,9 +64,30 @@ async fn insert_extract(repo: &RepoDatabase, id: i32) {
     .expect("project_semantic row should insert");
 }
 
-async fn insert_spec(repo: &RepoDatabase, extract_id: i32, finding_id: i32, body: &str) -> i32 {
+async fn insert_historical(repo: &RepoDatabase, id: i32) {
+    historical_semantic_model::Entity::insert(historical_semantic_model::ActiveModel {
+        id: Set(id),
+        name: Set(format!("hist_{id}")),
+        definition: Set(String::new()),
+        description: Set(String::new()),
+        category: Set(DeFiCategory::Lending),
+        ..Default::default()
+    })
+    .exec(repo.connection())
+    .await
+    .expect("historical_semantic row should insert");
+}
+
+async fn insert_spec(
+    repo: &RepoDatabase,
+    extract_id: i32,
+    historical_id: i32,
+    finding_id: i32,
+    body: &str,
+) -> i32 {
     let res = specification_model::Entity::insert(specification_model::ActiveModel {
         semantic_id: Set(extract_id),
+        historical_id: Set(historical_id),
         finding_id: Set(finding_id),
         specification: Set(body.to_string()),
         ..Default::default()
@@ -206,7 +228,8 @@ async fn load_valid_findings_empty_when_no_reflections() {
 async fn load_valid_findings_returns_joined_fields() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{\"setup\":\"x\"}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{\"setup\":\"x\"}").await;
     let code_id = insert_code_gen(
         &temp.repo,
         spec_id,
@@ -265,7 +288,8 @@ async fn load_valid_findings_returns_joined_fields() {
 async fn load_valid_findings_skips_non_valid_finding_results() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, spec_id, "", "").await;
     let run_id = insert_harness_run(&temp.repo, code_id, RunKind::Test, 0, "", None).await;
     // A reflection with Suspect must NOT show up — even if you bend the
@@ -281,7 +305,8 @@ async fn load_valid_findings_skips_non_valid_finding_results() {
 async fn load_valid_findings_orders_by_reflection_id_ascending() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, spec_id, "", "").await;
 
     let mut reflection_ids = Vec::new();
@@ -317,7 +342,8 @@ async fn load_valid_findings_orders_by_reflection_id_ascending() {
 async fn load_valid_findings_errors_when_reflection_has_no_sibling_valid_finding() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, spec_id, "", "").await;
     let run_id = insert_harness_run(&temp.repo, code_id, RunKind::Test, 0, "", None).await;
     // ValidFinding reflection with NO matching valid_finding row —
@@ -355,7 +381,8 @@ async fn pending_reflections_empty_when_db_empty() {
 async fn pending_reflections_includes_each_regen_eligible_result() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, spec_id, "", "").await;
 
     let mut want_ids = Vec::new();
@@ -383,7 +410,8 @@ async fn pending_reflections_includes_each_regen_eligible_result() {
 async fn pending_reflections_excludes_non_regen_results() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, spec_id, "", "").await;
 
     for kind in [
@@ -403,7 +431,8 @@ async fn pending_reflections_excludes_non_regen_results() {
 async fn pending_reflections_excludes_reflection_consumed_by_code_gen_regen() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let parent_code = insert_code_gen(&temp.repo, spec_id, "", "").await;
     let child_code = insert_code_gen(&temp.repo, spec_id, "", "").await;
     let run_id = insert_harness_run(&temp.repo, parent_code, RunKind::Test, 0, "", None).await;
@@ -437,8 +466,9 @@ async fn pending_reflections_excludes_reflection_consumed_by_code_gen_regen() {
 async fn pending_reflections_excludes_reflection_consumed_by_specification_regen() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let parent_spec = insert_spec(&temp.repo, 1, 7, "{}").await;
-    let child_spec = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let parent_spec = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
+    let child_spec = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_id = insert_code_gen(&temp.repo, parent_spec, "", "").await;
     let run_id = insert_harness_run(&temp.repo, code_id, RunKind::Test, 0, "", None).await;
     let consumed_rid = insert_reflection(
@@ -459,7 +489,8 @@ async fn pending_reflections_excludes_reflection_consumed_by_specification_regen
 async fn pending_reflections_includes_code_id_via_harness_run_join() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
-    let spec_id = insert_spec(&temp.repo, 1, 7, "{}").await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
     let code_a = insert_code_gen(&temp.repo, spec_id, "", "a").await;
     let code_b = insert_code_gen(&temp.repo, spec_id, "", "b").await;
     let run_a = insert_harness_run(&temp.repo, code_a, RunKind::Test, 0, "", None).await;

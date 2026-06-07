@@ -6,4 +6,5 @@
 mod chain;
 mod findings;
 mod link;
+mod link_resume;
 mod repo;

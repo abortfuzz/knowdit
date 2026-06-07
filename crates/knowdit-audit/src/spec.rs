@@ -393,7 +393,38 @@ impl PlannedLinkWork {
     /// Run the claimed link end-to-end and commit any built specs to the
     /// project DB. Returns the populated `LinkSpecOutcome` with
     /// `specification_ids` filled in on success.
+    ///
+    /// When the link arrives with `pre_committed_spec_ids` populated
+    /// (DB resume: this `(extract, finding)` already has spec rows but
+    /// no code_gen yet), the gen-spec agent is skipped entirely and
+    /// the outcome is synthesized as `Built` with those ids — the
+    /// caller's inner fuzz / reflect / regen cycle then picks up where
+    /// the prior run left off.
     pub async fn run(self, repo: &RepoDatabase, llm: &LLM) -> LinkSpecOutcome {
+        if !self.link.pre_committed_spec_ids.is_empty() {
+            tracing::info!(
+                "Spec generator skipping gen-spec for resumed link={} (total = {}) {} — {} pre-committed spec(s)",
+                self.ordinal,
+                self.total_links,
+                self.link,
+                self.link.pre_committed_spec_ids.len(),
+            );
+            return LinkSpecOutcome {
+                ordinal: self.ordinal,
+                extract_id: self.link.extract_id,
+                historical_id: self.link.historical_id,
+                finding_id: self.link.finding_id,
+                status: LinkSpecStatus::Built,
+                specifications: Vec::new(),
+                specification_ids: self.link.pre_committed_spec_ids.clone(),
+                abort_reason: None,
+                final_summary: Some(
+                    "resumed from existing spec rows; gen-spec agent skipped".to_string(),
+                ),
+                steps: 0,
+                compact_count: 0,
+            };
+        }
         let mut outcome = process_link(
             &self.link,
             &self.project_index,
@@ -734,17 +765,52 @@ impl SpecificationGenerator {
                 .wrap_err("failed to clear existing specifications before regenerate")?;
             tracing::info!("Specification Generator: --regenerate set, cleared existing specs");
         } else {
-            let done_pairs = repo
-                .loaded_specification_pairs()
-                .await
-                .wrap_err("failed to load already-committed specification pairs")?;
-            if !done_pairs.is_empty() {
-                let before = links.len();
-                links.retain(|l| !done_pairs.contains(&(l.extract_id, l.finding_id)));
+            // DB-driven resume. Per candidate link, look up
+            // [`LinkResumeState`]:
+            //   * NotStarted → keep, run gen-spec from scratch.
+            //   * Partial    → keep, tag with the existing spec ids so
+            //                  [`PlannedLinkWork::run`] skips gen-spec
+            //                  and feeds them into the cycle.
+            //   * Built      → drop (link has already been fuzzed at
+            //                  least once; standalone reflect / regen
+            //                  can still drive any pending state).
+            let before = links.len();
+            let mut kept: Vec<LinkInput> = Vec::with_capacity(before);
+            let mut dropped_built = 0usize;
+            let mut resumed_partial = 0usize;
+            for mut link in links.drain(..) {
+                let state = repo
+                    .link_resume_state(link.extract_id, link.historical_id, link.finding_id)
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to resolve link resume state for (extract={}, historical={}, finding={})",
+                            link.extract_id, link.historical_id, link.finding_id
+                        )
+                    })?;
+                match state {
+                    knowdit_repo_model::LinkResumeState::Built => {
+                        dropped_built += 1;
+                    }
+                    knowdit_repo_model::LinkResumeState::Partial { spec_ids } => {
+                        resumed_partial += 1;
+                        link.pre_committed_spec_ids = spec_ids;
+                        kept.push(link);
+                    }
+                    knowdit_repo_model::LinkResumeState::NotStarted => {
+                        kept.push(link);
+                    }
+                }
+            }
+            links = kept;
+            if dropped_built > 0 || resumed_partial > 0 {
                 tracing::info!(
-                    "Specification Generator: skipping {} link(s) already committed; {} link(s) remaining",
-                    before - links.len(),
-                    links.len()
+                    "Specification Generator resume: {} link(s) dropped (Built), {} link(s) resuming at inner cycle (Partial), {} link(s) remaining; {} → {} link(s) total",
+                    dropped_built,
+                    resumed_partial,
+                    links.len(),
+                    before,
+                    links.len(),
                 );
             }
         }
@@ -789,13 +855,16 @@ impl SpecificationGenerator {
             .links
             .iter()
             .find(|l| {
-                l.extract_id == request.extract_id && l.finding_id == request.finding_id
+                l.extract_id == request.extract_id
+                    && l.historical_id == request.historical_id
+                    && l.finding_id == request.finding_id
             })
             .cloned()
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "no LinkInput for (extract={}, finding={}) — did the KG change since the spec was first synthesized?",
+                    "no LinkInput for (extract={}, historical={}, finding={}) — did the KG change since the spec was first synthesized?",
                     request.extract_id,
+                    request.historical_id,
                     request.finding_id
                 )
             })?;
@@ -844,6 +913,12 @@ struct PlannedLinks {
 #[derive(Debug, Clone)]
 pub struct SpecRegenRequest {
     pub extract_id: i32,
+    /// `historical_semantic.id` of the prior spec — pinned so
+    /// `regen_one_link` matches the **same** LinkInput the original
+    /// spec was authored from. Without this, sibling LinkInputs
+    /// sharing `(E, F)` but with different H could silently swap in
+    /// during regen.
+    pub historical_id: i32,
     pub finding_id: i32,
     pub mode: SpecRegenMode,
     pub prior_feedback: String,
@@ -928,6 +1003,7 @@ async fn commit_link_outcome(repo: &RepoDatabase, outcome: &LinkSpecOutcome) -> 
         match serde_json::to_string(spec) {
             Ok(json) => payload.push(SpecificationRecord {
                 semantic_id: outcome.extract_id,
+                historical_id: outcome.historical_id,
                 finding_id: outcome.finding_id,
                 specification_json: json,
             }),
@@ -1043,6 +1119,14 @@ pub(crate) struct LinkInput {
     pub(crate) extract: ExtractedSemantic,
     pub(crate) historical: semantic_node::Model,
     pub(crate) finding: audit_finding::Model,
+    /// Spec ids already committed for this link in a prior run.
+    /// Empty for fresh links. When non-empty, [`PlannedLinkWork::run`]
+    /// short-circuits the gen-spec agent and emits a [`LinkSpecOutcome`]
+    /// synthesized from these ids — the inner cycle in the caller
+    /// then drives fuzz / reflect / regen against them. Populated by
+    /// [`SpecificationGenerator::plan_links`] via
+    /// [`RepoDatabase::link_resume_state`].
+    pub(crate) pre_committed_spec_ids: Vec<i32>,
 }
 
 impl LinkInput {
@@ -1113,6 +1197,7 @@ pub(crate) fn build_link_inputs(
                 extract: extract.clone(),
                 historical: record.semantic.clone(),
                 finding: finding.clone(),
+                pre_committed_spec_ids: Vec::new(),
             });
         }
     }
