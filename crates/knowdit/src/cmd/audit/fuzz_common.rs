@@ -18,7 +18,7 @@ use std::time::Duration;
 use clap::Args;
 use color_eyre::eyre::Result;
 use knowdit_audit::harness::forge::{ForgeBackend, ForgeRunner};
-use knowdit_audit::harness::solidity::{FuzzOptions, HarnessKind};
+use knowdit_audit::harness::solidity::{FuzzOptions, HarnessKind, SolidityHarness};
 
 /// CLI mirror of [`HarnessKind`] (kebab-cased on the command line).
 /// Two-variant `clap::ValueEnum` that we map to the audit-crate enum.
@@ -241,6 +241,22 @@ impl HarnessSharedArgs {
         // (which the agent uses for real fuzz runs).
         let runner = ForgeRunner::new(backend.clone(), forge_work_dir, Duration::from_secs(60));
         runner.preflight(&harness_dir).await
+    }
+
+    /// Compose a [`SolidityHarness`] in one step: resolve the
+    /// [`ForgeBackend`] (one-time `forge coverage --help` probe),
+    /// fold these args into [`FuzzOptions`], bundle both with the
+    /// [`HarnessKind`] mode. Single seam for "CLI args → backend
+    /// handle" so orchestrators don't re-thread the underlying
+    /// `(backend, options, kind)` tuple manually.
+    pub fn to_solidity_harness(&self, build: FuzzOptionsBuild) -> Result<SolidityHarness> {
+        let forge_backend = self.to_forge_backend()?;
+        let options = self.to_fuzz_options(build);
+        Ok(SolidityHarness::new(
+            self.harness_mode.into(),
+            options,
+            forge_backend,
+        ))
     }
 
     /// Compose [`FuzzOptions`] from `self` plus the per-subcommand

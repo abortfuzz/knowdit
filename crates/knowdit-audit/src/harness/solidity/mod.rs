@@ -32,12 +32,14 @@
 //! docker/cgroup variants) lives one level up at
 //! [`crate::harness::forge`].
 
+mod backend;
 mod harness;
 mod poc;
 mod runtime;
 mod tools;
 mod utils;
 
+pub use backend::SolidityHarness;
 pub use runtime::{CodegenRegenInMemory, FuzzOneOutcome, RegenOutcome, SolidityHarnessGenerator};
 pub use utils::{CounterCall, ForgeTestSummary, FuzzOptions, FuzzOutcome, LinkFuzzOutcome};
 

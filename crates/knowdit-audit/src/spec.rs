@@ -102,6 +102,11 @@ pub struct SpecGenOptions {
     /// link is weaker than `min_link_strength`. Default `Medium`
     /// matches the noise floor used for `min_strength`.
     pub min_link_strength: knowdit_kg_model::link_strength::LinkStrength,
+    /// Pre-rendered Markdown block describing the project's
+    /// source language; verbatim-prepended to each per-link
+    /// system prompt. See [`crate::profile::ProfileOptions::language_prompt_prefix`]
+    /// for the same dispatch convention.
+    pub language_prompt_prefix: String,
 }
 
 impl Default for SpecGenOptions {
@@ -120,6 +125,7 @@ impl Default for SpecGenOptions {
             regenerate: false,
             min_strength: knowdit_repo_model::MatchStrength::Medium,
             min_link_strength: knowdit_kg_model::link_strength::LinkStrength::Medium,
+            language_prompt_prefix: String::new(),
         }
     }
 }
@@ -1526,7 +1532,7 @@ async fn run_link(
         )
     });
 
-    let mut system_prompt = build_system_prompt(link);
+    let mut system_prompt = build_system_prompt(link, &options.language_prompt_prefix);
     if let Some(ext) = prompt_extension {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(ext);
@@ -1849,13 +1855,18 @@ pub(crate) fn spec_memory_criteria() -> AgentMemorySystemPromptCriteria {
 // Prompts
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(link: &LinkInput) -> String {
+fn build_system_prompt(link: &LinkInput, language_prompt_prefix: &str) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let finding = &link.finding;
     let extract_functions = render_extracted_functions(&extract.functions);
+    let prefix = if language_prompt_prefix.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", language_prompt_prefix.trim_end())
+    };
     format!(
-        r#"You are the Specification Generator agent for a knowledge-driven smart-contract auditing pipeline.
+        r#"{prefix}You are the Specification Generator agent for a knowledge-driven smart-contract auditing pipeline.
 
 ## Your task
 

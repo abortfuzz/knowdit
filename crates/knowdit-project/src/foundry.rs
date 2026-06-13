@@ -22,6 +22,7 @@ use foundry_compilers::{
     Project, ProjectBuilder, ProjectPathsConfig,
     compilers::solc::{SolcCompiler, SolcLanguage, SolcSettings},
 };
+use foundry_compilers_artifacts::EvmVersion;
 use foundry_compilers_artifacts::Settings as SolcCompilerSettings;
 use foundry_compilers_artifacts::ast::SourceUnit as AstSourceUnit;
 use foundry_compilers_artifacts::remappings::Remapping;
@@ -174,17 +175,24 @@ impl FoundryProject {
         let options = options.clone();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<SourceUnitInput>> {
-            let paths = Self::build_project_paths(&repo_root, &options)?;
+            // Parse `foundry.toml` once — it drives both path/remapping
+            // resolution and the solc settings assembled below.
+            let foundry = FoundryToml::load(&repo_root)?;
+            let paths = Self::build_project_paths(&repo_root, &options, &foundry)?;
 
-            // Inject the `viaIR` solc flag when requested. We start
-            // from `Settings::default()` (which includes the
-            // default output_selection + `with_ast()` — i.e. exactly
-            // what `ProjectBuilder` would synthesize on its own
-            // without `.settings()`), and only flip `via_ir`.
+            // Assemble solc settings from the selected profile so we
+            // compile the same way `forge build` would — honouring
+            // `evm_version` (e.g. a project that needs the `osaka`-only
+            // `clz` opcode), `via_ir`, and the optimizer config.
+            // Starting from `Settings::default()` preserves the default
+            // output_selection + `with_ast()` that the call-graph
+            // extractor depends on; we only overlay the profile's keys.
+            // The `--via-ir` CLI flag force-enables IR codegen on top of
+            // whatever the toml declares.
             let mut solc_settings = SolcSettings::default();
-            if options.via_ir {
-                solc_settings.settings = SolcCompilerSettings::default().with_via_ir();
-            }
+            solc_settings.settings = foundry
+                .select(&options.profile)
+                .solc_compiler_settings(options.via_ir)?;
 
             // `ephemeral()` disables the on-disk cache
             // (`cache/solidity-files-cache.json`) because (a) cached
@@ -295,8 +303,8 @@ impl FoundryProject {
     fn build_project_paths(
         repo_root: &Path,
         options: &FoundryOptions,
+        foundry: &FoundryToml,
     ) -> Result<ProjectPathsConfig<SolcLanguage>> {
-        let foundry = FoundryToml::load(repo_root)?;
         let mut builder = ProjectPathsConfig::builder().root(repo_root);
 
         // Source-dir precedence: explicit `options.src` →
@@ -682,6 +690,51 @@ pub struct FoundryProfile {
     /// profile to read from (audit currently uses the conventional
     /// default).
     pub test: Option<String>,
+    /// `evm_version = "osaka"` — target EVM version. Must be honoured
+    /// or projects using version-gated opcodes (e.g. the `osaka`-only
+    /// `clz`) fail to compile with solc error 4948.
+    pub evm_version: Option<String>,
+    /// `via_ir = true` — IR-based codegen. Some projects only compile
+    /// (no "stack too deep") through the IR pipeline.
+    pub via_ir: Option<bool>,
+    /// `optimizer = true` — enable the solc optimizer.
+    pub optimizer: Option<bool>,
+    /// `optimizer_runs = 800` — optimizer run count.
+    pub optimizer_runs: Option<usize>,
+}
+
+impl FoundryProfile {
+    /// Assemble the `solc` settings this profile implies, mirroring the
+    /// `[profile.<name>]` keys `forge` itself honours: `evm_version`,
+    /// `via_ir`, `optimizer`, `optimizer_runs`. Starting from
+    /// `Settings::default()` keeps solc's default output_selection
+    /// (plus AST) that the call-graph extractor relies on; we only
+    /// overlay the keys the profile actually sets, leaving the rest at
+    /// their defaults.
+    ///
+    /// `cli_via_ir` force-enables IR codegen (the `--via-ir` escape
+    /// hatch) regardless of the toml; the toml can also enable it on
+    /// its own. Errors only on an `evm_version` string solc doesn't
+    /// recognise.
+    fn solc_compiler_settings(&self, cli_via_ir: bool) -> Result<SolcCompilerSettings> {
+        let mut settings = SolcCompilerSettings::default();
+        if cli_via_ir || self.via_ir.unwrap_or(false) {
+            settings = settings.with_via_ir();
+        }
+        if let Some(raw) = self.evm_version.as_deref() {
+            let evm: EvmVersion = raw
+                .parse()
+                .map_err(|_| eyre!("unsupported evm_version `{raw}` in foundry.toml"))?;
+            settings.evm_version = Some(evm);
+        }
+        if let Some(enabled) = self.optimizer {
+            settings.optimizer.enabled = Some(enabled);
+        }
+        if let Some(runs) = self.optimizer_runs {
+            settings.optimizer.runs = Some(runs);
+        }
+        Ok(settings)
+    }
 }
 
 impl FoundryToml {

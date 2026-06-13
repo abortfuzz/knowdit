@@ -12,6 +12,16 @@ pub struct FindingLinkCliArgs {
     #[arg(long)]
     pub finding_token_budget: Option<usize>,
 
+    /// Hard ceiling on findings per batch — independent of token
+    /// budget. Token-based partitioning alone packs too many findings
+    /// when each finding's text is short (e.g. ~150 tok/finding on
+    /// the Move KG fits ~480 findings in a 72K budget); agents in
+    /// practice can only stably emit decisions for a few dozen
+    /// findings per attempt before finalizing prematurely. Leave
+    /// unset to use the built-in default.
+    #[arg(long)]
+    pub max_findings_per_batch: Option<usize>,
+
     /// Maximum attempts per (finding-batch × semantic-chunk): if the agent
     /// finalizes without covering every finding in the batch, the runner
     /// re-runs a fresh agent restricted to the still-missing findings,
@@ -20,13 +30,14 @@ pub struct FindingLinkCliArgs {
     #[arg(long, default_value_t = 3)]
     pub max_response_attempts: usize,
 
-    /// Per-attempt cap on agent steps (one tool call = one step). Bigger
-    /// batches need more steps so the agent can emit one decision per
-    /// finding plus a finalize call. Default 320 sized for the post-
-    /// refactor "emit 1 finding per step" agent on the biggest batches
-    /// we currently materialise (~250 findings) with headroom for a
-    /// few extra reasoning steps.
-    #[arg(long, default_value_t = 320)]
+    /// Per-attempt cap on agent steps (one tool call = one step).
+    /// Rule of thumb: needs to be at least `max_findings_per_batch +
+    /// 4` (one emit per finding, one finalize, plus a few reasoning
+    /// steps). The runner logs a warning at batch start when this
+    /// looks too tight. Default 200 sized for the new ~50-finding
+    /// batches; raise alongside `--max-findings-per-batch` if you
+    /// crank it up.
+    #[arg(long, default_value_t = 200)]
     pub link_max_agent_steps: usize,
 }
 
@@ -57,6 +68,7 @@ impl FindingLinkCliArgs {
             concurrency,
             input_token_budget: self.input_token_budget,
             finding_token_budget: self.finding_token_budget,
+            max_findings_per_batch: self.max_findings_per_batch,
             max_response_attempts: self.max_response_attempts,
             max_agent_steps: self.link_max_agent_steps,
             include_unlinked: false,

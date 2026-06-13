@@ -38,7 +38,7 @@ use crate::types::AuditSpecification;
 use super::agent_loop::{
     AttemptHandle, CoverageSummary, GraderOptions, RunSummary, drive_agent_loop,
 };
-use super::prompt::VERDICT_SYSTEM;
+use super::prompt::verdict_system;
 
 /// Single per-`harness_run` grading task. All fields owned so the
 /// input crosses async boundaries by clone — no lifetime params on
@@ -91,6 +91,11 @@ pub struct VerdictGrader {
     /// [`VerdictInput`] handed to the agent. `None` when the profile
     /// phase hasn't run yet (older DBs).
     project_profile: Option<ProjectProfile>,
+    /// Pre-rendered Markdown block describing the project's
+    /// source language; verbatim-prepended to the verdict
+    /// system prompt at grade time. The audit crate never names
+    /// a non-Solidity language; the consumer binary fills this in.
+    language_prompt_prefix: String,
     options: GraderOptions,
 }
 
@@ -101,6 +106,7 @@ impl VerdictGrader {
     pub async fn new(
         repo: &RepoDatabase,
         repo_root: &Path,
+        language_prompt_prefix: String,
         llm: &LLM,
         options: GraderOptions,
     ) -> Result<Self> {
@@ -130,8 +136,18 @@ impl VerdictGrader {
             project_index,
             repo_root: repo_root.to_path_buf(),
             project_profile,
+            language_prompt_prefix,
             options,
         })
+    }
+
+    /// The language prompt prefix this grader was configured
+    /// with. Used by
+    /// [`super::severity_grader::SeverityGrader::new_with_index`]
+    /// to inherit the same prefix without re-reading project
+    /// metadata.
+    pub fn language_prompt_prefix(&self) -> &str {
+        &self.language_prompt_prefix
     }
 
     /// Skip the project-index reload when the caller already has one
@@ -164,7 +180,10 @@ impl VerdictGrader {
             &self.project_index,
             &self.llm,
             &self.options,
-            VERDICT_SYSTEM.to_string(),
+            // The language prefix is prepended to the system
+            // prompt by `verdict_system`; this crate never
+            // branches on a closed-set language enum.
+            verdict_system(&self.language_prompt_prefix),
             user_prompt,
             &cache_suffix,
             tools,

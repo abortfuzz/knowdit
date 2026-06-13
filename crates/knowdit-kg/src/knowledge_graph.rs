@@ -1,8 +1,8 @@
 use crate::error::Result;
 use knowdit_kg_model::db::{
-    audit_finding, audit_finding_category, category, finding_category, finding_merge, project,
-    project_category, project_finding, project_platform, project_semantic, semantic_finding_link,
-    semantic_function, semantic_merge, semantic_node,
+    audit_finding, audit_finding_category, category, finding_category, finding_link_status,
+    finding_merge, project, project_category, project_finding, project_platform, project_semantic,
+    semantic_finding_link, semantic_function, semantic_merge, semantic_node,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,14 @@ pub struct KnowledgeGraph {
     /// `audit_finding.project_id` for the same reason.
     pub project_findings: Vec<project_finding::Model>,
     pub semantic_finding_links: Vec<semantic_finding_link::Model>,
+    /// Per-finding completion marker. A finding's sfl rows are only
+    /// downstream-visible once a row for it lands here, so the
+    /// status set must round-trip through snapshots — otherwise a
+    /// freshly-restored DB would have orphaned sfl rows that
+    /// `load_knowledge_graph`'s gate filters out, and the snapshot
+    /// would no longer be self-contained.
+    #[serde(default)]
+    pub finding_link_statuses: Vec<finding_link_status::Model>,
     pub finding_merges: Vec<finding_merge::Model>,
 }
 

@@ -21,6 +21,10 @@ use crate::cg::{
 };
 pub use crate::db::code_gen::CodeGenStatus;
 pub use crate::db::harness_run::RunKind;
+use crate::db::r#move::{
+    move_function_metadata as move_function_metadata_model, move_struct as move_struct_model,
+    move_struct_ability as move_struct_ability_model,
+};
 pub use crate::db::reflection::ReflectionResult;
 pub use crate::db::semantic_matched::MatchStrength;
 use crate::db::{
@@ -40,6 +44,10 @@ use crate::db::{
     valid_finding as valid_finding_model,
 };
 use crate::inheritance::{ContractInherit, InheritanceGraph};
+use crate::move_lang::{
+    MoveAbility, MoveField, MoveFunctionMetadata, MoveGenericParam, MovePackageStructure,
+    MoveStruct,
+};
 use crate::storage::{
     ContractVariable, FunctionStateVariable, StateVariable, StorageDotOptions, StorageGraph,
     dot_escape,
@@ -180,6 +188,13 @@ impl RepoDatabase {
             schema.create_table_from_entity(code_gen_regen_model::Entity),
             schema.create_table_from_entity(line_coverage_model::Entity),
             schema.create_table_from_entity(project_model::Entity),
+            // Move-only tables. Created on every backend (incl. OSS
+            // Solidity-only builds) so the schema stays uniform; the
+            // Solidity write paths never populate them and they stay
+            // empty.
+            schema.create_table_from_entity(move_struct_model::Entity),
+            schema.create_table_from_entity(move_struct_ability_model::Entity),
+            schema.create_table_from_entity(move_function_metadata_model::Entity),
         ];
 
         for mut table in tables {
@@ -226,6 +241,40 @@ impl RepoDatabase {
             .execute(&spec_link_idx)
             .await
             .wrap_err("failed to create compound index on specification")?;
+
+        // UNIQUE on (contract_id, name) for `move_struct`. A Move
+        // module can't declare two structs with the same name; the
+        // unique constraint lets `INSERT OR REPLACE` / `on_conflict`
+        // produce idempotent re-runs of `export-repo-info`.
+        let move_struct_uniq = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("ux_move_struct_contract_name")
+            .table(move_struct_model::Entity)
+            .col(move_struct_model::Column::ContractId)
+            .col(move_struct_model::Column::Name)
+            .unique()
+            .to_owned();
+        self.db
+            .execute(&move_struct_uniq)
+            .await
+            .wrap_err("failed to create UNIQUE index on move_struct")?;
+
+        // UNIQUE on (struct_id, ability) for `move_struct_ability`.
+        // A struct can't carry the same ability twice; this also
+        // gates the writer's bulk-insert from accidentally
+        // duplicating rows.
+        let move_ability_uniq = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("ux_move_struct_ability_struct_ability")
+            .table(move_struct_ability_model::Entity)
+            .col(move_struct_ability_model::Column::StructId)
+            .col(move_struct_ability_model::Column::Ability)
+            .unique()
+            .to_owned();
+        self.db
+            .execute(&move_ability_uniq)
+            .await
+            .wrap_err("failed to create UNIQUE index on move_struct_ability")?;
 
         Ok(())
     }
@@ -1244,6 +1293,18 @@ pub struct SemanticMatchSet {
 /// truth for both sides.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectProfile {
+    /// Project source language, declared by the profile agent
+    /// after reading the project sources. This is the
+    /// **authoritative** language signal downstream phases
+    /// (mapper / spec / reflect / regen) consume — by the time
+    /// any of them runs, the profile row exists and its
+    /// `language` field is the one source of truth. The
+    /// project-load auto-detector
+    /// (`knowdit_project::ProjectData::language`) is still used
+    /// **before profile completes** (for harness backend
+    /// selection + CG ingest path), but the profile-agent
+    /// declaration overrides it for prompt purposes.
+    pub language: crate::SourceLanguage,
     /// ~200-word prose paragraph describing what this project IS.
     pub domain_summary: String,
     /// LLM-chosen short labels for the mechanisms / subsystems the
@@ -1650,6 +1711,7 @@ impl RepoDatabase {
         for record in records {
             let inserted = specification_model::Entity::insert(specification_model::ActiveModel {
                 semantic_id: Set(record.semantic_id),
+                historical_id: Set(record.historical_id),
                 finding_id: Set(record.finding_id),
                 specification: Set(record.specification_json.clone()),
                 ..Default::default()
@@ -2980,5 +3042,249 @@ impl RepoDatabase {
                 )
             })?;
         Ok(n as u32)
+    }
+
+    // -----------------------------------------------------------------
+    // Move-language schema (Stage 3a of plan_move_lang.md). Written
+    // by movy CLI subprocesses, read by the audit pipeline (gen-spec /
+    // mapper prompts) when language == Move. Solidity paths never
+    // touch these tables; the rows stay empty in OSS builds.
+    // -----------------------------------------------------------------
+
+    /// Persist a full per-repo static-analysis snapshot —
+    /// [`CallGraph`] plus [`MovePackageStructure`] — in a single
+    /// orchestrated call. Composes [`Self::write_call_graph`] and
+    /// [`Self::write_package_structure`] sequentially.
+    ///
+    /// Each underlying writer is its own crash-safe transaction
+    /// (`clear all + bulk insert`); we do **not** wrap them in
+    /// one outer transaction. That's intentional: each writer is
+    /// independently idempotent, so a crash between them leaves
+    /// the DB in a valid partial state (CG written, structure
+    /// stale or empty) that the next invocation overwrites
+    /// cleanly. The §0.1.D resume-safety property holds without
+    /// the complexity of threading a shared transaction through
+    /// two large writer paths.
+    ///
+    /// Movy's `analysis export-repo-info` CLI is the canonical
+    /// caller. Future repo-level static analyses
+    /// (type graphs, storage patterns, …) should plug in here
+    /// rather than spawning more standalone export commands.
+    pub async fn write_repo_info(
+        &self,
+        call_graph: &CallGraph,
+        structure: &MovePackageStructure,
+    ) -> Result<()> {
+        self.write_call_graph(call_graph).await?;
+        self.write_package_structure(structure).await?;
+        Ok(())
+    }
+
+    /// Replace the per-package Move structure (struct definitions +
+    /// per-function metadata) in one crash-safe transaction. Same
+    /// `clear all + bulk insert` pattern as [`Self::write_storage_graph`]
+    /// — a crash partway through rolls back; re-running fully
+    /// replaces the previous snapshot.
+    ///
+    /// `contract` and `function` rows must already exist (they
+    /// are written by [`Self::write_call_graph`], invoked as the
+    /// first half of [`Self::write_repo_info`]); this method
+    /// validates referential integrity at insert time by relying
+    /// on the FKs SQLite enforces with `PRAGMA foreign_keys=ON`.
+    pub async fn write_package_structure(&self, structure: &MovePackageStructure) -> Result<()> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .wrap_err("failed to begin move package structure write transaction")?;
+
+        // FK-safe clear order: ability rows reference move_struct,
+        // function_metadata references function (independent).
+        move_struct_ability_model::Entity::delete_many()
+            .exec(&txn)
+            .await
+            .wrap_err("failed to clear move_struct_ability rows")?;
+        move_function_metadata_model::Entity::delete_many()
+            .exec(&txn)
+            .await
+            .wrap_err("failed to clear move_function_metadata rows")?;
+        move_struct_model::Entity::delete_many()
+            .exec(&txn)
+            .await
+            .wrap_err("failed to clear move_struct rows")?;
+
+        let mut next_ability_id: i32 = 1;
+        for s in &structure.structs {
+            let generic_params_json =
+                serde_json::to_string(&s.generic_params).wrap_err_with(|| {
+                    format!(
+                        "failed to serialize move_struct.generic_params for struct id={}",
+                        s.id
+                    )
+                })?;
+            let fields_json = serde_json::to_string(&s.fields).wrap_err_with(|| {
+                format!(
+                    "failed to serialize move_struct.fields for struct id={}",
+                    s.id
+                )
+            })?;
+            move_struct_model::Entity::insert(move_struct_model::ActiveModel {
+                id: Set(s.id),
+                contract_id: Set(s.contract_id),
+                name: Set(s.name.clone()),
+                generic_params: Set(generic_params_json),
+                fields: Set(fields_json),
+            })
+            .exec(&txn)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to insert move_struct id={} contract={} name={}",
+                    s.id, s.contract_id, s.name
+                )
+            })?;
+
+            // Dedupe abilities on input so a malformed analyzer
+            // emit that double-lists an ability hits a clear Rust-
+            // level error rather than a cryptic UNIQUE violation.
+            let mut seen: std::collections::BTreeSet<MoveAbility> =
+                std::collections::BTreeSet::new();
+            for ability in &s.abilities {
+                if !seen.insert(*ability) {
+                    continue;
+                }
+                move_struct_ability_model::Entity::insert(move_struct_ability_model::ActiveModel {
+                    id: Set(next_ability_id),
+                    struct_id: Set(s.id),
+                    ability: Set(*ability),
+                })
+                .exec(&txn)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to insert move_struct_ability struct_id={} ability={:?}",
+                        s.id, ability
+                    )
+                })?;
+                next_ability_id += 1;
+            }
+        }
+
+        for m in &structure.function_metadata {
+            let generic_params_json = serde_json::to_string(&m.generic_params).wrap_err_with(
+                || {
+                    format!(
+                        "failed to serialize move_function_metadata.generic_params for function id={}",
+                        m.function_id
+                    )
+                },
+            )?;
+            move_function_metadata_model::Entity::insert(
+                move_function_metadata_model::ActiveModel {
+                    function_id: Set(m.function_id),
+                    visibility: Set(m.visibility),
+                    is_entry: Set(m.is_entry),
+                    generic_params: Set(generic_params_json),
+                },
+            )
+            .exec(&txn)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to insert move_function_metadata function_id={}",
+                    m.function_id
+                )
+            })?;
+        }
+
+        txn.commit()
+            .await
+            .wrap_err("failed to commit move package structure write transaction")?;
+        Ok(())
+    }
+
+    /// Read back the Move package structure into a single in-memory
+    /// snapshot. Three table scans + one in-Rust group-by; no
+    /// joins. Callers that only need one slice can build dedicated
+    /// queries on top of the raw SeaORM entities.
+    pub async fn load_package_structure(&self) -> Result<MovePackageStructure> {
+        let struct_rows = move_struct_model::Entity::find()
+            .order_by_asc(move_struct_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load move_struct rows")?;
+        let ability_rows = move_struct_ability_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load move_struct_ability rows")?;
+        let metadata_rows = move_function_metadata_model::Entity::find()
+            .order_by_asc(move_function_metadata_model::Column::FunctionId)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load move_function_metadata rows")?;
+
+        // Group abilities by struct_id; sort each list by
+        // canonical order so the returned `Vec<MoveAbility>` is
+        // deterministic regardless of insertion order in the DB.
+        let mut abilities_by_struct: BTreeMap<i32, Vec<MoveAbility>> = BTreeMap::new();
+        for row in ability_rows {
+            abilities_by_struct
+                .entry(row.struct_id)
+                .or_default()
+                .push(row.ability);
+        }
+        for list in abilities_by_struct.values_mut() {
+            list.sort_by_key(|a| a.canonical_order());
+        }
+
+        let structs = struct_rows
+            .into_iter()
+            .map(|row| {
+                let abilities = abilities_by_struct.remove(&row.id).unwrap_or_default();
+                let generic_params: Vec<MoveGenericParam> =
+                    serde_json::from_str(&row.generic_params).wrap_err_with(|| {
+                        format!(
+                            "failed to deserialize move_struct.generic_params for id={}",
+                            row.id
+                        )
+                    })?;
+                let fields: Vec<MoveField> =
+                    serde_json::from_str(&row.fields).wrap_err_with(|| {
+                        format!("failed to deserialize move_struct.fields for id={}", row.id)
+                    })?;
+                Ok::<_, color_eyre::eyre::Report>(MoveStruct {
+                    id: row.id,
+                    contract_id: row.contract_id,
+                    name: row.name,
+                    abilities,
+                    generic_params,
+                    fields,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let function_metadata = metadata_rows
+            .into_iter()
+            .map(|row| {
+                let generic_params: Vec<MoveGenericParam> =
+                    serde_json::from_str(&row.generic_params).wrap_err_with(|| {
+                        format!(
+                            "failed to deserialize move_function_metadata.generic_params for function_id={}",
+                            row.function_id
+                        )
+                    })?;
+                Ok::<_, color_eyre::eyre::Report>(MoveFunctionMetadata {
+                    function_id: row.function_id,
+                    visibility: row.visibility,
+                    is_entry: row.is_entry,
+                    generic_params,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MovePackageStructure {
+            function_metadata,
+            structs,
+        })
     }
 }

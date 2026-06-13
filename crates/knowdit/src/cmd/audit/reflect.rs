@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
+use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::reflect::GraderPair;
 use knowdit_audit::reflect::agent_loop::{CoverageSummary, GraderOptions, RunSummary};
 use knowdit_audit::reflect::coverage_audit;
@@ -34,7 +35,7 @@ use knowdit_audit::reflect::severity_grader::{SeverityInput, SeverityOutput};
 use knowdit_audit::types::AuditSpecification;
 use knowdit_repo_model::{
     CodeGenStatus, LoadedCodeGen, LoadedHarnessRun, LoadedSpecification, ReflectionRecord,
-    ReflectionResult, RepoDatabase, ValidFindingRecord,
+    ReflectionResult, RepoDatabase, SourceLanguage, ValidFindingRecord,
 };
 use llmy::client::client::LLM;
 
@@ -155,6 +156,24 @@ impl ReflectArgs {
         repo_root: &Path,
         shared: &ReflectSharedArgs,
     ) -> Result<ReflectStats> {
+        // Reflect needs the language for verdict + severity grader
+        // prompt prefix. Source from the persisted profile —
+        // workflow drivers always run profile first; the standalone
+        // CLI fails fast here if profile is missing.
+        let profile = repo.get_project_profile().await?.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Reflect requires a ProjectProfile; run `knowdit agentic profile` for \
+                 project '{project_name}' first (or let `workflow streamloop` run the \
+                 profile phase)."
+            )
+        })?;
+        // Standalone CLI: Solidity-only path (see map-semantics).
+        if profile.language != SourceLanguage::Solidity {
+            return Err(color_eyre::eyre::eyre!(
+                "standalone `agentic reflect` only supports Solidity projects; use `workflow streamloop` for other languages"
+            ));
+        }
+        let language_prompt_prefix = SolidityHarness::PROMPT_PREFIX.to_string();
         if shared.allow_redo_reflect {
             let cleared = repo.clear_reflections_for_redo().await?;
             tracing::warn!(
@@ -178,6 +197,7 @@ impl ReflectArgs {
             repo.clone(),
             repo_root,
             llm.clone(),
+            language_prompt_prefix,
             grader_options,
             shared.reflect_skip_grader,
             shared.reflect_concurrency.unwrap_or(1).max(1),
@@ -196,6 +216,7 @@ impl ReflectArgs {
         llm: &LLM,
         project_name: &str,
         repo_root: &Path,
+        language_prompt_prefix: String,
         shared: &ReflectSharedArgs,
         code_gen_ids: &[i32],
     ) -> Result<ReflectStats> {
@@ -216,6 +237,7 @@ impl ReflectArgs {
             repo.clone(),
             repo_root,
             llm.clone(),
+            language_prompt_prefix,
             grader_options,
             shared.reflect_skip_grader,
             shared.reflect_concurrency.unwrap_or(1).max(1),
@@ -318,6 +340,7 @@ impl ReflectionRunner {
         repo: RepoDatabase,
         repo_root: &Path,
         llm: llmy::client::client::LLM,
+        language_prompt_prefix: String,
         grader_options: GraderOptions,
         skip_grader: bool,
         concurrency: usize,
@@ -328,7 +351,16 @@ impl ReflectionRunner {
         let graders = if skip_grader {
             None
         } else {
-            Some(GraderPair::new(&repo, repo_root, &llm, grader_options).await?)
+            Some(
+                GraderPair::new(
+                    &repo,
+                    repo_root,
+                    language_prompt_prefix,
+                    &llm,
+                    grader_options,
+                )
+                .await?,
+            )
         };
         Ok(Self {
             repo,

@@ -27,10 +27,8 @@
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
-use knowdit_audit::harness::forge::ForgeBackend;
-use knowdit_audit::harness::solidity::{
-    CodegenRegenInMemory, RegenOutcome, SolidityHarnessGenerator,
-};
+use knowdit_audit::harness::HarnessBackend;
+use knowdit_audit::harness::solidity::{CodegenRegenInMemory, RegenOutcome};
 use knowdit_audit::spec::{
     LinkSpecStatus, SpecGenOptions, SpecRegenInMemory, SpecRegenMode, SpecRegenRequest,
     SpecificationGenerator,
@@ -41,7 +39,6 @@ use knowdit_repo_model::{
     repo::SpecificationRecord,
 };
 use llmy::client::client::LLM;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -114,28 +111,34 @@ pub struct RegenArgs {
 }
 
 impl RegenArgs {
-    /// CLI entry: open the project DB, build the forge backend,
-    /// delegate to [`Self::regen`], print summary.
+    /// CLI entry: open the project DB, build the Solidity harness
+    /// backend, delegate to [`Self::regen`], print summary.
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let backend = self.harness.to_forge_backend()?;
+        let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+            repo_root: spec.root.clone(),
+            default_cache_key: format!("{}-knowdit-regen", spec.name),
+            max_specs: 0,
+            concurrency: self.shared.regen_concurrency.unwrap_or(1).max(1),
+            regenerate: false,
+            via_ir: self.harness.harness_via_ir,
+        })?;
         // Preflight before the regen agent loop touches forge — same
         // rationale as standalone fuzz.
-        self.harness
-            .preflight(&backend, &spec.root)
+        harness_backend
+            .preflight(&spec.root)
             .await
             .wrap_err("forge environment preflight failed")?;
         let stats = Self::regen(
+            &harness_backend,
             &repo,
             llm,
             &spec.name,
-            &spec.root,
             &self.harness,
             &self.shared,
-            &backend,
         )
         .await?;
         println!(
@@ -152,43 +155,29 @@ impl RegenArgs {
     }
 
     /// In-process entry: consume the pending-reflection queue against
-    /// pre-built repo + LLM handles + forge backend. The autoloop
-    /// reuses the same `backend` it passed to fuzz so the
-    /// `forge coverage --help` probe runs once per cycle, not twice.
-    pub async fn regen(
+    /// pre-built repo + LLM handles + harness backend. The autoloop
+    /// reuses the same `harness_backend` it passed to fuzz so the
+    /// `forge coverage --help` probe (Solidity) — or movy version
+    /// check (Move) — runs once per cycle, not twice.
+    pub async fn regen<B: HarnessBackend + Clone + 'static>(
+        harness_backend: &B,
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
-        repo_root: &Path,
         harness: &HarnessSharedArgs,
         shared: &RegenSharedArgs,
-        backend: &ForgeBackend,
     ) -> Result<RegenStats> {
-        let fuzz_options = harness.to_fuzz_options(FuzzOptionsBuild {
-            repo_root: repo_root.to_path_buf(),
-            default_cache_key: format!("{}-knowdit-regen", project_name),
-            max_specs: 0,
-            concurrency: shared.regen_concurrency.unwrap_or(1).max(1),
-            regenerate: false,
-            via_ir: harness.harness_via_ir,
-        });
-        let fuzz_generator = SolidityHarnessGenerator::new(
-            harness.harness_mode.into(),
-            repo,
-            llm,
-            &fuzz_options,
-            backend.clone(),
-        );
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
             cache_key: format!("{}-knowdit-spec-regen", project_name),
             debug_prefix: harness.harness_debug_prefix.clone(),
+            language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
         };
         let runner = RegenRunner::new(
             repo.clone(),
-            fuzz_generator,
+            harness_backend.clone(),
             llm.clone(),
             spec_options,
             shared.regen_max_chain_depth,
@@ -206,44 +195,29 @@ impl RegenArgs {
     /// `spec_ids` and return the newly-created child spec / code_gen ids.
     /// Used by streaming schedulers to advance one link's lineage without
     /// blocking on global pending queue completion.
-    pub async fn regen_specs(
+    pub async fn regen_specs<B: HarnessBackend + Clone + 'static>(
+        harness_backend: &B,
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
-        repo_root: &Path,
         harness: &HarnessSharedArgs,
         shared: &RegenSharedArgs,
-        backend: &ForgeBackend,
         spec_ids: &[i32],
     ) -> Result<(RegenStats, Vec<i32>, Vec<i32>)> {
         if spec_ids.is_empty() {
             return Ok((RegenStats::default(), Vec::new(), Vec::new()));
         }
-        let fuzz_options = harness.to_fuzz_options(FuzzOptionsBuild {
-            repo_root: repo_root.to_path_buf(),
-            default_cache_key: format!("{}-knowdit-regen", project_name),
-            max_specs: 0,
-            concurrency: shared.regen_concurrency.unwrap_or(1).max(1),
-            regenerate: false,
-            via_ir: harness.harness_via_ir,
-        });
-        let fuzz_generator = SolidityHarnessGenerator::new(
-            harness.harness_mode.into(),
-            repo,
-            llm,
-            &fuzz_options,
-            backend.clone(),
-        );
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
             cache_key: format!("{}-knowdit-spec-regen", project_name),
             debug_prefix: harness.harness_debug_prefix.clone(),
+            language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
         };
         let runner = RegenRunner::new(
             repo.clone(),
-            fuzz_generator,
+            harness_backend.clone(),
             llm.clone(),
             spec_options,
             shared.regen_max_chain_depth,
@@ -299,19 +273,24 @@ impl RegenStats {
 /// about concurrency or queue scheduling — that's the dispatcher's
 /// job (see [`dispatch_pending`] / [`dispatch_pending_for_specs`]).
 /// Cheap to wrap in `Arc` and share across worker tasks.
-struct RegenRunner {
+///
+/// Generic over the harness backend so the regen pathway is
+/// language-agnostic at orchestration level — the trait methods
+/// `regen_codegen_for_spec` / `codegen_for_in_memory_spec` provide
+/// the only mode-specific seams.
+struct RegenRunner<B: HarnessBackend> {
     repo: RepoDatabase,
-    fuzz: SolidityHarnessGenerator,
+    harness: B,
     llm: LLM,
     spec_options: SpecGenOptions,
     max_chain_depth: u32,
     spec_regen_patch_threshold: u32,
 }
 
-impl RegenRunner {
+impl<B: HarnessBackend> RegenRunner<B> {
     fn new(
         repo: RepoDatabase,
-        fuzz: SolidityHarnessGenerator,
+        harness: B,
         llm: LLM,
         spec_options: SpecGenOptions,
         max_chain_depth: u32,
@@ -319,7 +298,7 @@ impl RegenRunner {
     ) -> Self {
         Self {
             repo,
-            fuzz,
+            harness,
             llm,
             spec_options,
             max_chain_depth,
@@ -342,7 +321,7 @@ fn truncate_pending(pending: &mut Vec<PendingReflection>, max_pending: usize, la
     }
 }
 
-impl RegenRunner {
+impl<B: HarnessBackend + 'static> RegenRunner<B> {
     /// Drain the *global* pending-reflection queue with a worker pool
     /// of `concurrency` tasks. `max_pending = 0` means no cap. Consumes
     /// `self` because the concurrent path needs `Arc::new(self)` to
@@ -525,10 +504,10 @@ impl RegenRunner {
     ) -> Result<RegenChildren> {
         let feedback = format_prior_feedback(r);
         let outcome: RegenOutcome = self
-            .fuzz
-            .regen_one_spec(r.spec_id, feedback)
+            .harness
+            .regen_codegen_for_spec(&self.repo, &self.llm, r.spec_id, feedback)
             .await
-            .wrap_err_with(|| format!("regen_one_spec failed for spec_id={}", r.spec_id))?;
+            .wrap_err_with(|| format!("regen_codegen_for_spec failed for spec_id={}", r.spec_id))?;
         // Lineage row is written after the new code_gen lands. Resume
         // safety: a crash here leaves the new code_gen but no lineage,
         // and the original reflection is still pending — next pass
@@ -620,8 +599,10 @@ impl RegenRunner {
         // Phase 2: agent → new code_gen for the in-memory spec.
         let synthetic_spec_id = -(r.reflection_id);
         let codegen: CodegenRegenInMemory = self
-            .fuzz
-            .regen_codegen_with_explicit_spec(
+            .harness
+            .codegen_for_in_memory_spec(
+                &self.repo,
+                &self.llm,
                 extract_id,
                 finding_id,
                 new_spec.clone(),

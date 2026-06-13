@@ -14,35 +14,14 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 
 use crate::scope::{ProjectScope, ProjectScopeContent, ScopedSourceFile};
 
-/// Source language for a project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceLanguage {
-    Solidity,
-    Move,
-}
-
-impl SourceLanguage {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Solidity => "Solidity",
-            Self::Move => "Move",
-        }
-    }
-
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Solidity => "sol",
-            Self::Move => "move",
-        }
-    }
-
-    pub fn code_fence(self) -> &'static str {
-        match self {
-            Self::Solidity => "solidity",
-            Self::Move => "move",
-        }
-    }
-}
+/// Source language for a project. Re-exported from
+/// `knowdit-repo-model` so the type lives in one place — the
+/// `ProjectProfile` row in the repo DB carries it, and the
+/// project-load auto-detector here writes it into
+/// [`ProjectData`]. Keeping the canonical definition in
+/// `knowdit-repo-model` (the storage-layer crate) means the
+/// DB-side serde derives are the only ones in the workspace.
+pub use knowdit_repo_model::SourceLanguage;
 
 /// A project, as the higher-level pipeline sees it.
 ///

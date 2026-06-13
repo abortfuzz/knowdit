@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use color_eyre::eyre::Result;
+use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::spec::{
     LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecificationGenerator,
 };
@@ -157,12 +158,23 @@ struct RunSummary {
 impl GenSpecsArgs {
     /// CLI entry: open the project DB, delegate to
     /// [`Self::gen_specs`], pretty-print + optionally dump `--out`.
+    ///
+    /// Standalone CLI is Solidity-only — same rationale as
+    /// `map-semantics`. Move projects go through `workflow
+    /// streamloop`, which passes its harness backend's prefix.
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let outcome = Self::gen_specs(&repo, llm, &spec.name, &self.shared).await?;
+        let outcome = Self::gen_specs(
+            &repo,
+            llm,
+            &spec.name,
+            SolidityHarness::PROMPT_PREFIX.to_string(),
+            &self.shared,
+        )
+        .await?;
         println!(
             "Specification Generator finished: {} link(s), {} built, {} abandoned, {} spec(s) committed",
             outcome.link_count,
@@ -191,12 +203,27 @@ impl GenSpecsArgs {
     /// In-process entry: run the Specification Generator against an
     /// already-opened repo DB + LLM. No `&self` — every knob comes
     /// from `shared`.
+    ///
+    /// `language_prompt_prefix` is the language-context block to
+    /// prepend to the spec-gen agent's system prompt. Sourced from
+    /// `harness_backend.prompt_prefix()` by streamloop, or
+    /// hardcoded to `SolidityHarness::PROMPT_PREFIX` by the
+    /// standalone Solidity-only CLI.
     pub async fn gen_specs(
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
+        language_prompt_prefix: String,
         shared: &GenSpecsSharedArgs,
     ) -> Result<SpecGenOutcome> {
+        // Profile fetch verifies the upstream pipeline produced one.
+        repo.get_project_profile().await?.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Specification Generator requires a ProjectProfile; run `knowdit agentic \
+                 profile` for project '{project_name}' first (or let `workflow streamloop` \
+                 run the profile phase)."
+            )
+        })?;
         let cache_key = shared
             .gen_specs_cache_key
             .clone()
@@ -217,6 +244,7 @@ impl GenSpecsArgs {
             regenerate: shared.gen_specs_regenerate,
             min_strength: shared.gen_specs_min_strength.into(),
             min_link_strength: shared.gen_specs_min_link_strength.into(),
+            language_prompt_prefix,
         };
         SpecificationGenerator::new().run(repo, llm, &options).await
     }

@@ -109,9 +109,6 @@ pub struct StaticCommand {
 pub enum StaticCommands {
     /// Solidity tree-sitter / AST extraction tools (no LLM)
     Solidity(StaticSolidityCommand),
-
-    /// Move package extraction and call-graph tools (no LLM)
-    Move(StaticMoveCommand),
 }
 
 #[derive(Args)]
@@ -189,24 +186,6 @@ pub enum StaticSolidityCommands {
     ExportStateVariableDot(cmd::solidity::SolidityExportStateVariableDotArgs),
 }
 
-#[derive(Args)]
-pub struct StaticMoveCommand {
-    #[command(subcommand)]
-    pub command: StaticMoveCommands,
-}
-
-#[derive(Subcommand)]
-pub enum StaticMoveCommands {
-    /// Extract Move modules and functions as JSON
-    Extract(cmd::r#move::ExtractMoveArgs),
-
-    /// Build a Move package and analyze its call graph into the project database
-    CallGraph(cmd::r#move::MoveCallGraphArgs),
-
-    /// Export the stored Move callgraph from the project database as DOT/PDF
-    ExportCallGraphDot(cmd::r#move::MoveExportCallGraphDotArgs),
-}
-
 // ---------------------------------------------------------------------------
 // `knowdit agentic ...` — LLM-driven workflows
 // ---------------------------------------------------------------------------
@@ -225,7 +204,10 @@ pub struct AgenticCommand {
 
 #[derive(Subcommand)]
 pub enum AgenticCommands {
-    /// LLM-driven Solidity workflows
+    /// LLM-driven Solidity workflows (CG / storage-graph LLM
+    /// agents). Phases that work on any project language —
+    /// extract / profile / map / gen-specs / reflect / regen —
+    /// live at this level, not under `solidity`.
     Solidity(AgenticSolidityCommand),
 
     /// Select and localize semantic specifications from a scope corpus
@@ -333,7 +315,6 @@ impl StaticCommand {
     pub async fn run(self) -> color_eyre::Result<()> {
         match self.command {
             StaticCommands::Solidity(command) => command.run().await,
-            StaticCommands::Move(command) => command.run().await,
         }
     }
 }
@@ -368,17 +349,6 @@ impl StaticSolidityCommand {
             StaticSolidityCommands::CallGraph(args) => args.run().await?,
             StaticSolidityCommands::ExportCallGraphDot(args) => args.run().await?,
             StaticSolidityCommands::ExportStateVariableDot(args) => args.run().await?,
-        }
-        Ok(())
-    }
-}
-
-impl StaticMoveCommand {
-    pub async fn run(self) -> color_eyre::Result<()> {
-        match self.command {
-            StaticMoveCommands::Extract(args) => args.run().await?,
-            StaticMoveCommands::CallGraph(args) => args.run().await?,
-            StaticMoveCommands::ExportCallGraphDot(args) => args.run().await?,
         }
         Ok(())
     }

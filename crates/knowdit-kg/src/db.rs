@@ -5,15 +5,15 @@ use crate::vulnerability::{FINDING_TAXONOMY, VulnerabilityCategory};
 use itertools::Itertools;
 use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_link_status,
-    finding_merge, project, project_category, project_finding, project_platform, project_semantic,
-    semantic_finding_link, semantic_function, semantic_merge, semantic_node,
+    finding_merge, pending_semantic, project, project_category, project_finding, project_platform,
+    project_semantic, semantic_finding_link, semantic_function, semantic_merge, semantic_node,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
     ActiveModelTrait,
     ActiveValue::{NotSet, Set},
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    IntoActiveModel, QueryFilter, Schema, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, Schema, Statement, TransactionTrait,
     sea_query::{ForeignKey, ForeignKeyAction, TableCreateStatement},
 };
 use std::collections::{HashMap, HashSet};
@@ -104,7 +104,11 @@ impl DbValidationReport {
 #[derive(Debug, Clone)]
 struct DetectedDbIssue {
     issue: DbValidationIssue,
-    repair_action: DbValidationRepairAction,
+    /// `None` for issues that can't be auto-fixed via row deletion.
+    /// `validate_db --repair` skips these — the caller has to make a
+    /// decision (e.g. partial-link state is fixed by finishing the
+    /// learn run, not by deleting rows).
+    repair_action: Option<DbValidationRepairAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,20 +242,87 @@ impl HistoricalDatabase {
         Ok(me)
     }
 
+    /// Open a fresh database transaction. Exposed so callers that
+    /// need to compose multiple write methods atomically can drive
+    /// the txn lifetime themselves — e.g. `workflow learn` admits a
+    /// project via [`Self::write_project_completed_txn`] AND then
+    /// enqueues its new canonicals via
+    /// [`Self::enqueue_pending_canonical_semantics_txn`] in the
+    /// SAME transaction, so a kill between the two steps rolls
+    /// back the whole thing.
+    pub async fn begin(&self) -> Result<DatabaseTransaction> {
+        Ok(self.db.begin().await?)
+    }
+
     // ── Schema / init ───────────────────────────────────────────────
 
+    /// One-shot lifecycle setup: create tables, run idempotent
+    /// schema migrations, and seed the static taxonomies. The whole
+    /// thing runs inside a **single transaction** so a kill mid-init
+    /// either leaves the DB completely untouched OR fully set up —
+    /// never half-seeded. Without this guard, a partial seed (e.g.
+    /// only 2 of 14 DeFi categories inserted before SIGKILL) would
+    /// stick because both seed loops short-circuit on `if !existing
+    /// .is_empty()`, and `write_project_completed` later silently
+    /// drops `project_category` links for missing category names
+    /// (db.rs:~2965 just `tracing::warn!` and continues).
     pub async fn init(&self) -> Result<()> {
-        self.create_tables(&self.db, true).await?;
-        // `connect()` also runs this, so on a fresh `init-db` against
-        // a pre-existing file this is a no-op (the columns exist) and
-        // on a brand-new file it's also a no-op (create_tables just
-        // built the table with the right shape). Keeping the call
-        // here documents intent: every DB lifecycle path runs the
-        // schema migrations.
-        self.migrate_schema().await?;
-        self.seed_categories().await?;
-        self.seed_finding_categories().await?;
+        let txn = self.db.begin().await?;
+        self.create_tables(&txn, true).await?;
+        self.migrate_schema_within(&txn).await?;
+        self.seed_categories_within(&txn).await?;
+        self.seed_finding_categories_within(&txn).await?;
+        txn.commit().await?;
         Ok(())
+    }
+
+    /// Read-only probe for whether this database already holds the
+    /// historical-KG schema. Consumers (`workflow streamloop` /
+    /// `autoloop`, `agentic map-semantics`) call this so they can skip
+    /// the write-requiring [`Self::init`] when pointed at a
+    /// pre-populated DB — including one exposed through a SELECT-only
+    /// grant (e.g. a read-only MySQL replica), where the `CREATE TABLE`
+    /// / `ALTER TABLE` in `init` would be denied and is unnecessary.
+    /// Presence of the `project` table is the marker: every initialized
+    /// KG has it, and it's the first table `create_tables` emits.
+    pub async fn schema_is_initialized(&self) -> Result<bool> {
+        self.table_exists("project").await
+    }
+
+    /// Backend-aware existence probe for a single table. Read-only.
+    /// Lets lifecycle code tolerate a historical KG that legitimately
+    /// dropped a writer-side table — e.g. a read-only v3 consumer DB
+    /// with `pending_semantic` removed, where a *missing* queue table
+    /// is semantically identical to a *drained* (empty) one.
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        let backend = self.db.get_database_backend();
+        let sql = match backend {
+            DatabaseBackend::MySql => format!(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = {}",
+                sql_string_literal(table)
+            ),
+            DatabaseBackend::Postgres => format!(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = current_schema() AND table_name = {}",
+                sql_string_literal(table)
+            ),
+            DatabaseBackend::Sqlite => format!(
+                "SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = {}",
+                sql_string_literal(table)
+            ),
+            // `DatabaseBackend` is `#[non_exhaustive]`; for any future
+            // backend we can't introspect, assume the table is present
+            // so behaviour is unchanged (the caller's query runs as
+            // before).
+            _ => return Ok(true),
+        };
+        let row = self
+            .db
+            .query_one_raw(Statement::from_string(backend, sql))
+            .await?;
+        Ok(row.is_some())
     }
 
     /// Apply every idempotent in-place schema migration this crate
@@ -261,7 +332,16 @@ impl HistoricalDatabase {
     /// `migrate_schema` repeatedly is cheap (a few PRAGMA introspect
     /// queries) and safe.
     pub async fn migrate_schema(&self) -> Result<()> {
-        self.migrate_link_strength_columns().await?;
+        self.migrate_link_strength_columns_within(&self.db).await?;
+        Ok(())
+    }
+
+    /// Transaction-scoped variant of [`Self::migrate_schema`] used
+    /// by [`Self::init`]'s atomic setup. Same migrations, same
+    /// idempotence guarantees, but every statement lands inside the
+    /// caller's transaction.
+    async fn migrate_schema_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
+        self.migrate_link_strength_columns_within(conn).await?;
         Ok(())
     }
 
@@ -589,6 +669,19 @@ impl HistoricalDatabase {
             .exec(&txn)
             .await?;
             imported_rows += graph.semantic_finding_links.len();
+        }
+
+        if !graph.finding_link_statuses.is_empty() {
+            finding_link_status::Entity::insert_many(
+                graph
+                    .finding_link_statuses
+                    .iter()
+                    .cloned()
+                    .map(|model| model.into_active_model()),
+            )
+            .exec(&txn)
+            .await?;
+            imported_rows += graph.finding_link_statuses.len();
         }
 
         if !graph.finding_merges.is_empty() {
@@ -1126,10 +1219,16 @@ impl HistoricalDatabase {
         Ok(values)
     }
 
-    async fn seed_categories(&self) -> Result<()> {
+    /// Transaction-scoped seed used by [`Self::init`]. Atomicity
+    /// matters: a kill mid-loop on the standalone variant would
+    /// leave a partial taxonomy that the `if !existing.is_empty()`
+    /// gate then refuses to re-seed, so the table is permanently
+    /// short of rows. Inside the init transaction, mid-seed kill
+    /// rolls back to zero rows — next run seeds from scratch.
+    async fn seed_categories_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
         use crate::category::DeFiCategory;
 
-        let existing = category::Entity::find().all(&self.db).await?;
+        let existing = category::Entity::find().all(conn).await?;
         if !existing.is_empty() {
             return Ok(());
         }
@@ -1139,15 +1238,15 @@ impl HistoricalDatabase {
                 name: Set(*cat),
                 ..Default::default()
             };
-            category::Entity::insert(am).exec(&self.db).await?;
+            category::Entity::insert(am).exec(conn).await?;
         }
 
         tracing::info!("Seeded {} DeFi categories", DeFiCategory::ALL.len());
         Ok(())
     }
 
-    async fn seed_finding_categories(&self) -> Result<()> {
-        let existing = finding_category::Entity::find().all(&self.db).await?;
+    async fn seed_finding_categories_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
+        let existing = finding_category::Entity::find().all(conn).await?;
         if !existing.is_empty() {
             return Ok(());
         }
@@ -1159,7 +1258,7 @@ impl HistoricalDatabase {
                 description: Set(entry.description.to_string()),
                 ..Default::default()
             };
-            finding_category::Entity::insert(am).exec(&self.db).await?;
+            finding_category::Entity::insert(am).exec(conn).await?;
         }
 
         tracing::info!(
@@ -1485,6 +1584,13 @@ impl HistoricalDatabase {
             canonical_for_id.insert(*id, *id);
         }
 
+        // Partial-link safety is handled at the consumer's entry
+        // point (`HistoricalDatabaseArgs::connect_init_for_consumer`
+        // refuses to open a partial DB unless the operator opts in
+        // via `--force-allow-partial-historical`). By the time this
+        // query runs, the caller has either confirmed the DB is
+        // fully linked or explicitly accepted the risk — no
+        // additional silent filtering here.
         let links = semantic_finding_link::Entity::find()
             .filter(semantic_finding_link::Column::SemanticNodeId.is_in(search_ids.iter().copied()))
             .all(&self.db)
@@ -1970,6 +2076,11 @@ impl HistoricalDatabase {
                 .map(|merge| (merge.from_finding_id, merge.to_finding_id)),
         );
 
+        // Presence of a row in `finding_link_status` = finding fully
+        // processed by the linker (partial-commit sfl rows have no
+        // matching row here yet). The same set drives the resume
+        // skip-list — partial findings flow back through
+        // `link_pending_findings` for completion.
         let processed_ids: HashSet<i32> = finding_link_status::Entity::find()
             .all(&self.db)
             .await?
@@ -2102,6 +2213,61 @@ impl HistoricalDatabase {
         &self,
         result: &crate::learn::PersistedFindingLinkResult,
     ) -> Result<()> {
+        self.upsert_finding_link_rows(result).await?;
+        self.mark_finding_link_complete(result.finding_id).await?;
+        tracing::info!(
+            "Finding {} processed with {} semantic link(s) targeting finding {}",
+            result.finding_id,
+            result.semantic_links.len(),
+            result.link_target_finding_id
+        );
+        Ok(())
+    }
+
+    /// Partial-commit hook for the link runner: durably persist the
+    /// links discovered by ONE batch for this finding. The finding
+    /// stays out of `finding_link_status` until
+    /// [`mark_finding_link_complete`] runs, so downstream consumers
+    /// (mapper, spec-gen) skip the still-partial sfl rows via
+    /// `load_knowledge_graph`'s gate. Mid-flight crashes leave the
+    /// sfl rows in place; the next pass re-emits the same edges and
+    /// the strongest-strength-wins upsert is idempotent.
+    pub async fn upsert_finding_link_partial(
+        &self,
+        result: &crate::learn::PersistedFindingLinkResult,
+    ) -> Result<()> {
+        self.upsert_finding_link_rows(result).await
+    }
+
+    /// Counterpart to [`Self::upsert_finding_link_partial`]: insert
+    /// the `finding_link_status` row so downstream consumers start
+    /// seeing the finding's links. No-op if the row already exists
+    /// (resume-safe).
+    pub async fn mark_finding_link_complete(&self, finding_id: i32) -> Result<()> {
+        let txn = self.db.begin().await?;
+        let existing = finding_link_status::Entity::find_by_id(finding_id)
+            .one(&txn)
+            .await?;
+        if existing.is_none() {
+            finding_link_status::Entity::insert(finding_link_status::ActiveModel {
+                audit_finding_id: Set(finding_id),
+            })
+            .exec(&txn)
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Shared sfl writer: strongest-strength wins per
+    /// (semantic, finding). Called by both the full and partial
+    /// commit paths; partial commit may upsert the same edge
+    /// multiple times across batches and the comparison guarantees
+    /// no per-cycle downgrade.
+    async fn upsert_finding_link_rows(
+        &self,
+        result: &crate::learn::PersistedFindingLinkResult,
+    ) -> Result<()> {
         let txn = self.db.begin().await?;
 
         for link in &result.semantic_links {
@@ -2113,38 +2279,35 @@ impl HistoricalDatabase {
                 .one(&txn)
                 .await?;
 
-            if existing.is_none() {
-                let row = semantic_finding_link::ActiveModel {
-                    semantic_node_id: Set(link.semantic_id),
-                    audit_finding_id: Set(result.link_target_finding_id),
-                    strength: Set(link.strength),
-                    evidence: Set(link.evidence.clone()),
-                };
-                semantic_finding_link::Entity::insert(row)
-                    .exec(&txn)
-                    .await?;
+            match existing {
+                None => {
+                    let row = semantic_finding_link::ActiveModel {
+                        semantic_node_id: Set(link.semantic_id),
+                        audit_finding_id: Set(result.link_target_finding_id),
+                        strength: Set(link.strength),
+                        evidence: Set(link.evidence.clone()),
+                    };
+                    semantic_finding_link::Entity::insert(row)
+                        .exec(&txn)
+                        .await?;
+                }
+                Some(existing_row) => {
+                    // Strongest-strength wins on conflict. Equal-rank
+                    // collisions keep the existing row to avoid
+                    // unnecessary writes.
+                    let existing_rank = existing_row.strength.rank();
+                    let incoming_rank = link.strength.rank();
+                    if incoming_rank > existing_rank {
+                        let mut active: semantic_finding_link::ActiveModel = existing_row.into();
+                        active.strength = Set(link.strength);
+                        active.evidence = Set(link.evidence.clone());
+                        active.update(&txn).await?;
+                    }
+                }
             }
         }
 
-        let status = finding_link_status::Entity::find_by_id(result.finding_id)
-            .one(&txn)
-            .await?;
-        if status.is_none() {
-            let status = finding_link_status::ActiveModel {
-                audit_finding_id: Set(result.finding_id),
-            };
-            finding_link_status::Entity::insert(status)
-                .exec(&txn)
-                .await?;
-        }
-
         txn.commit().await?;
-        tracing::info!(
-            "Finding {} processed with {} semantic link(s) targeting finding {}",
-            result.finding_id,
-            result.semantic_links.len(),
-            result.link_target_finding_id
-        );
         Ok(())
     }
 
@@ -2155,6 +2318,10 @@ impl HistoricalDatabase {
     pub async fn list_findings_with_link_status(
         &self,
     ) -> Result<Vec<crate::learn::PendingFindingForLinking>> {
+        // Retro-link replays canonical semantics into the linker for
+        // findings already fully processed; partial findings (sfl rows
+        // without a matching `finding_link_status` row) will be
+        // covered by the next `link_pending_findings` pass instead.
         let processed_ids: HashSet<i32> = finding_link_status::Entity::find()
             .all(&self.db)
             .await?
@@ -2280,6 +2447,9 @@ impl HistoricalDatabase {
     }
 
     pub async fn list_processed_findings_without_semantic_links(&self) -> Result<Vec<i32>> {
+        // "processed" = row present in `finding_link_status`. Partial
+        // findings (sfl rows but no status row) are expected to be
+        // missing some links and aren't a diagnostic.
         let processed_ids: HashSet<i32> = finding_link_status::Entity::find()
             .all(&self.db)
             .await?
@@ -2348,7 +2518,19 @@ impl HistoricalDatabase {
     /// created via `init()` get the columns directly through
     /// `create_tables`, so this method is a no-op for them.
     pub async fn migrate_link_strength_columns(&self) -> Result<()> {
-        if self.db.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+        self.migrate_link_strength_columns_within(&self.db).await
+    }
+
+    /// Transaction-scoped backfill for `semantic_finding_link`'s
+    /// `strength` / `evidence` columns. Same behaviour as
+    /// [`Self::migrate_link_strength_columns`] but executes against
+    /// the supplied connection so [`Self::init`] can run the whole
+    /// lifecycle setup atomically.
+    async fn migrate_link_strength_columns_within<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+    ) -> Result<()> {
+        if conn.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
             return Ok(());
         }
         use sea_orm::{FromQueryResult, Statement};
@@ -2360,11 +2542,9 @@ impl HistoricalDatabase {
             sea_orm::DatabaseBackend::Sqlite,
             "PRAGMA table_info(semantic_finding_link)".to_string(),
         ))
-        .all(&self.db)
+        .all(conn)
         .await?;
         if columns.is_empty() {
-            // Table doesn't exist yet — `init()` will create it with
-            // the right columns. Nothing to migrate.
             return Ok(());
         }
         let has_strength = columns.iter().any(|c| c.name == "strength");
@@ -2379,34 +2559,25 @@ impl HistoricalDatabase {
              migrating in place (LinkStrength rollout backfill)"
         );
         if !has_strength {
-            // Default 'Medium' is a placeholder for any rows that
-            // survive the migration; callers usually pair this with
-            // `clear_finding_link_progress` so all rows get wiped
-            // and re-graded.
-            self.db
-                .execute_unprepared(
-                    "ALTER TABLE semantic_finding_link \
-                     ADD COLUMN strength TEXT NOT NULL DEFAULT 'Medium'",
-                )
-                .await?;
-        }
-        if !has_evidence {
-            self.db
-                .execute_unprepared(
-                    "ALTER TABLE semantic_finding_link \
-                     ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",
-                )
-                .await?;
-        }
-        // Re-create the strength index. CREATE INDEX IF NOT EXISTS is
-        // safe even when create_tables ran earlier.
-        self.db
-            .execute_unprepared(
-                "CREATE INDEX IF NOT EXISTS \
-                 \"idx-semantic_finding_link-strength\" \
-                 ON semantic_finding_link(strength)",
+            conn.execute_unprepared(
+                "ALTER TABLE semantic_finding_link \
+                 ADD COLUMN strength TEXT NOT NULL DEFAULT 'Medium'",
             )
             .await?;
+        }
+        if !has_evidence {
+            conn.execute_unprepared(
+                "ALTER TABLE semantic_finding_link \
+                 ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",
+            )
+            .await?;
+        }
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS \
+             \"idx-semantic_finding_link-strength\" \
+             ON semantic_finding_link(strength)",
+        )
+        .await?;
         Ok(())
     }
 
@@ -2427,7 +2598,13 @@ impl HistoricalDatabase {
         let txn = self.db.begin().await?;
         let mut repaired_rows = 0usize;
         for issue in &detected {
-            repaired_rows += issue.repair_action.execute(&txn).await? as usize;
+            // Some detected issues (e.g. partial-link state) have no
+            // row-deletion fix — they need the linker to finish.
+            // Skip those during repair; they'll resurface in
+            // `remaining_issues` for the caller to act on.
+            if let Some(action) = &issue.repair_action {
+                repaired_rows += action.execute(&txn).await? as usize;
+            }
         }
         txn.commit().await?;
 
@@ -2491,7 +2668,9 @@ impl HistoricalDatabase {
                         row_key: format!("id={} (platform_id={})", row.id, row.platform_id),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteProjectPlatform { id: row.id },
+                    repair_action: Some(DbValidationRepairAction::DeleteProjectPlatform {
+                        id: row.id,
+                    }),
                 });
             }
         }
@@ -2511,10 +2690,10 @@ impl HistoricalDatabase {
                         row_key: format!("project={} category={}", row.project_id, row.category_id),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteProjectCategory {
+                    repair_action: Some(DbValidationRepairAction::DeleteProjectCategory {
                         project_id: row.project_id,
                         category_id: row.category_id,
-                    },
+                    }),
                 });
             }
         }
@@ -2527,7 +2706,9 @@ impl HistoricalDatabase {
                         row_key: format!("id={}", row.id),
                         problem: format!("missing semantic node sem-{}", row.semantic_node_id),
                     },
-                    repair_action: DbValidationRepairAction::DeleteSemanticFunction { id: row.id },
+                    repair_action: Some(DbValidationRepairAction::DeleteSemanticFunction {
+                        id: row.id,
+                    }),
                 });
             }
         }
@@ -2556,10 +2737,10 @@ impl HistoricalDatabase {
                         ),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteSemanticMerge {
+                    repair_action: Some(DbValidationRepairAction::DeleteSemanticMerge {
                         from_semantic_id: row.from_semantic_id,
                         to_semantic_id: row.to_semantic_id,
-                    },
+                    }),
                 });
             }
         }
@@ -2585,10 +2766,10 @@ impl HistoricalDatabase {
                         ),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteAuditFindingCategory {
+                    repair_action: Some(DbValidationRepairAction::DeleteAuditFindingCategory {
                         audit_finding_id: row.audit_finding_id,
                         finding_category_id: row.finding_category_id,
-                    },
+                    }),
                 });
             }
         }
@@ -2614,15 +2795,16 @@ impl HistoricalDatabase {
                         ),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteSemanticFindingLink {
+                    repair_action: Some(DbValidationRepairAction::DeleteSemanticFindingLink {
                         semantic_node_id: row.semantic_node_id,
                         audit_finding_id: row.audit_finding_id,
-                    },
+                    }),
                 });
             }
         }
 
-        for row in finding_link_status::Entity::find().all(&self.db).await? {
+        let finding_link_statuses = finding_link_status::Entity::find().all(&self.db).await?;
+        for row in &finding_link_statuses {
             if !audit_finding_ids.contains(&row.audit_finding_id) {
                 issues.push(DetectedDbIssue {
                     issue: DbValidationIssue {
@@ -2630,11 +2812,97 @@ impl HistoricalDatabase {
                         row_key: format!("finding-{}", row.audit_finding_id),
                         problem: format!("missing finding {}", row.audit_finding_id),
                     },
-                    repair_action: DbValidationRepairAction::DeleteFindingLinkStatus {
+                    repair_action: Some(DbValidationRepairAction::DeleteFindingLinkStatus {
                         audit_finding_id: row.audit_finding_id,
-                    },
+                    }),
                 });
             }
+        }
+
+        // Partial-link detection: per-batch `semantic_finding_link`
+        // writes can land before the linker's final `mark_finding_link_complete`
+        // call. A finding that has sfl rows but no matching
+        // `finding_link_status` row is in an intermediate state —
+        // either the link agent was killed mid-run, or it's still
+        // running concurrently. Consumers (mapper / spec-gen) must
+        // not silently see this state; `connect_init_for_consumer`
+        // refuses to open the DB until the linker finishes, unless
+        // the operator passes `--force-allow-partial-historical`.
+        let complete_finding_ids: HashSet<i32> = finding_link_statuses
+            .iter()
+            .map(|s| s.audit_finding_id)
+            .collect();
+        let mut partial_finding_ids: HashSet<i32> = HashSet::new();
+        for row in semantic_finding_link::Entity::find().all(&self.db).await? {
+            // Skip rows that already fired the FK loop above — that
+            // diagnostic is more specific.
+            if !audit_finding_ids.contains(&row.audit_finding_id) {
+                continue;
+            }
+            if !complete_finding_ids.contains(&row.audit_finding_id) {
+                partial_finding_ids.insert(row.audit_finding_id);
+            }
+        }
+        let mut partial_sorted: Vec<i32> = partial_finding_ids.into_iter().collect();
+        partial_sorted.sort_unstable();
+        for finding_id in partial_sorted {
+            issues.push(DetectedDbIssue {
+                issue: DbValidationIssue {
+                    table: "finding_link_status",
+                    row_key: format!("finding-{}", finding_id),
+                    problem: format!(
+                        "finding {} has semantic_finding_link rows but no finding_link_status row (partial link state — re-run `knowdit workflow learn` to finish linking)",
+                        finding_id,
+                    ),
+                },
+                repair_action: None,
+            });
+        }
+
+        // Pending-retro-link detection: the `pending_semantic` queue
+        // holds canonical semantic ids that Phase 1 of a learn pass
+        // committed but Phase 2 (retro-link) hasn't drained yet. The
+        // queue is the only signal for two distinct kill scenarios
+        // the per-finding `partial_finding_ids` check misses:
+        //
+        //   (a) Phase 2 partial commit against findings that already
+        //       have a `finding_link_status` row from a prior run —
+        //       new sfl edges land for some old findings, none for
+        //       others, and the per-finding partial detector doesn't
+        //       fire (every involved finding has its status row).
+        //
+        //   (b) Phase 1 committed only new semantics with no new
+        //       findings (a semantics-only project), so no sfl rows
+        //       were even written — but retro-link still owes a sweep
+        //       against every old finding for those new canonicals.
+        //
+        // In both cases, a non-empty `pending_semantic` table means
+        // the linker pass is incomplete and consumers should not
+        // treat the DB as canonical. Single COUNT query, fires once
+        // per drain-incomplete run.
+        //
+        // A KG may legitimately have *dropped* this table once its
+        // owning learn run was finalized (e.g. a read-only v3 consumer
+        // DB). A missing queue table is identical to a drained one —
+        // zero pending work — so probe for it first rather than letting
+        // the COUNT error out on the absent table.
+        let pending_count = if self.table_exists("pending_semantic").await? {
+            pending_semantic::Entity::find().count(&self.db).await?
+        } else {
+            0
+        };
+        if pending_count > 0 {
+            issues.push(DetectedDbIssue {
+                issue: DbValidationIssue {
+                    table: "pending_semantic",
+                    row_key: format!("{} row(s)", pending_count),
+                    problem: format!(
+                        "{} canonical semantic(s) queued for retro-link but never drained — Phase 2 of `workflow learn` did not finish. Re-run `knowdit workflow learn` against the same project to drain the queue.",
+                        pending_count,
+                    ),
+                },
+                repair_action: None,
+            });
         }
 
         for row in finding_merge::Entity::find().all(&self.db).await? {
@@ -2655,10 +2923,10 @@ impl HistoricalDatabase {
                         ),
                         problem: missing.join(", "),
                     },
-                    repair_action: DbValidationRepairAction::DeleteFindingMerge {
+                    repair_action: Some(DbValidationRepairAction::DeleteFindingMerge {
                         from_finding_id: row.from_finding_id,
                         to_finding_id: row.to_finding_id,
-                    },
+                    }),
                 });
             }
         }
@@ -2678,6 +2946,15 @@ impl HistoricalDatabase {
 
     /// Atomically write a completed project with its categories, semantic nodes,
     /// functions, and merge decisions.
+    /// Commit one project's full merge output to the historical KG.
+    /// Begins its own transaction, calls
+    /// [`Self::write_project_completed_txn`], commits, and discards
+    /// the new-canonical id list. Use this when the caller doesn't
+    /// need to compose additional writes inside the same
+    /// transaction; bulk learn paths (`learn moves` / `learn c4` /
+    /// `learn projects`) go through here because they don't run
+    /// retro-link and therefore don't need to enqueue
+    /// `pending_semantic`.
     pub async fn write_project_completed(
         &self,
         name: &str,
@@ -2687,32 +2964,77 @@ impl HistoricalDatabase {
         finding_merge_results: &[crate::learn::FindingMergeResult],
         in_project_links: &crate::learn::InProjectLinks,
     ) -> Result<()> {
-        use crate::learn::{FindingMergeAction, MergeAction};
+        let txn = self.begin().await?;
+        self.write_project_completed_txn(
+            &txn,
+            name,
+            platform_id,
+            categories,
+            semantic_merge_results,
+            finding_merge_results,
+            in_project_links,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
 
-        let txn = self.db.begin().await?;
+    /// Transaction-scoped variant of
+    /// [`Self::write_project_completed`]. Writes every row this
+    /// project contributes (project / project_platform /
+    /// project_category / semantic_node / semantic_function /
+    /// semantic_merge / project_semantic / audit_finding /
+    /// project_finding / audit_finding_category / finding_merge /
+    /// in-project semantic_finding_link) into the supplied
+    /// transaction.
+    ///
+    /// Does NOT touch `pending_semantic` — that side of the
+    /// "retro-link work queue" is a separate concern and only
+    /// `workflow learn` (the incremental flow) calls
+    /// [`Self::enqueue_pending_canonical_semantics_txn`] alongside
+    /// this. See `crates/knowdit/src/cmd/learn/retro_link.rs` for
+    /// the responsibility table.
+    ///
+    /// Returns the canonical semantic ids this project newly
+    /// introduced (i.e. `MergeAction::New` entries from the
+    /// supplied merge results). The caller is responsible for
+    /// passing them to
+    /// [`Self::enqueue_pending_canonical_semantics_txn`] if their
+    /// flow runs retro-link.
+    pub async fn write_project_completed_txn(
+        &self,
+        conn: &DatabaseTransaction,
+        name: &str,
+        platform_id: Option<&str>,
+        categories: &[crate::category::DeFiCategory],
+        semantic_merge_results: &[crate::learn::MergeResult],
+        finding_merge_results: &[crate::learn::FindingMergeResult],
+        in_project_links: &crate::learn::InProjectLinks,
+    ) -> Result<Vec<i32>> {
+        use crate::learn::{FindingMergeAction, MergeAction};
 
         // Upsert project — look up by platform_id first, then by name
         let existing_project = if let Some(pid) = platform_id {
             let pp = project_platform::Entity::find()
                 .filter(project_platform::Column::PlatformId.eq(pid))
-                .one(&txn)
+                .one(conn)
                 .await?;
             if let Some(pp) = pp {
-                project::Entity::find_by_id(pp.project_id).one(&txn).await?
+                project::Entity::find_by_id(pp.project_id).one(conn).await?
             } else {
                 None
             }
         } else {
             project::Entity::find()
                 .filter(project::Column::Name.eq(name))
-                .one(&txn)
+                .one(conn)
                 .await?
         };
 
         let project_id = if let Some(p) = existing_project {
             let mut am = p.into_active_model();
             am.status = Set("completed".to_string());
-            let updated = am.update(&txn).await?;
+            let updated = am.update(conn).await?;
             updated.id
         } else {
             let am = project::ActiveModel {
@@ -2720,7 +3042,7 @@ impl HistoricalDatabase {
                 status: Set("completed".to_string()),
                 ..Default::default()
             };
-            let inserted = project::Entity::insert(am).exec(&txn).await?;
+            let inserted = project::Entity::insert(am).exec(conn).await?;
             inserted.last_insert_id
         };
 
@@ -2728,7 +3050,7 @@ impl HistoricalDatabase {
         if let Some(pid) = platform_id {
             let existing_pp = project_platform::Entity::find()
                 .filter(project_platform::Column::ProjectId.eq(project_id))
-                .one(&txn)
+                .one(conn)
                 .await?;
             if existing_pp.is_none() {
                 let pp = project_platform::ActiveModel {
@@ -2736,7 +3058,7 @@ impl HistoricalDatabase {
                     platform_id: Set(pid.to_string()),
                     ..Default::default()
                 };
-                project_platform::Entity::insert(pp).exec(&txn).await?;
+                project_platform::Entity::insert(pp).exec(conn).await?;
             }
         }
 
@@ -2744,14 +3066,14 @@ impl HistoricalDatabase {
         for cat_name in categories {
             let cat = category::Entity::find()
                 .filter(category::Column::Name.eq(*cat_name))
-                .one(&txn)
+                .one(conn)
                 .await?;
 
             if let Some(cat) = cat {
                 let existing = project_category::Entity::find()
                     .filter(project_category::Column::ProjectId.eq(project_id))
                     .filter(project_category::Column::CategoryId.eq(cat.id))
-                    .one(&txn)
+                    .one(conn)
                     .await?;
 
                 if existing.is_none() {
@@ -2759,7 +3081,7 @@ impl HistoricalDatabase {
                         project_id: Set(project_id),
                         category_id: Set(cat.id),
                     };
-                    project_category::Entity::insert(link).exec(&txn).await?;
+                    project_category::Entity::insert(link).exec(conn).await?;
                 }
             } else {
                 tracing::warn!("Category '{}' not found in DB", cat_name);
@@ -2814,10 +3136,10 @@ impl HistoricalDatabase {
                         description: Set(result.semantic.description.clone()),
                         ..Default::default()
                     };
-                    let inserted = semantic_node::Entity::insert(node).exec(&txn).await?;
+                    let inserted = semantic_node::Entity::insert(node).exec(conn).await?;
                     let node_id = inserted.last_insert_id;
 
-                    upsert_project_semantic(&txn, project_id, node_id).await?;
+                    upsert_project_semantic(conn, project_id, node_id).await?;
                     raw_semantic_id_by_idx.push(node_id);
                     new_canonical_semantic_ids.push(node_id);
 
@@ -2828,7 +3150,7 @@ impl HistoricalDatabase {
                             contract_path: Set(func.contract.clone()),
                             ..Default::default()
                         };
-                        semantic_function::Entity::insert(f).exec(&txn).await?;
+                        semantic_function::Entity::insert(f).exec(conn).await?;
                     }
 
                     new_semantic_count += 1;
@@ -2850,9 +3172,9 @@ impl HistoricalDatabase {
                         description: Set(result.semantic.description.clone()),
                         ..Default::default()
                     };
-                    let inserted = semantic_node::Entity::insert(node).exec(&txn).await?;
+                    let inserted = semantic_node::Entity::insert(node).exec(conn).await?;
                     let new_id = inserted.last_insert_id;
-                    upsert_project_semantic(&txn, project_id, new_id).await?;
+                    upsert_project_semantic(conn, project_id, new_id).await?;
                     raw_semantic_id_by_idx.push(new_id);
 
                     for func in &result.semantic.functions {
@@ -2862,12 +3184,12 @@ impl HistoricalDatabase {
                             contract_path: Set(func.contract.clone()),
                             ..Default::default()
                         };
-                        semantic_function::Entity::insert(f).exec(&txn).await?;
+                        semantic_function::Entity::insert(f).exec(conn).await?;
                     }
 
                     for target_id in target_ids {
                         let target = semantic_node::Entity::find_by_id(*target_id)
-                            .one(&txn)
+                            .one(conn)
                             .await?
                             .ok_or_else(|| {
                                 KgError::other(format!(
@@ -2879,13 +3201,13 @@ impl HistoricalDatabase {
                         // Project provenance grows on the canonical too:
                         // every merged-away raw contributed by some project
                         // surfaces as a project_semantic edge on the canonical.
-                        upsert_project_semantic(&txn, project_id, *target_id).await?;
+                        upsert_project_semantic(conn, project_id, *target_id).await?;
 
                         let merge = semantic_merge::ActiveModel {
                             from_semantic_id: Set(new_id),
                             to_semantic_id: Set(*target_id),
                         };
-                        semantic_merge::Entity::insert(merge).exec(&txn).await?;
+                        semantic_merge::Entity::insert(merge).exec(conn).await?;
 
                         // Only append to description; never touch name or
                         // definition. The append carries a separator and
@@ -2901,7 +3223,7 @@ impl HistoricalDatabase {
                                 );
                                 let mut am = target.into_active_model();
                                 am.description = Set(new_desc);
-                                am.update(&txn).await?;
+                                am.update(conn).await?;
                             }
                         }
                     }
@@ -2918,7 +3240,7 @@ impl HistoricalDatabase {
             let category_row = finding_category::Entity::find()
                 .filter(finding_category::Column::Category.eq(result.finding.category))
                 .filter(finding_category::Column::Name.eq(result.finding.subcategory.clone()))
-                .one(&txn)
+                .one(conn)
                 .await?
                 .ok_or_else(|| {
                     crate::error::KgError::other(format!(
@@ -2936,7 +3258,7 @@ impl HistoricalDatabase {
                 exploits: Set(result.finding.exploits.clone()),
                 ..Default::default()
             };
-            let inserted = audit_finding::Entity::insert(finding).exec(&txn).await?;
+            let inserted = audit_finding::Entity::insert(finding).exec(conn).await?;
             let finding_id = inserted.last_insert_id;
             raw_finding_id_by_idx.push(finding_id);
 
@@ -2945,7 +3267,7 @@ impl HistoricalDatabase {
                 project_id: Set(project_id),
                 audit_finding_id: Set(finding_id),
             })
-            .exec(&txn)
+            .exec(conn)
             .await?;
 
             let finding_category_link = audit_finding_category::ActiveModel {
@@ -2953,7 +3275,7 @@ impl HistoricalDatabase {
                 finding_category_id: Set(category_row.id),
             };
             audit_finding_category::Entity::insert(finding_category_link)
-                .exec(&txn)
+                .exec(conn)
                 .await?;
 
             match &result.action {
@@ -2974,7 +3296,7 @@ impl HistoricalDatabase {
                     // `patterns`, `exploits` may be appended to.
                     for target_id in target_ids {
                         let target = audit_finding::Entity::find_by_id(*target_id)
-                            .one(&txn)
+                            .one(conn)
                             .await?
                             .ok_or_else(|| {
                                 KgError::other(format!(
@@ -2987,19 +3309,19 @@ impl HistoricalDatabase {
                             from_finding_id: Set(finding_id),
                             to_finding_id: Set(*target_id),
                         };
-                        finding_merge::Entity::insert(merge).exec(&txn).await?;
+                        finding_merge::Entity::insert(merge).exec(conn).await?;
 
                         let already = project_finding::Entity::find()
                             .filter(project_finding::Column::ProjectId.eq(project_id))
                             .filter(project_finding::Column::AuditFindingId.eq(*target_id))
-                            .one(&txn)
+                            .one(conn)
                             .await?;
                         if already.is_none() {
                             project_finding::Entity::insert(project_finding::ActiveModel {
                                 project_id: Set(project_id),
                                 audit_finding_id: Set(*target_id),
                             })
-                            .exec(&txn)
+                            .exec(conn)
                             .await?;
                         }
 
@@ -3049,7 +3371,7 @@ impl HistoricalDatabase {
                             }
                         }
                         if touched {
-                            am.update(&txn).await?;
+                            am.update(conn).await?;
                         }
                     }
 
@@ -3080,7 +3402,7 @@ impl HistoricalDatabase {
             let already = semantic_finding_link::Entity::find()
                 .filter(semantic_finding_link::Column::SemanticNodeId.eq(raw_semantic_id))
                 .filter(semantic_finding_link::Column::AuditFindingId.eq(raw_finding_id))
-                .one(&txn)
+                .one(conn)
                 .await?;
             if already.is_none() {
                 // In-project links come from the extract pipeline's
@@ -3100,7 +3422,7 @@ impl HistoricalDatabase {
                             .to_string(),
                     ),
                 })
-                .exec(&txn)
+                .exec(conn)
                 .await?;
                 in_project_link_rows += 1;
             }
@@ -3111,30 +3433,16 @@ impl HistoricalDatabase {
         // these findings to canonical semantics from OTHER projects. The
         // global linker writes finding_link_status when it has finished
         // processing each pending finding.
+        //
+        // We also do NOT enqueue `pending_semantic` here — that's
+        // the caller's call. The incremental `workflow learn` flow
+        // chains `enqueue_pending_canonical_semantics_txn` on the
+        // returned id list inside the same transaction; bulk
+        // callers (`learn moves` / `learn c4` / `learn projects`)
+        // skip the enqueue because they never run retro-link.
 
-        // ── pending_semantic → enqueue newly-introduced canonicals ─
-        // Used by the retro-link step in the incremental learn-new-project
-        // CLI. On bootstrap (no prior projects) the rows queue up but no
-        // retro-link is needed yet; subsequent learn-new-project runs read
-        // and clear them.
-        for canonical_id in &new_canonical_semantic_ids {
-            let already = knowdit_kg_model::db::pending_semantic::Entity::find_by_id(*canonical_id)
-                .one(&txn)
-                .await?;
-            if already.is_none() {
-                knowdit_kg_model::db::pending_semantic::Entity::insert(
-                    knowdit_kg_model::db::pending_semantic::ActiveModel {
-                        semantic_node_id: Set(*canonical_id),
-                    },
-                )
-                .exec(&txn)
-                .await?;
-            }
-        }
-
-        txn.commit().await?;
         tracing::info!(
-            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings, {} in-project links, {} pending canonical semantics enqueued",
+            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings, {} in-project links; {} new canonical id(s) returned for caller-driven pending_semantic enqueue",
             platform_id.unwrap_or(name),
             new_semantic_count,
             merged_semantic_count,
@@ -3143,7 +3451,45 @@ impl HistoricalDatabase {
             in_project_link_rows,
             new_canonical_semantic_ids.len(),
         );
-        Ok(())
+        Ok(new_canonical_semantic_ids)
+    }
+
+    /// Append a list of canonical semantic ids to the
+    /// `pending_semantic` retro-link queue, deduping per-id against
+    /// what's already enqueued. Called by `workflow learn` right
+    /// after [`Self::write_project_completed_txn`] inside the SAME
+    /// transaction so a kill between project commit and queue
+    /// enqueue rolls both writes back.
+    ///
+    /// Bulk learn paths (`learn moves` / `learn c4` /
+    /// `learn projects`) must NOT call this — they never run
+    /// retro-link, so populating the queue would leave dead rows
+    /// the validator surfaces as a partial-state issue.
+    ///
+    /// Returns the number of rows actually inserted (i.e. how many
+    /// of the supplied ids were not already queued).
+    pub async fn enqueue_pending_canonical_semantics_txn(
+        &self,
+        conn: &DatabaseTransaction,
+        canonical_ids: &[i32],
+    ) -> Result<usize> {
+        let mut enqueued = 0usize;
+        for canonical_id in canonical_ids {
+            let already = knowdit_kg_model::db::pending_semantic::Entity::find_by_id(*canonical_id)
+                .one(conn)
+                .await?;
+            if already.is_none() {
+                knowdit_kg_model::db::pending_semantic::Entity::insert(
+                    knowdit_kg_model::db::pending_semantic::ActiveModel {
+                        semantic_node_id: Set(*canonical_id),
+                    },
+                )
+                .exec(conn)
+                .await?;
+                enqueued += 1;
+            }
+        }
+        Ok(enqueued)
     }
 
     // ── KnowledgeGraph loading ──────────────────────────────────────
@@ -3165,7 +3511,17 @@ impl HistoricalDatabase {
         let finding_categories = finding_category::Entity::find().all(&self.db).await?;
         let audit_finding_categories = audit_finding_category::Entity::find().all(&self.db).await?;
         let project_findings = project_finding::Entity::find().all(&self.db).await?;
+        // Raw dump — `semantic_finding_link` is NOT filtered against
+        // `finding_link_status` here. This loader feeds snapshot
+        // export (`export_json_snapshot`) and visualization paths
+        // (`export_dot` / `export_html`), all of which want the
+        // raw on-disk state to faithfully round-trip / diagnose.
+        // Consumer-side partial-link safety lives at
+        // `HistoricalDatabaseArgs::connect_init_for_consumer`, not
+        // here. The mapper / spec-gen paths go through
+        // `findings_for_semantic_ids`, not this function.
         let semantic_finding_links = semantic_finding_link::Entity::find().all(&self.db).await?;
+        let finding_link_statuses = finding_link_status::Entity::find().all(&self.db).await?;
         let finding_merges = finding_merge::Entity::find().all(&self.db).await?;
 
         Ok(crate::knowledge_graph::KnowledgeGraph {
@@ -3182,6 +3538,7 @@ impl HistoricalDatabase {
             audit_finding_categories,
             project_findings,
             semantic_finding_links,
+            finding_link_statuses,
             finding_merges,
         })
     }
@@ -3688,6 +4045,261 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
     }
 
     #[tokio::test]
+    async fn write_project_completed_does_not_touch_pending_semantic() {
+        // Bulk learn paths (`learn moves` / `learn c4` /
+        // `learn projects`) call the single-step
+        // `write_project_completed` wrapper. The bug fix splits the
+        // enqueue out into a separate caller-driven step, so the
+        // single-step path must NOT populate `pending_semantic`.
+        // This test guards against future drift.
+        let (db, path) = create_test_db().await;
+
+        let project_id = project::Entity::insert(project::ActiveModel {
+            name: Set("Bulk-mode test".to_string()),
+            status: Set("pending".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .expect("project insert should succeed")
+        .last_insert_id;
+        let _ = project_id;
+
+        let semantic_extract = crate::learn::ExtractedSemantic {
+            name: "TestSem".to_string(),
+            category: DeFiCategory::Dexes,
+            definition: "A test definition".to_string(),
+            description: "A test description".to_string(),
+            functions: vec![],
+        };
+        let merge_results = vec![crate::learn::MergeResult {
+            semantic: semantic_extract,
+            action: crate::learn::MergeAction::New,
+        }];
+
+        db.write_project_completed(
+            "Bulk-mode test",
+            None,
+            &[DeFiCategory::Dexes],
+            &merge_results,
+            &[],
+            &crate::learn::InProjectLinks::default(),
+        )
+        .await
+        .expect("write_project_completed should succeed");
+
+        let pending = knowdit_kg_model::db::pending_semantic::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("pending_semantic should load");
+        assert_eq!(
+            pending.len(),
+            0,
+            "single-step write_project_completed must NOT enqueue pending_semantic; \
+             that's the workflow learn-only path's job. Got {} row(s)",
+            pending.len(),
+        );
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn write_project_completed_txn_plus_enqueue_writes_pending_semantic() {
+        // Incremental `workflow learn` composes
+        // `write_project_completed_txn` + `enqueue_pending_canonical_semantics_txn`
+        // in one transaction. This is the path that SHOULD populate
+        // `pending_semantic` for Phase 2 retro-link to consume.
+        let (db, path) = create_test_db().await;
+
+        let semantic_extract = crate::learn::ExtractedSemantic {
+            name: "IncrSem".to_string(),
+            category: DeFiCategory::Lending,
+            definition: "Inc def".to_string(),
+            description: "Inc desc".to_string(),
+            functions: vec![],
+        };
+        let merge_results = vec![crate::learn::MergeResult {
+            semantic: semantic_extract,
+            action: crate::learn::MergeAction::New,
+        }];
+
+        let txn = db.begin().await.expect("begin should succeed");
+        let new_canonicals = db
+            .write_project_completed_txn(
+                &txn,
+                "Incremental test",
+                None,
+                &[DeFiCategory::Lending],
+                &merge_results,
+                &[],
+                &crate::learn::InProjectLinks::default(),
+            )
+            .await
+            .expect("write_project_completed_txn should succeed");
+        assert_eq!(new_canonicals.len(), 1, "one new canonical expected");
+        let enqueued = db
+            .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)
+            .await
+            .expect("enqueue should succeed");
+        assert_eq!(enqueued, 1);
+        txn.commit().await.expect("commit should succeed");
+
+        let pending = knowdit_kg_model::db::pending_semantic::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("pending_semantic should load");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].semantic_node_id, new_canonicals[0]);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn validate_db_reports_pending_semantic_queue_without_repair() {
+        // Non-empty `pending_semantic` means Phase 2 retro-link did
+        // not finish. validator must flag it — the per-finding
+        // partial detector wouldn't (no sfl rows or all involved
+        // findings already in finding_link_status).
+        let (db, path) = create_test_db().await;
+
+        let semantic_id = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Pending retro-link semantic".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .expect("semantic insert should succeed")
+        .last_insert_id;
+
+        knowdit_kg_model::db::pending_semantic::Entity::insert(
+            knowdit_kg_model::db::pending_semantic::ActiveModel {
+                semantic_node_id: Set(semantic_id),
+            },
+        )
+        .exec(&db.db)
+        .await
+        .expect("pending_semantic insert should succeed");
+
+        let report = db
+            .validate_db(false)
+            .await
+            .expect("validation should succeed");
+        assert_eq!(report.remaining_issue_count(), 1);
+        assert_eq!(report.remaining_issues[0].table, "pending_semantic");
+        assert!(
+            report.remaining_issues[0]
+                .problem
+                .contains("queued for retro-link"),
+            "unexpected issue: {}",
+            report.remaining_issues[0]
+        );
+
+        // Repair shouldn't auto-delete pending rows — fix is to
+        // re-run learn, not to silently drop semantics.
+        let repair_report = db.validate_db(true).await.expect("repair should succeed");
+        assert_eq!(repair_report.repaired_rows, 0);
+        assert_eq!(repair_report.remaining_issue_count(), 1);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn validate_db_reports_partial_link_without_repair() {
+        // sfl row exists for finding-X but finding_link_status does not
+        // → "partial link state", reported but NOT auto-repairable.
+        let (db, path) = create_test_db().await;
+
+        let semantic_id = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Partial Link Source".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("Definition".to_string()),
+            description: Set("Description".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .expect("semantic node insert should succeed")
+        .last_insert_id;
+
+        let finding_id = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("Partial link finding".to_string()),
+            severity: Set(audit_finding::FindingSeverity::Medium),
+            root_cause: Set("Cause".to_string()),
+            description: Set("Description".to_string()),
+            patterns: Set("Pattern".to_string()),
+            exploits: Set("Exploit".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .expect("finding insert should succeed")
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(semantic_id),
+            audit_finding_id: Set(finding_id),
+            strength: Set(LinkStrength::High),
+            evidence: Set("test evidence".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .expect("sfl insert should succeed");
+
+        // No finding_link_status row → partial state.
+        let report = db
+            .validate_db(false)
+            .await
+            .expect("validation should succeed");
+        assert_eq!(report.detected_issue_count(), 1);
+        assert_eq!(report.remaining_issue_count(), 1);
+        assert_eq!(report.remaining_issues[0].table, "finding_link_status");
+        assert!(
+            report.remaining_issues[0]
+                .problem
+                .contains("partial link state"),
+            "unexpected issue: {}",
+            report.remaining_issues[0]
+        );
+
+        // Repair should NOT delete the sfl row — partial state needs the
+        // linker to finish, not row deletion. `remaining_issues` stays.
+        let repair_report = db.validate_db(true).await.expect("repair should succeed");
+        assert_eq!(repair_report.detected_issue_count(), 1);
+        assert_eq!(repair_report.repaired_rows, 0);
+        assert_eq!(repair_report.remaining_issue_count(), 1);
+        assert_eq!(
+            semantic_finding_link::Entity::find()
+                .all(&db.db)
+                .await
+                .expect("sfl should load")
+                .len(),
+            1
+        );
+
+        // Adding the fls row clears the issue.
+        finding_link_status::Entity::insert(finding_link_status::ActiveModel {
+            audit_finding_id: Set(finding_id),
+        })
+        .exec(&db.db)
+        .await
+        .expect("fls insert should succeed");
+        let clean = db
+            .validate_db(false)
+            .await
+            .expect("validation should succeed");
+        assert!(clean.is_clean(), "{:?}", clean.remaining_issues);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
     async fn sql_snapshot_roundtrip_restores_sqlite_database() {
         let (db, source_path) = create_test_db().await;
 
@@ -3860,6 +4472,17 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         .exec(&db.db)
         .await
         .expect("link insert should succeed");
+
+        // The snapshot loader hides sfl rows whose finding has no
+        // matching `finding_link_status` row (partial-commit state),
+        // so for this roundtrip test we record the finding as fully
+        // processed.
+        finding_link_status::Entity::insert(finding_link_status::ActiveModel {
+            audit_finding_id: Set(finding_id),
+        })
+        .exec(&db.db)
+        .await
+        .expect("finding-link status insert should succeed");
 
         let snapshot = db
             .export_json_snapshot()

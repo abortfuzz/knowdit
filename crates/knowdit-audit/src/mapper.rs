@@ -24,6 +24,7 @@
 //!    via [`RepoDatabase::write_semantic_match_results`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::{Result, WrapErr};
@@ -39,6 +40,7 @@ use knowdit_repo_model::{
 };
 use llmy::client::client::LLM;
 use serde::Deserialize;
+use tokio::task::JoinSet;
 
 const DEFAULT_BATCH_SIZE: usize = 16;
 /// Cap on raw children rendered per canonical in the matcher prompt.
@@ -58,32 +60,48 @@ const MIN_EVIDENCE_LEN_LOW: usize = 15;
 pub struct MapperOptions {
     /// Historical semantics presented per matching prompt.
     pub batch_size: usize,
+    /// Max historical batches matched concurrently. Each batch is one
+    /// LLM call, so this fans the matching prompts out over this many
+    /// workers (async-channel + `JoinSet`, the same idiom as the fuzz
+    /// runtime). `1` keeps the old strictly-sequential behaviour.
+    pub concurrency: usize,
     /// Optional `llmy` cache key prefix.
     pub cache_key: Option<String>,
+    /// Pre-rendered Markdown block describing the project's
+    /// source language; verbatim-prepended to the mapper's
+    /// system prompt. See [`crate::profile::ProfileOptions::language_prompt_prefix`]
+    /// for the same dispatch convention.
+    pub language_prompt_prefix: String,
 }
 
 impl Default for MapperOptions {
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
+            concurrency: 1,
             cache_key: Some("knowdit-mapper".to_string()),
+            language_prompt_prefix: String::new(),
         }
     }
 }
 
 /// Knowledge Mapper agent.
 ///
-/// Owns the project profile; `repo` / `kg` / `llm` are method
-/// arguments to [`Self::run`] so this struct has no lifetime params
-/// (plan §1.6).
+/// Owns the project profile + language prompt prefix; `repo` /
+/// `kg` / `llm` are method arguments to [`Self::run`] so this
+/// struct has no lifetime params (plan §1.6).
 #[derive(Debug, Clone)]
 pub struct KnowledgeMapper {
     profile: ProjectProfile,
+    language_prompt_prefix: String,
 }
 
 impl KnowledgeMapper {
-    pub fn new(profile: ProjectProfile) -> Self {
-        Self { profile }
+    pub fn new(profile: ProjectProfile, language_prompt_prefix: String) -> Self {
+        Self {
+            profile,
+            language_prompt_prefix,
+        }
     }
 
     /// Run one mapping pass and write the result into `repo`.
@@ -140,7 +158,7 @@ impl KnowledgeMapper {
         );
 
         let extract_ids: BTreeSet<i32> = extracted_with_id.iter().map(|(id, _)| *id).collect();
-        let system_prompt = build_system_prompt(&self.profile);
+        let system_prompt = build_system_prompt(&self.profile, &self.language_prompt_prefix);
 
         let pass1_matches = batch_match(
             llm,
@@ -322,104 +340,203 @@ async fn batch_match(
     }
 
     let batch_size = options.batch_size.max(1);
-    let extracted_block = render_extracted_block(extracts);
+    let concurrency = options.concurrency.max(1);
     let total_batches = historicals.len().div_ceil(batch_size);
-    let mut matches: Vec<SemanticMatch> = Vec::new();
+
+    // Shared, read-only inputs every worker needs. Wrapped in `Arc`
+    // once so each spawned worker holds a cheap clone — `JoinSet`
+    // tasks must be `'static`, so nothing can be borrowed across the
+    // spawn boundary (same async-channel + `JoinSet` idiom the fuzz
+    // runtime uses). Workers only need the extract *ids* (for the
+    // forced-per-candidate-emit check) plus the pre-rendered extract
+    // block, so the `ExtractedSemantic` values themselves never have
+    // to cross the boundary.
+    let extracted_block = Arc::new(render_extracted_block(extracts));
+    let system_prompt = Arc::new(system_prompt.to_string());
+    let valid_extract_ids = Arc::new(valid_extract_ids.clone());
+    let cache_key = options.cache_key.clone();
+    let label_prefix = Arc::new(label_prefix.to_string());
+
+    type Batch = Vec<CanonicalWithChildren<semantic_node::Model>>;
+    // Job queue sized to hold every batch, so feeding it never blocks
+    // on a slow worker; results come back on an mpsc the collector
+    // drains.
+    let (tx, rx) = async_channel::bounded::<(usize, Batch)>(total_batches + 1);
+    let (out_tx, mut out_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<SemanticMatch>>>(concurrency + 1);
+
+    let mut workers = JoinSet::new();
+    for _ in 0..concurrency {
+        let rx = rx.clone();
+        let out = out_tx.clone();
+        let llm = llm.clone();
+        let extracted_block = extracted_block.clone();
+        let system_prompt = system_prompt.clone();
+        let valid_extract_ids = valid_extract_ids.clone();
+        let cache_key = cache_key.clone();
+        let label_prefix = label_prefix.clone();
+        workers.spawn(async move {
+            while let Ok((batch_idx, batch)) = rx.recv().await {
+                let label = format!(
+                    "knowledge-mapper {} batch {}/{}",
+                    label_prefix,
+                    batch_idx + 1,
+                    total_batches
+                );
+                let res = run_one_batch(
+                    &llm,
+                    cache_key.as_deref(),
+                    &system_prompt,
+                    &extracted_block,
+                    &valid_extract_ids,
+                    &batch,
+                    &label,
+                )
+                .await;
+                // A closed receiver means the collector hit an error
+                // and bailed; stop pulling work.
+                if out.send(res).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(out_tx);
+    drop(rx);
 
     for (batch_idx, batch) in historicals.chunks(batch_size).enumerate() {
-        let label = format!(
-            "knowledge-mapper {} batch {}/{}",
-            label_prefix,
-            batch_idx + 1,
-            total_batches
-        );
-        let user_prompt = build_user_prompt(&extracted_block, batch);
-
-        let response: MatchResponse = llm
-            .prompt_json_with_retry(
-                system_prompt,
-                &user_prompt,
-                None,
-                options.cache_key.as_deref(),
-                None,
-            )
+        tx.send((batch_idx, batch.to_vec()))
             .await
-            .map_err(|err| eyre!("{label} request failed: {err}"))?
-            .ok_or_else(|| eyre!("{label} returned no JSON payload"))?;
+            .expect("mapper workers kept alive");
+    }
+    drop(tx);
 
-        let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
-
-        // Forced per-candidate emit (plan_link.md §6.4): every
-        // (extract_id × historical_id) pair shown in this batch should
-        // appear in the response. We don't bounce the response on
-        // missing coverage (no agent re-loop on the JSON path right
-        // now), but we log a warning so calibration runs can see when
-        // the model is sneakily omitting Low pairs.
-        let expected_pairs: BTreeSet<(i32, i32)> = extracts
-            .iter()
-            .flat_map(|(eid, _)| valid_historical_ids.iter().map(move |hid| (*eid, *hid)))
-            .collect();
-        let mut emitted_pairs: BTreeSet<(i32, i32)> = BTreeSet::new();
-
-        for record in response.matches {
-            if !valid_historical_ids.contains(&record.historical_id) {
-                tracing::warn!(
-                    "{label}: dropping match for unknown historical id {}",
-                    record.historical_id
-                );
-                continue;
+    let mut matches: Vec<SemanticMatch> = Vec::new();
+    let mut first_err: Option<color_eyre::eyre::Error> = None;
+    while let Some(res) = out_rx.recv().await {
+        match res {
+            Ok(batch_matches) => matches.extend(batch_matches),
+            Err(err) => {
+                // Abort the remaining batches the moment one fails —
+                // matches the old `?`-on-first-error behaviour without
+                // waiting on in-flight LLM calls.
+                first_err = Some(err);
+                break;
             }
-            if !valid_extract_ids.contains(&record.extract_id) {
-                tracing::warn!(
-                    "{label}: dropping match for unknown extract id {}",
-                    record.extract_id
-                );
-                continue;
-            }
-            let Some(strength) = MatchStrength::parse(&record.strength) else {
-                tracing::warn!(
-                    "{label}: dropping (extract={}, historical={}): unparseable strength '{}'",
-                    record.extract_id,
-                    record.historical_id,
-                    record.strength
-                );
-                continue;
-            };
-            let evidence = record.evidence.trim().to_string();
-            let floor = match strength {
-                MatchStrength::High | MatchStrength::Medium => MIN_EVIDENCE_LEN_HIGH_MEDIUM,
-                MatchStrength::Low => MIN_EVIDENCE_LEN_LOW,
-            };
-            if evidence.len() < floor {
-                tracing::warn!(
-                    "{label}: dropping (extract={}, historical={}, strength={}): evidence shorter than {} chars: {:?}",
-                    record.extract_id,
-                    record.historical_id,
-                    strength,
-                    floor,
-                    evidence
-                );
-                continue;
-            }
-            emitted_pairs.insert((record.extract_id, record.historical_id));
-            matches.push(SemanticMatch {
-                extract_id: record.extract_id,
-                historical_id: record.historical_id,
-                strength,
-                evidence,
-            });
         }
+    }
+    if first_err.is_some() {
+        workers.abort_all();
+    }
+    drop(out_rx);
+    while let Some(joined) = workers.join_next().await {
+        match joined {
+            Ok(()) => {}
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => tracing::error!("knowledge-mapper worker task panicked: {err:#}"),
+        }
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
 
-        let missing: Vec<(i32, i32)> = expected_pairs.difference(&emitted_pairs).copied().collect();
-        if !missing.is_empty() {
+    Ok(matches)
+}
+
+/// Match one batch of historical semantics against the (pre-rendered)
+/// extract block: one LLM call + the per-record validation /
+/// forced-per-candidate-emit accounting. Returns the surviving
+/// [`SemanticMatch`] rows; an `Err` aborts the whole mapping pass.
+async fn run_one_batch(
+    llm: &LLM,
+    cache_key: Option<&str>,
+    system_prompt: &str,
+    extracted_block: &str,
+    valid_extract_ids: &BTreeSet<i32>,
+    batch: &[CanonicalWithChildren<semantic_node::Model>],
+    label: &str,
+) -> Result<Vec<SemanticMatch>> {
+    let user_prompt = build_user_prompt(extracted_block, batch);
+
+    let response: MatchResponse = llm
+        .prompt_json_with_retry(system_prompt, &user_prompt, None, cache_key, None)
+        .await
+        .map_err(|err| eyre!("{label} request failed: {err}"))?
+        .ok_or_else(|| eyre!("{label} returned no JSON payload"))?;
+
+    let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
+
+    // Forced per-candidate emit (plan_link.md §6.4): every
+    // (extract_id × historical_id) pair shown in this batch should
+    // appear in the response. We don't bounce the response on missing
+    // coverage (no agent re-loop on the JSON path right now), but we
+    // log a warning so calibration runs can see when the model is
+    // sneakily omitting Low pairs.
+    let expected_pairs: BTreeSet<(i32, i32)> = valid_extract_ids
+        .iter()
+        .flat_map(|eid| valid_historical_ids.iter().map(move |hid| (*eid, *hid)))
+        .collect();
+    let mut emitted_pairs: BTreeSet<(i32, i32)> = BTreeSet::new();
+    let mut matches: Vec<SemanticMatch> = Vec::new();
+
+    for record in response.matches {
+        if !valid_historical_ids.contains(&record.historical_id) {
             tracing::warn!(
-                "{label}: response omitted {} of {} expected (extract, historical) pair(s); \
-                 plan §6.4 contract requires per-candidate emit. First few missing: {:?}",
-                missing.len(),
-                expected_pairs.len(),
-                &missing[..missing.len().min(5)],
+                "{label}: dropping match for unknown historical id {}",
+                record.historical_id
             );
+            continue;
         }
+        if !valid_extract_ids.contains(&record.extract_id) {
+            tracing::warn!(
+                "{label}: dropping match for unknown extract id {}",
+                record.extract_id
+            );
+            continue;
+        }
+        let Some(strength) = MatchStrength::parse(&record.strength) else {
+            tracing::warn!(
+                "{label}: dropping (extract={}, historical={}): unparseable strength '{}'",
+                record.extract_id,
+                record.historical_id,
+                record.strength
+            );
+            continue;
+        };
+        let evidence = record.evidence.trim().to_string();
+        let floor = match strength {
+            MatchStrength::High | MatchStrength::Medium => MIN_EVIDENCE_LEN_HIGH_MEDIUM,
+            MatchStrength::Low => MIN_EVIDENCE_LEN_LOW,
+        };
+        if evidence.len() < floor {
+            tracing::warn!(
+                "{label}: dropping (extract={}, historical={}, strength={}): evidence shorter than {} chars: {:?}",
+                record.extract_id,
+                record.historical_id,
+                strength,
+                floor,
+                evidence
+            );
+            continue;
+        }
+        emitted_pairs.insert((record.extract_id, record.historical_id));
+        matches.push(SemanticMatch {
+            extract_id: record.extract_id,
+            historical_id: record.historical_id,
+            strength,
+            evidence,
+        });
+    }
+
+    let missing: Vec<(i32, i32)> = expected_pairs.difference(&emitted_pairs).copied().collect();
+    if !missing.is_empty() {
+        tracing::warn!(
+            "{label}: response omitted {} of {} expected (extract, historical) pair(s); \
+             plan §6.4 contract requires per-candidate emit. First few missing: {:?}",
+            missing.len(),
+            expected_pairs.len(),
+            &missing[..missing.len().min(5)],
+        );
     }
 
     Ok(matches)
@@ -560,8 +677,12 @@ fn build_user_prompt(
     )
 }
 
-fn build_system_prompt(profile: &ProjectProfile) -> String {
+fn build_system_prompt(profile: &ProjectProfile, language_prompt_prefix: &str) -> String {
     let mut profile_block = String::new();
+    if !language_prompt_prefix.trim().is_empty() {
+        profile_block.push_str(language_prompt_prefix.trim_end());
+        profile_block.push_str("\n\n");
+    }
     profile_block.push_str("## Project profile\n");
     profile_block.push_str(&format!(
         "Domain summary: {}\n\n",

@@ -36,15 +36,16 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use knowdit_audit::harness::forge::ForgeBackend;
-use knowdit_audit::harness::solidity::SolidityHarnessGenerator;
+use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
     LinkKey, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork, SpecGenOptions, SpecGenStream,
     SpecificationGenerator,
 };
 use knowdit_audit::types::AuditSpecification;
+use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg_model::db::semantic_finding_link;
+use knowdit_project::{ProjectData, SourceLanguage};
 use knowdit_repo_model::{CodeGenStatus, LoadedValidFinding, RepoDatabase, SemanticMatch};
 use llmy::clap::OptOpenAISetup;
 use llmy::client::client::LLM;
@@ -75,6 +76,7 @@ pub struct StreamloopArgs {
 
     #[command(flatten)]
     pub backend: crate::cli::ProjectBackendCliOptions,
+
 
     #[command(flatten)]
     pub reflect_llm: OptOpenAISetup,
@@ -153,14 +155,13 @@ impl StreamloopArgs {
         tracing::info!("[streamloop stage 1/8] preparing output folder");
         self.prepare_output_folder()?;
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
-        let forge_backend = self.harness.to_forge_backend()?;
 
         tracing::info!("[streamloop stage 2/8] loading project DB and connecting to KG");
         let loaded = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let kg = self.kg.connect().await?;
+        let kg = self.kg.connect_init_for_consumer().await?;
         let spec_name = loaded.spec.name.clone();
         let repo_root = loaded.spec.root.clone();
         let repo = loaded.repo;
@@ -168,33 +169,6 @@ impl StreamloopArgs {
             "[streamloop stage 2/8] DB ready (project={}, repo_root={})",
             spec_name,
             repo_root.display(),
-        );
-
-        tracing::info!("[streamloop preflight] verifying forge environment");
-        self.harness
-            .preflight(&forge_backend, &repo_root)
-            .await
-            .wrap_err("forge environment preflight failed — fix the project's foundry config / forge-std install and re-run")?;
-        tracing::info!("[streamloop preflight] forge environment OK");
-
-        tracing::info!("[streamloop stage 3/8] loading call graph");
-        let cg = repo.load_call_graph().await?;
-        if cg.contracts.is_empty() {
-            tracing::info!(
-                "[streamloop stage 3/8] no contracts in call graph — running static call-graph phase"
-            );
-            SolidityCallGraphStaticArgs::update_call_graph(&repo, &repo_root, &self.backend)
-                .await?;
-        }
-        let cg = repo.load_call_graph().await?;
-        if cg.contracts.is_empty() {
-            return Err(eyre!(
-                "no available contracts found after call-graph rebuild"
-            ));
-        }
-        tracing::info!(
-            "[streamloop stage 3/8] call graph ready: {} contract(s)",
-            cg.contracts.len()
         );
 
         let reflect_llm = self
@@ -205,11 +179,119 @@ impl StreamloopArgs {
             .map_err(|err| eyre!("failed to build reflect LLM: {err}"))?
             .unwrap_or_else(|| primary_llm.clone());
 
-        tracing::info!("[streamloop stage 4/8] extracting project semantics");
         let project_data = self.project.to_project_data().await?;
+
+        // Profile is the **only** language-dispatch input streamloop
+        // honors. It runs before any harness construction / CG ingest;
+        // its declared `language` then drives every subsequent branch
+        // (HarnessBackend constructor, CG ingest path, downstream
+        // phase prompt prefixes). The file-extension auto-detect on
+        // `project_data.language` is *not* read at this layer — if
+        // profile says Move on a project that looks Solidity by
+        // file extensions (or vice versa), the LLM judgment wins.
+        tracing::info!(
+            "[streamloop stage 3/8] running profile (language discovery + project framing)"
+        );
+        let profile =
+            ProfileArgs::profile(&repo, primary_llm, &spec_name, &repo_root, &self.profile).await?;
+        tracing::info!(
+            "[streamloop stage 3/8] profile ready: language={:?}, {} subsystem(s), {} core component(s)",
+            profile.language,
+            profile.subsystems.len(),
+            profile.core_components.len(),
+        );
+
+        // Branch the entire backend + CG ingest path on
+        // `profile.language`. The two arms build different
+        // [`HarnessBackend`] impls (SolidityHarness vs MovyHarness)
+        // and call different CG ingest paths
+        // (`SolidityCallGraphStaticArgs::update_call_graph` vs
+        // `MoveExtractor::ingest_to_db`). Post-CG work
+        // ([`Self::run_with_backend`]) is generic over
+        // `B: HarnessBackend`.
+        match profile.language {
+            SourceLanguage::Solidity => {
+                let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+                    repo_root: repo_root.clone(),
+                    default_cache_key: self
+                        .stream_fuzz_cache_key
+                        .clone()
+                        .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name)),
+                    max_specs: 0,
+                    concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
+                    regenerate: self.fuzz.fuzz_regenerate,
+                    via_ir: self.harness.harness_via_ir,
+                })?;
+                tracing::info!("[streamloop preflight] verifying forge environment");
+                harness_backend.preflight(&repo_root).await.wrap_err(
+                    "forge environment preflight failed — fix the project's foundry config / \
+                     forge-std install and re-run",
+                )?;
+                tracing::info!("[streamloop preflight] forge environment OK");
+
+                tracing::info!("[streamloop stage 3/8] loading call graph (Solidity)");
+                let cg = repo.load_call_graph().await?;
+                if cg.contracts.is_empty() {
+                    tracing::info!(
+                        "[streamloop stage 3/8] no contracts in call graph — running static call-graph phase"
+                    );
+                    SolidityCallGraphStaticArgs::update_call_graph(
+                        &repo,
+                        &repo_root,
+                        &self.backend,
+                    )
+                    .await?;
+                }
+                let cg = repo.load_call_graph().await?;
+                if cg.contracts.is_empty() {
+                    return Err(eyre!(
+                        "no available contracts found after Solidity call-graph rebuild"
+                    ));
+                }
+                tracing::info!(
+                    "[streamloop stage 3/8] call graph ready: {} contract(s)",
+                    cg.contracts.len()
+                );
+                self.run_with_backend(
+                    harness_backend,
+                    primary_llm.clone(),
+                    reflect_llm,
+                    repo,
+                    repo_root,
+                    spec_name,
+                    project_data,
+                    &kg,
+                )
+                .await
+            }
+            SourceLanguage::Move => Err(eyre!("Move language not supported in this build")),
+        }
+    }
+
+    /// Backend-generic post-ingest pipeline. Profile + CG ingest
+    /// have already run; this drives extract-semantics → map →
+    /// gen-specs → scheduler. Generic over `B: HarnessBackend`
+    /// for backend operations. The language-context prompt prefix
+    /// comes from `harness_backend.prompt_prefix()`, not from
+    /// `ProjectProfile` — so this function takes no profile.
+    async fn run_with_backend<B>(
+        &self,
+        harness_backend: B,
+        primary_llm: LLM,
+        reflect_llm: LLM,
+        repo: RepoDatabase,
+        repo_root: PathBuf,
+        spec_name: String,
+        project_data: ProjectData,
+        kg: &HistoricalDatabase,
+    ) -> Result<()>
+    where
+        B: HarnessBackend + Clone + Send + Sync + 'static,
+    {
+        tracing::info!("[streamloop stage 4/8] extracting project semantics");
         let semantics = ExtractSemanticsArgs::extract_semantics(
             &repo,
-            primary_llm,
+            &primary_llm,
             &project_data,
             &self.extract,
         )
@@ -219,21 +301,25 @@ impl StreamloopArgs {
             semantics.len()
         );
 
-        tracing::info!("[streamloop stage 5/8] building project profile");
-        let profile =
-            ProfileArgs::profile(&repo, primary_llm, &spec_name, &repo_root, &self.profile).await?;
-        tracing::info!(
-            "[streamloop stage 5/8] profile ready: {} subsystem(s), {} core component(s)",
-            profile.subsystems.len(),
-            profile.core_components.len(),
-        );
+        // Prefix dispatch lives on the harness backend (each
+        // language's wording sits next to its `HarnessBackend`
+        // impl). Source it once and thread through the LLM-driven
+        // phases: mapper, spec-gen, and the per-link reflect path
+        // via `LinkContext`.
+        let language_prompt_prefix = harness_backend.prompt_prefix().to_string();
 
         tracing::info!("[streamloop stage 6/8] mapping extract↔historical semantics");
         let match_set = repo.load_semantic_match_results().await?;
         if match_set.matches.is_empty() {
-            let outcome: MapperOutcome =
-                MapSemanticsArgs::map_semantics(&repo, &kg, primary_llm, &spec_name, &self.map)
-                    .await?;
+            let outcome: MapperOutcome = MapSemanticsArgs::map_semantics(
+                &repo,
+                kg,
+                &primary_llm,
+                &spec_name,
+                language_prompt_prefix.clone(),
+                &self.map,
+            )
+            .await?;
             tracing::info!(
                 "[streamloop stage 6/8] mapper finished: {} matched pair(s) (H/M/L = {}/{}/{}), {} unmatched",
                 outcome.matched_pair_count,
@@ -250,7 +336,8 @@ impl StreamloopArgs {
         }
 
         tracing::info!("[streamloop stage 7/8] preparing spec-gen stream");
-        let gen_options = build_spec_options(&spec_name, &self.gen_specs);
+        let gen_options =
+            build_spec_options(&spec_name, language_prompt_prefix.clone(), &self.gen_specs);
         let stream = match SpecificationGenerator::new()
             .prepare_stream(&repo, &gen_options)
             .await?
@@ -269,24 +356,22 @@ impl StreamloopArgs {
             stream.total_links(),
             self.stream_link_concurrency.unwrap_or(1).max(1),
         );
-        let fuzz_cache_key = self
-            .stream_fuzz_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name));
+        // `language_prompt_prefix` flows into LinkContext too so the
+        // per-link reflect path can prepend it to the grader system
+        // prompt without re-walking the harness backend each call.
         let ctx = Arc::new(LinkContext {
             repo,
             primary_llm: primary_llm.clone(),
             reflect_llm,
             spec_name,
             repo_root,
-            forge_backend,
+            harness_backend,
             harness: self.harness.clone(),
-            fuzz: self.fuzz.clone(),
             reflect: self.reflect.clone(),
             regen: self.regen.clone(),
             output_folder: self.output_folder.clone(),
             max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
-            fuzz_cache_key,
+            language_prompt_prefix,
         });
         let scheduler = LinkScheduler {
             ctx,
@@ -311,13 +396,15 @@ impl StreamloopArgs {
             return;
         };
         let d = d.max(1);
+        self.map.map_concurrency.get_or_insert(d);
         self.gen_specs.gen_specs_concurrency.get_or_insert(d);
         self.fuzz.fuzz_concurrency.get_or_insert(d);
         self.reflect.reflect_concurrency.get_or_insert(d);
         self.regen.regen_concurrency.get_or_insert(d);
         self.stream_link_concurrency.get_or_insert(d);
         tracing::info!(
-            "[streamloop] --default-concurrency={d} fills in gen-specs={} fuzz={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
+            "[streamloop] --default-concurrency={d} fills in map={} gen-specs={} fuzz={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
+            self.map.map_concurrency.unwrap_or(1),
             self.gen_specs.gen_specs_concurrency.unwrap_or(1),
             self.fuzz.fuzz_concurrency.unwrap_or(1),
             self.reflect.reflect_concurrency.unwrap_or(1),
@@ -345,7 +432,11 @@ impl StreamloopArgs {
     }
 }
 
-fn build_spec_options(project_name: &str, shared: &GenSpecsSharedArgs) -> SpecGenOptions {
+fn build_spec_options(
+    project_name: &str,
+    language_prompt_prefix: String,
+    shared: &GenSpecsSharedArgs,
+) -> SpecGenOptions {
     SpecGenOptions {
         max_agent_steps: shared.gen_specs_max_agent_steps,
         max_specs_per_link: shared.gen_specs_max_specs_per_link,
@@ -365,6 +456,7 @@ fn build_spec_options(project_name: &str, shared: &GenSpecsSharedArgs) -> SpecGe
         regenerate: shared.gen_specs_regenerate,
         min_strength: shared.gen_specs_min_strength.into(),
         min_link_strength: shared.gen_specs_min_link_strength.into(),
+        language_prompt_prefix,
     }
 }
 
@@ -375,25 +467,43 @@ fn build_spec_options(project_name: &str, shared: &GenSpecsSharedArgs) -> SpecGe
 /// Immutable per-run context shared by every link pipeline. Built once
 /// at the bottom of `StreamloopArgs::run` and cloned via `Arc` into each
 /// worker. Everything a single link needs to drive itself end-to-end —
-/// repo handle, both LLMs, forge backend, the four phase arg-sets, and
+/// repo handle, both LLMs, harness backend, the four phase arg-sets, and
 /// the resolved `fuzz_cache_key` — lives here.
-struct LinkContext {
+///
+/// Generic over `B: HarnessBackend` so the same per-link orchestration
+/// drives both Solidity (`SolidityHarness`) and Sui Move
+/// (`MovyHarness`) runs. The concrete `B` is chosen at the top of
+/// `StreamloopArgs::run` based on the detected
+/// [`SourceLanguage`] (Stage 7 of plan_move_lang.md).
+struct LinkContext<B: HarnessBackend + Clone + 'static> {
     repo: RepoDatabase,
     primary_llm: LLM,
     reflect_llm: LLM,
     spec_name: String,
     repo_root: PathBuf,
-    forge_backend: ForgeBackend,
+    /// Bundled harness backend + per-pass options. Construction
+    /// (forge probe vs movy probe), preflight, and the inner
+    /// `fuzz_one_existing_spec` all dispatch through the
+    /// [`HarnessBackend`] impl so the per-link pipeline never has to
+    /// branch on language.
+    harness_backend: B,
+    /// Original CLI args — kept because regen still consumes a few
+    /// fields (`harness_debug_prefix`, `harness_via_ir`, etc.) that
+    /// don't have a home on the backend handle. Trim once a `Move`
+    /// path lands and we settle on the smallest shared surface.
     harness: HarnessSharedArgs,
-    fuzz: FuzzSharedArgs,
     reflect: ReflectSharedArgs,
     regen: RegenSharedArgs,
     output_folder: PathBuf,
     max_inner_cycles: usize,
-    fuzz_cache_key: String,
+    /// Frozen prompt prefix sourced once from
+    /// `harness_backend.prompt_prefix()` at link-pipeline start.
+    /// Reflection threads this into the grader system prompt without
+    /// having to round-trip through the backend per call.
+    language_prompt_prefix: String,
 }
 
-impl LinkContext {
+impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
     /// Drive one claimed link end-to-end. Resume is now DB-driven:
     /// [`SpecGenStream::prepare_stream`] already filtered out
     /// previously-built links and tagged previously-partial ones with
@@ -572,21 +682,6 @@ impl LinkContext {
             total,
         );
         let phase_started = std::time::Instant::now();
-        let fuzz_options = self.harness.to_fuzz_options(FuzzOptionsBuild {
-            repo_root: self.repo_root.clone(),
-            default_cache_key: self.fuzz_cache_key.clone(),
-            max_specs: 0,
-            concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
-            regenerate: self.fuzz.fuzz_regenerate,
-            via_ir: self.harness.harness_via_ir,
-        });
-        let fuzz_generator = SolidityHarnessGenerator::new(
-            self.harness.harness_mode.into(),
-            &self.repo,
-            &self.primary_llm,
-            &fuzz_options,
-            self.forge_backend.clone(),
-        );
         let mut produced = Vec::new();
         let mut completed = 0usize;
         let mut violated = 0usize;
@@ -598,7 +693,11 @@ impl LinkContext {
                 idx + 1,
                 total,
             );
-            if let Some(fuzzed) = fuzz_generator.fuzz_one_existing_spec(spec_id).await? {
+            if let Some(fuzzed) = self
+                .harness_backend
+                .fuzz_one_existing_spec(&self.repo, &self.primary_llm, spec_id)
+                .await?
+            {
                 let was_completed = matches!(fuzzed.status, CodeGenStatus::Completed);
                 drain.fuzz_completed += usize::from(was_completed);
                 drain.fuzz_violated += usize::from(fuzzed.any_violation);
@@ -656,6 +755,7 @@ impl LinkContext {
             &self.reflect_llm,
             &self.spec_name,
             &self.repo_root,
+            self.language_prompt_prefix.clone(),
             &self.reflect,
             produced,
         )
@@ -701,13 +801,12 @@ impl LinkContext {
         );
         let phase_started = std::time::Instant::now();
         let (stats, child_specs, child_code_gens) = RegenArgs::regen_specs(
+            &self.harness_backend,
             &self.repo,
             &self.primary_llm,
             &self.spec_name,
-            &self.repo_root,
             &self.harness,
             &self.regen,
-            &self.forge_backend,
             active_spec_ids,
         )
         .await?;
@@ -811,12 +910,12 @@ fn snapshot_status(s: LinkSpecStatus) -> &'static str {
 /// from the shared stream, spawns a task per claim, and keeps up to
 /// `concurrency` tasks active via [`JoinSet`]. Stats roll up from each
 /// `(specs_built, abandoned)` per worker as they finish.
-struct LinkScheduler {
-    ctx: Arc<LinkContext>,
+struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
+    ctx: Arc<LinkContext<B>>,
     concurrency: usize,
 }
 
-impl LinkScheduler {
+impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
     async fn run(self, stream: SpecGenStream) -> Result<StreamStats> {
         let total = stream.total_links();
         let stream = Arc::new(Mutex::new(stream));

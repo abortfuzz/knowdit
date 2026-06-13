@@ -229,6 +229,16 @@ impl ProfileAttemptHandle {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FinalizeProfileArgs {
+    /// The project's source language — exactly one of
+    /// `"Solidity"` or `"Move"`. Determine this by reading
+    /// representative source files: `.sol` extension + Solidity
+    /// syntax (`pragma solidity`, `contract X { ... }`) → emit
+    /// `"Solidity"`; `.move` extension + Move syntax (`module
+    /// pkg::name;`, `entry fun`, `struct ... has key`) → emit
+    /// `"Move"`. The `finalize_profile` tool refuses any other
+    /// value, so the agent must determine the language before
+    /// it can terminate.
+    pub language: String,
     /// 100-300 word prose describing what the project IS — the
     /// mechanism it uses, what role it plays. No marketing language.
     pub domain_summary: String,
@@ -259,11 +269,29 @@ pub struct FinalizeComponent {
     pub role: String,
 }
 
-impl From<FinalizeProfileArgs> for ProjectProfile {
-    fn from(value: FinalizeProfileArgs) -> Self {
-        Self {
-            domain_summary: value.domain_summary,
-            subsystems: value
+impl FinalizeProfileArgs {
+    /// Convert the raw agent emission into a [`ProjectProfile`].
+    /// Returns `Err(reason)` when `language` is missing or
+    /// unrecognized — the `finalize_profile` tool surfaces the
+    /// reason back to the agent so it can retry with a corrected
+    /// value rather than crash-stop the run. Other fields are
+    /// validated separately in `invoke()` (non-empty
+    /// `domain_summary`, non-empty `subsystems` /
+    /// `core_components`).
+    fn into_profile(self) -> std::result::Result<ProjectProfile, String> {
+        let language = knowdit_repo_model::SourceLanguage::parse_lenient(&self.language)
+            .ok_or_else(|| {
+                format!(
+                    "language must be exactly \"Solidity\" or \"Move\" (got {:?}). \
+                     Identify the project's source language by reading at least one \
+                     source file and re-call finalize_profile with the correct value.",
+                    self.language
+                )
+            })?;
+        Ok(ProjectProfile {
+            language,
+            domain_summary: self.domain_summary,
+            subsystems: self
                 .subsystems
                 .into_iter()
                 .map(|s| ProjectSubsystem {
@@ -271,7 +299,7 @@ impl From<FinalizeProfileArgs> for ProjectProfile {
                     summary: s.summary,
                 })
                 .collect(),
-            core_components: value
+            core_components: self
                 .core_components
                 .into_iter()
                 .map(|c| ProjectComponent {
@@ -280,9 +308,9 @@ impl From<FinalizeProfileArgs> for ProjectProfile {
                     role: c.role,
                 })
                 .collect(),
-            out_of_scope_notes: value.out_of_scope_notes,
-            source_files_read: value.source_files_read,
-        }
+            out_of_scope_notes: self.out_of_scope_notes,
+            source_files_read: self.source_files_read,
+        })
     }
 }
 
@@ -315,7 +343,18 @@ impl FinalizeProfileTool {
         if args.core_components.is_empty() {
             return Ok("error: core_components must contain at least one entry".to_string());
         }
-        match self.attempt.try_set(args.into()).await {
+        // `language` is parsed inside `into_profile`. Invalid /
+        // missing values surface back to the agent as a normal
+        // tool result — the attempt is NOT marked committed,
+        // so the agent loop keeps running and the LLM can retry
+        // `finalize_profile` with a corrected language. This
+        // matches how other fields are validated above; the
+        // agent's step budget is the only ceiling on retries.
+        let profile = match args.into_profile() {
+            Ok(p) => p,
+            Err(reason) => return Ok(format!("error: {reason}")),
+        };
+        match self.attempt.try_set(profile).await {
             Ok(()) => Ok("ok: profile committed; finish the run".to_string()),
             Err(_) => Ok(
                 "error: finalize_profile was already called this run; do not call it twice"
@@ -342,9 +381,14 @@ Workflow:
        src/, contracts/
   2. Use read_file to read the most informative docs (README first, then scope, then audit
      notes if present). Cap your reads at {max_files_read}.
-  3. If docs are absent or unhelpful, fall back to list_dir on src/ (or contracts/) +
+  3. Read at least one project source file (NOT just docs) to confirm the source language.
+     Solidity vs Move is decided by combining the file extension with concrete syntax —
+     `.sol` + `pragma solidity` + `contract X {{ ... }}` ⇒ Solidity; `.move` + `module
+     pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move. Mark your answer in
+     `finalize_profile`'s `language` field.
+  4. If docs are absent or unhelpful, fall back to list_dir on src/ (or contracts/) +
      read_file on 2-3 of the main contract files for shape inference.
-  4. Call finalize_profile exactly once with a complete profile.
+  5. Call finalize_profile exactly once with a complete profile.
 
 Tool reference (all relative paths are resolved against the project root):
   - list_dir(relative_path)         — list direct child entries
@@ -353,6 +397,12 @@ Tool reference (all relative paths are resolved against the project root):
   - finalize_profile({{...fields}})  — sink; call exactly once
 
 Rules for each field:
+
+  - language: exactly `"Solidity"` or `"Move"`. Read at least one source file (NOT just
+    docs/README) and confirm: `.sol` with `pragma solidity` + `contract X` keywords ⇒
+    Solidity; `.move` with `module pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move.
+    `finalize_profile` will REFUSE to commit any other value (you'll see an `error:` tool
+    response and the run will continue), so determine this before calling finalize.
 
   - domain_summary (~200 words): what this project IS, what role it plays in DeFi/wallet/infra
     space, who the user is. Be concrete. Avoid marketing language ("the leading X protocol") —

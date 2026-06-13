@@ -117,9 +117,29 @@ impl WorkflowLearnArgs {
             let extract = project
                 .categorize_and_extract(primary_llm, &agent_options, None)
                 .await?;
-            project
-                .merge_and_write(&kg, primary_llm, &extract, &agent_options, chunking)
+
+            // Compose Phase 1c admission + pending_semantic enqueue
+            // in ONE transaction: write_project_completed_txn returns
+            // this project's newly-introduced canonical ids, which
+            // we immediately enqueue for Phase 2 retro-link via
+            // enqueue_pending_canonical_semantics_txn. A kill
+            // between the two writes rolls both back. The
+            // single-step `merge_and_write` wrapper is reserved for
+            // bulk learn paths that don't run retro-link.
+            let txn = kg.begin().await?;
+            let new_canonicals = project
+                .merge_and_write_txn(&txn, &kg, primary_llm, &extract, &agent_options, chunking)
                 .await?;
+            let enqueued = kg
+                .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)
+                .await?;
+            txn.commit().await?;
+            tracing::info!(
+                "Phase 1: enqueued {} new canonical semantic(s) for Phase 2 retro-link \
+                 (of {} newly introduced)",
+                enqueued,
+                new_canonicals.len(),
+            );
         }
 
         // ----- Phase 2: retro link --------------------------------

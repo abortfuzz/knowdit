@@ -13,6 +13,7 @@
 //! automatically there.
 use clap::Args;
 use color_eyre::eyre::{Result, eyre};
+use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::mapper::{KnowledgeMapper, MapperOptions, MapperOutcome};
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_repo_model::RepoDatabase;
@@ -37,6 +38,14 @@ pub struct MapSemanticsSharedArgs {
     /// projects don't share a cache namespace.
     #[arg(long = "map-cache-key")]
     pub map_cache_key: Option<String>,
+
+    /// Max historical batches the mapper matches concurrently (each
+    /// batch is one LLM call). Defaults to 8 when unset. `workflow
+    /// streamloop` fills this from `--default-concurrency` when you
+    /// don't pass it explicitly. Typed `Option` so that fill-in can
+    /// tell "unset" from an explicit value.
+    #[arg(long = "map-concurrency")]
+    pub map_concurrency: Option<usize>,
 }
 
 #[derive(Args)]
@@ -60,13 +69,27 @@ pub struct MapSemanticsArgs {
 impl MapSemanticsArgs {
     /// CLI entry: open the historical KG + project DB, delegate to
     /// [`Self::map_semantics`], print a one-line summary.
+    ///
+    /// Standalone CLI is Solidity-only: it doesn't construct a
+    /// harness backend, so the language prefix is hardcoded to
+    /// [`SolidityHarness::PROMPT_PREFIX`]. Move projects must go
+    /// through `workflow streamloop`, which has a backend in hand
+    /// and passes its `prompt_prefix()`.
     pub async fn run(self, llm: &LLM) -> Result<()> {
-        let kg = self.kg.connect_init().await?;
+        let kg = self.kg.connect_init_for_consumer().await?;
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let outcome = Self::map_semantics(&repo, &kg, llm, &spec.name, &self.shared).await?;
+        let outcome = Self::map_semantics(
+            &repo,
+            &kg,
+            llm,
+            &spec.name,
+            SolidityHarness::PROMPT_PREFIX.to_string(),
+            &self.shared,
+        )
+        .await?;
         println!(
             "Knowledge Mapper finished: {} extract semantic(s), {} historical considered, {} matched pair(s), {} unmatched extract(s), {} historical finding(s) ingested",
             outcome.extracted_count,
@@ -85,11 +108,18 @@ impl MapSemanticsArgs {
     /// returns an error otherwise. The autoloop runs the profile
     /// phase ahead of map-semantics to satisfy this; standalone CLI
     /// users must run `agentic profile` first.
+    ///
+    /// `language_prompt_prefix` is the language-context block to
+    /// prepend to the mapper agent's system prompt. Callers source
+    /// it from `harness_backend.prompt_prefix()` when they have one
+    /// (streamloop) or hardcode `SolidityHarness::PROMPT_PREFIX` for
+    /// the standalone Solidity-only CLI path.
     pub async fn map_semantics(
         repo: &RepoDatabase,
         kg: &HistoricalDatabase,
         llm: &LLM,
         project_name: &str,
+        language_prompt_prefix: String,
         shared: &MapSemanticsSharedArgs,
     ) -> Result<MapperOutcome> {
         let profile = repo.get_project_profile().await?.ok_or_else(|| {
@@ -104,9 +134,11 @@ impl MapSemanticsArgs {
             .unwrap_or_else(|| format!("{}-knowdit-mapper", project_name));
         let options = MapperOptions {
             batch_size: shared.map_batch_size.max(1),
+            concurrency: shared.map_concurrency.unwrap_or(8).max(1),
             cache_key: Some(cache_key),
+            language_prompt_prefix: language_prompt_prefix.clone(),
         };
-        KnowledgeMapper::new(profile)
+        KnowledgeMapper::new(profile, language_prompt_prefix)
             .run(repo, kg, llm, &options)
             .await
     }

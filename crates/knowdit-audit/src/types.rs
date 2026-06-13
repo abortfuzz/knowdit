@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub enum StateGraph {
     Solidity(StorageGraph),
-    Move, /* ? */
 }
 
 /// Fetch from repo database

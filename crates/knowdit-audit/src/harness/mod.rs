@@ -14,8 +14,11 @@
 //!   * [`forge_json`] — typed mirror of `forge test --json` output.
 //!   * [`cgroup`] — cgroup v2 raw `/sys/fs/cgroup` helpers used by the
 //!     `LocalCgroup` backend (Linux only).
+pub mod backend;
 #[cfg(target_os = "linux")]
 mod cgroup;
 pub mod forge;
 pub mod forge_json;
 pub mod solidity;
+
+pub use backend::HarnessBackend;

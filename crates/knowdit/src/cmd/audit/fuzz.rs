@@ -7,12 +7,10 @@
 //! `harness_run` / `line_coverage`. Resume-safe: a re-run skips specs whose
 //! `code_gen` row is already `Completed` unless `--fuzz-regenerate` is set.
 
-use std::path::Path;
-
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
-use knowdit_audit::harness::forge::ForgeBackend;
-use knowdit_audit::harness::solidity::{FuzzOutcome, SolidityHarnessGenerator};
+use knowdit_audit::harness::HarnessBackend;
+use knowdit_audit::harness::solidity::FuzzOutcome;
 use knowdit_repo_model::RepoDatabase;
 use llmy::client::client::LLM;
 
@@ -59,31 +57,29 @@ pub struct FuzzArgs {
 }
 
 impl FuzzArgs {
-    /// CLI entry: open the project DB, build the forge backend,
-    /// delegate to [`Self::fuzz`], print one-line summary.
+    /// CLI entry: open the project DB, build the Solidity harness
+    /// backend, delegate to [`Self::fuzz`], print one-line summary.
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let backend = self.harness.to_forge_backend()?;
+        let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+            repo_root: spec.root.clone(),
+            default_cache_key: format!("{}-knowdit-fuzz", spec.name),
+            max_specs: self.shared.fuzz_max_specs,
+            concurrency: self.shared.fuzz_concurrency.unwrap_or(1).max(1),
+            regenerate: self.shared.fuzz_regenerate,
+            via_ir: self.harness.harness_via_ir,
+        })?;
         // Preflight the forge environment before any harness-codegen
         // agent runs, so misconfigured projects fail with forge's own
         // error message instead of burning LLM steps.
-        self.harness
-            .preflight(&backend, &spec.root)
+        harness_backend
+            .preflight(&spec.root)
             .await
             .wrap_err("forge environment preflight failed")?;
-        let outcome = Self::fuzz(
-            &repo,
-            llm,
-            &spec.name,
-            &spec.root,
-            &self.harness,
-            &self.shared,
-            &backend,
-        )
-        .await?;
+        let outcome = Self::fuzz(&harness_backend, &repo, llm).await?;
         println!(
             "Fuzz finished: processed={} completed={} abandoned={} error={} violated={} skipped_resumed={}",
             outcome.processed_count,
@@ -96,37 +92,18 @@ impl FuzzArgs {
         Ok(())
     }
 
-    /// In-process entry: synthesize Foundry harnesses for every
-    /// pending `specification` row in `repo` and drive forge against
-    /// them. `backend` is the already-resolved forge runtime (the
-    /// caller builds it once with `HarnessSharedArgs::to_forge_backend`
-    /// and threads it through, so the `forge coverage --help` probe
-    /// runs only once across an autoloop cycle).
-    pub async fn fuzz(
+    /// In-process entry: drive the configured harness backend through
+    /// a full sweep of pending specs. Generic over the backend so
+    /// `workflow autoloop` and a future Move dispatch can call the
+    /// same path with their own [`HarnessBackend`] impl. The
+    /// already-built `harness_backend` carries the resolved forge
+    /// runtime so `forge coverage --help` only probes once per
+    /// pipeline invocation.
+    pub async fn fuzz<B: HarnessBackend>(
+        harness_backend: &B,
         repo: &RepoDatabase,
         llm: &LLM,
-        project_name: &str,
-        repo_root: &Path,
-        harness: &HarnessSharedArgs,
-        shared: &FuzzSharedArgs,
-        backend: &ForgeBackend,
     ) -> Result<FuzzOutcome> {
-        let options = harness.to_fuzz_options(FuzzOptionsBuild {
-            repo_root: repo_root.to_path_buf(),
-            default_cache_key: format!("{}-knowdit-fuzz", project_name),
-            max_specs: shared.fuzz_max_specs,
-            concurrency: shared.fuzz_concurrency.unwrap_or(1).max(1),
-            regenerate: shared.fuzz_regenerate,
-            via_ir: harness.harness_via_ir,
-        });
-        SolidityHarnessGenerator::new(
-            harness.harness_mode.into(),
-            repo,
-            llm,
-            &options,
-            backend.clone(),
-        )
-        .run()
-        .await
+        harness_backend.fuzz_sweep(repo, llm).await
     }
 }

@@ -2,20 +2,49 @@
 //!
 //! Both Phase 1 ([`super::grader::VerdictGrader`]) and Phase 2
 //! ([`super::severity_grader::SeverityGrader`]) keep their multi-page
-//! methodology prose as `const &str` constants. Splitting them out of
-//! the grader modules keeps the per-agent files focused on data flow
-//! and tool wiring; the prompt body itself lives here so iterating on
-//! wording doesn't churn the agent driver code.
+//! methodology prose as template constants. A small set of slot
+//! placeholders ([`crate::lang_hints::LanguagePromptHints`]) lets
+//! the same prose serve every language — only the language-specific
+//! wording (source extension, doc-comment convention, assertion
+//! idiom) gets substituted at render time.
+//!
+//! [`verdict_system`] / [`severity_system`] are the rendered
+//! entry points; callers pass whichever
+//! [`LanguagePromptHints`] constant the consumer binary's
+//! dispatch resolved for the project at hand.
+
+/// Build the verdict-grader system prompt for this run.
+/// `language_prompt_prefix`, when non-empty, is verbatim-prepended
+/// — the caller (consumer binary) supplies a per-language Markdown
+/// block. Empty prefix ⇒ Solidity-flavored default (the template
+/// itself reads as Solidity since that's the open-source path).
+pub(super) fn verdict_system(language_prompt_prefix: &str) -> String {
+    prepend_prefix(language_prompt_prefix, VERDICT_SYSTEM_TEMPLATE)
+}
+
+/// Same shape for the severity grader.
+pub(super) fn severity_system(language_prompt_prefix: &str) -> String {
+    prepend_prefix(language_prompt_prefix, SEVERITY_SYSTEM_TEMPLATE)
+}
+
+fn prepend_prefix(prefix: &str, body: &str) -> String {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}\n\n{body}")
+    }
+}
 
 /// Verdict grader system prompt. Name resolution is a triage signal,
 /// but the agent must still judge whether a violated trace semantically
 /// maps to real project code when enough requested names resolve.
-pub(super) const VERDICT_SYSTEM: &str = r#"You are the Reflector verdict agent — a multi-turn code auditor that classifies one violated harness_run against the project under audit.
+const VERDICT_SYSTEM_TEMPLATE: &str = r#"You are the Reflector verdict agent — a multi-turn code auditor that classifies one violated harness_run against the project under audit.
 
 You will be given a JSON document with:
 - `run_id`, `spec_id`: row identifiers for tracing
 - `spec`: the AuditSpecification this harness was supposed to validate (setup contracts/state, pre_attack/post_attack states, ordered call sequence)
-- `harness_source`: the .sol file the fuzz agent committed
+- `harness_source`: the source file the fuzz agent committed
 - `finding_title`: optional historical-finding label that motivated the spec
 - `run`: this single harness_run's digest (kind, exit_code, violated, stdout_tail, decoded counter-example)
 - `coverage_summary`: hit/expected count of spec.sequence functions and missed-step labels (when a coverage run was issued for this code_gen)
@@ -28,7 +57,7 @@ You have inspection tools to verify against the actual project source — USE th
 - `lookup_state_variable_xrefs(state_variable)` — find readers/writers of a state var
 - `read_contract_source(contract)` — full source of one contract by KG name
 - `read_function_source(contract, function)` — focused source for one function by KG name
-- `read_file(file_path, ...)` — read any repo-relative file (README, docs/, NatSpec-heavy .sol, audit reports, test notes)
+- `read_file(file_path, ...)` — read any repo-relative file (README, docs/, comment-heavy source files, audit reports, test notes)
 - `list_dir(relative_path)` — list one directory's direct children
 - `find_file(directory, pattern)` — glob filenames (`*.md`, `*SPEC*`, `*audit*`, …)
 - `grep(directory, pattern, ...)` — recursive content search (case-insensitive substrings or simple regex)
@@ -78,7 +107,7 @@ Required investigation BEFORE classifying ExpectedViolation:
 
   1. If `input.project_profile` is present, locate the subsystem / core component(s) the violating trace touches. Note documented invariants, expected reverts, intentional behaviors. The profile is the cheapest source of design intent — read it first.
 
-  2. `read_function_source` on every project function in spec.sequence AND every project function in the counter-example. Look in NatSpec and inline comments for:
+  2. `read_function_source` on every project function in spec.sequence AND every project function in the counter-example. Look in inline documentation / source comments for:
        - `@notice` / `@dev` / `@inheritdoc` blocks
        - explicit "MUST" / "MUST NOT" / "expected" / "intended" wording
        - documented revert reasons (`require(..., "REASON")`)
@@ -136,13 +165,13 @@ Methodology:
 - Burn cheap calls first: `lookup_call_graph` on every name in `spec.setup.contracts` and `spec.sequence`, then apply the 30% requested-name threshold above. Do not stop on the first unresolved role label.
 - Then `lookup_call_graph` on every `contract_name` in the counter-example. Names that fail to resolve = scaffolding = `OutOfScope` evidence.
 - Use `read_function_source` when at least 30% of requested names resolve and you need to choose between `IncompleteStep` / `ExpectedViolation` / `ValidFinding`.
-- The repository-level tools (`list_dir`, `find_file`, `grep`, `read_file`) are for surveying project docs, NatSpec, and test code that lives outside the KG. Use `read_function_source` and `read_contract_source` when the target is already known via `lookup_call_graph`.
+- The repository-level tools (`list_dir`, `find_file`, `grep`, `read_file`) are for surveying project docs, inline source comments, and test code that lives outside the KG. Use `read_function_source` and `read_contract_source` when the target is already known via `lookup_call_graph`.
 - Don't dump every contract you can think of; the agent step budget is finite.
 "#;
 
 /// Severity grader system prompt. Used only after the verdict grader
 /// returned `ValidFinding`; chooses one of High / Medium / Low.
-pub(super) const SEVERITY_SYSTEM: &str = r#"You are the Severity Grader — a multi-turn auditor that decides the severity tier (High / Medium / Low) of one ValidFinding.
+const SEVERITY_SYSTEM_TEMPLATE: &str = r#"You are the Severity Grader — a multi-turn auditor that decides the severity tier (High / Medium / Low) of one ValidFinding.
 
 A separate verdict-grader agent has already classified this harness_run as a real bug and produced a `verdict_reason`. Your job is the dedicated severity argument, not to re-litigate whether the bug exists.
 

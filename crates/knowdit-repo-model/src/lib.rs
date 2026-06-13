@@ -1,6 +1,8 @@
 pub mod cg;
 pub mod db;
 pub mod inheritance;
+pub mod lang;
+pub mod move_lang;
 pub mod repo;
 pub mod storage;
 
@@ -8,6 +10,11 @@ pub mod storage;
 mod tests;
 
 pub use inheritance::{ContractInherit, InheritanceGraph};
+pub use lang::SourceLanguage;
+pub use move_lang::{
+    MoveAbility, MoveField, MoveFunctionMetadata, MoveGenericParam, MovePackageStructure,
+    MoveStruct, MoveVisibility,
+};
 
 pub use repo::{
     CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, FullSpecRegenIds, HarnessRunRecord,

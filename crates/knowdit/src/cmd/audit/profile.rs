@@ -66,6 +66,10 @@ impl ProfileArgs {
     /// CLI entry. Opens the repo DB, runs the profile-gen agent,
     /// prints a one-line summary.
     pub async fn run(self, llm: &LLM) -> Result<()> {
+        // Profile is the discoverer of project language — no
+        // pre-load detection or prefix dispatch needed here.
+        // The agent reads the source itself and commits a
+        // `language` value via `finalize_profile`.
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone())

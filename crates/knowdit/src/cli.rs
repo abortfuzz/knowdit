@@ -242,6 +242,21 @@ pub struct HistoricalDatabaseArgs {
     /// mysql://, postgres://).
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
+
+    /// Consumer-only override: skip the partial-link integrity
+    /// check that [`Self::connect_init_for_consumer`] runs at
+    /// startup. The check refuses to open a historical KG that has
+    /// `semantic_finding_link` rows for findings missing a
+    /// `finding_link_status` row — that state means a prior
+    /// `workflow learn` was killed mid-link, and consuming it would
+    /// pull in mid-flight strength values that the linker hasn't
+    /// finalized.
+    ///
+    /// Writers (`learn` / `workflow learn`) bypass the check by
+    /// going through [`Self::connect_init`] directly — they expect
+    /// to operate on partial DBs (that's exactly how resume works).
+    #[arg(long, default_value_t = false)]
+    pub force_allow_partial_historical: bool,
 }
 
 impl HistoricalDatabaseArgs {
@@ -260,13 +275,73 @@ impl HistoricalDatabaseArgs {
     }
 
     /// Open + run `init()` (creates tables, seeds category rows).
-    /// Used by every learn/agentic/workflow subcommand that reads
-    /// or writes the KG.
+    /// **Writer-side entry point** — used by every `learn` /
+    /// `workflow learn` path. Does NOT run the partial-link
+    /// integrity check; writers must be able to operate on a
+    /// partial DB to resume an interrupted run.
     pub async fn connect_init(&self) -> Result<HistoricalDatabase> {
         let db = self.connect().await?;
         db.init()
             .await
             .wrap_err("failed to init historical KG schema")?;
+        Ok(db)
+    }
+
+    /// Consumer-side entry point — used by `workflow streamloop`,
+    /// `workflow autoloop`, and `agentic map-semantics`. Same
+    /// connect + init as [`Self::connect_init`], then runs
+    /// `validate_db(false)` and refuses to return a DB whose
+    /// integrity report has any issues. The operator can override
+    /// with `--force-allow-partial-historical` when they explicitly
+    /// want to consume a known-partial DB.
+    ///
+    /// Why this is a separate method (not a flag-gated behaviour
+    /// on `connect_init`): writers always need to bypass the
+    /// check, so making it conditional on a CLI flag would force
+    /// every `learn` invocation to carry the flag. Two methods is
+    /// the simplest split — the call site declares its intent.
+    pub async fn connect_init_for_consumer(&self) -> Result<HistoricalDatabase> {
+        // Consumers only ever READ the historical KG (the mapper pulls
+        // canonical semantics + linked findings; nothing here writes
+        // back). So initialize the schema only when it is actually
+        // missing — a brand-new DB. Against a pre-populated DB we must
+        // NOT run `init()`: its CREATE TABLE / ALTER are redundant
+        // there and are denied outright when the KG is exposed through
+        // a SELECT-only grant (e.g. a read-only MySQL replica). The
+        // writer entry point [`Self::connect_init`] is unchanged —
+        // writers always have, and need, full privileges.
+        let db = self.connect().await?;
+        if !db.schema_is_initialized().await? {
+            db.init()
+                .await
+                .wrap_err("failed to init historical KG schema")?;
+        }
+        if self.force_allow_partial_historical {
+            return Ok(db);
+        }
+        let report = db
+            .validate_db(false)
+            .await
+            .wrap_err("failed to run historical KG integrity check")?;
+        if !report.is_clean() {
+            let lines = report
+                .remaining_issues
+                .iter()
+                .map(|i| format!("  - {}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(color_eyre::eyre::eyre!(
+                "Historical KG at {} failed its integrity check ({} issue(s)):\n\
+                 {}\n\n\
+                 If this looks like an interrupted `workflow learn` run, finish \
+                 it by re-running `knowdit workflow learn` against the same \
+                 project. If you intentionally want to consume the partial DB, \
+                 re-run with `--force-allow-partial-historical`.",
+                self.database_url,
+                report.remaining_issues.len(),
+                lines,
+            ));
+        }
         Ok(db)
     }
 }

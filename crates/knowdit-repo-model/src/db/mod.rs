@@ -17,6 +17,7 @@ pub mod historical_semantic_finding_link;
 pub mod interface;
 pub mod interface_functions;
 pub mod line_coverage;
+pub mod r#move;
 pub mod project_metadata;
 pub mod project_semantic;
 pub mod project_semantic_function;

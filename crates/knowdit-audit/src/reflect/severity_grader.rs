@@ -40,7 +40,7 @@ use crate::types::AuditSpecification;
 use super::agent_loop::{
     AttemptHandle, CoverageSummary, GraderOptions, RunSummary, drive_agent_loop,
 };
-use super::prompt::SEVERITY_SYSTEM;
+use super::prompt::severity_system;
 
 /// Single per-`harness_run` severity-grading task. Same per-run /
 /// per-spec context the verdict grader saw, plus the verdict
@@ -77,6 +77,11 @@ pub struct SeverityGrader {
     /// so the agent's `read_file` / `list_dir` / `find_file` / `grep`
     /// tools sandbox to this directory.
     repo_root: PathBuf,
+    /// Pre-rendered Markdown block describing the project's
+    /// source language; verbatim-prepended to the severity
+    /// system prompt. Same dispatch convention as
+    /// [`super::grader::VerdictGrader::language_prompt_prefix`].
+    language_prompt_prefix: String,
     options: GraderOptions,
 }
 
@@ -85,6 +90,7 @@ impl SeverityGrader {
     pub async fn new(
         repo: &RepoDatabase,
         repo_root: &Path,
+        language_prompt_prefix: String,
         llm: &LLM,
         options: GraderOptions,
     ) -> Result<Self> {
@@ -109,6 +115,7 @@ impl SeverityGrader {
             llm: llm.clone(),
             project_index,
             repo_root: repo_root.to_path_buf(),
+            language_prompt_prefix,
             options,
         })
     }
@@ -120,6 +127,7 @@ impl SeverityGrader {
     pub fn new_with_index(
         llm: &LLM,
         repo_root: &Path,
+        language_prompt_prefix: String,
         project_index: Arc<ProjectIndex>,
         options: GraderOptions,
     ) -> Self {
@@ -127,8 +135,13 @@ impl SeverityGrader {
             llm: llm.clone(),
             project_index,
             repo_root: repo_root.to_path_buf(),
+            language_prompt_prefix,
             options,
         }
+    }
+
+    pub fn language_prompt_prefix(&self) -> &str {
+        &self.language_prompt_prefix
     }
 
     /// Grade severity for one ValidFinding. Returns `Err` only on
@@ -146,7 +159,9 @@ impl SeverityGrader {
             &self.project_index,
             &self.llm,
             &self.options,
-            SEVERITY_SYSTEM.to_string(),
+            // The language prefix is prepended to the system
+            // prompt by `severity_system` — see VerdictGrader.
+            severity_system(&self.language_prompt_prefix),
             user_prompt,
             &cache_suffix,
             tools,

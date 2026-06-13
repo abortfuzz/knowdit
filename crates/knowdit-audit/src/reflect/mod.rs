@@ -52,16 +52,33 @@ pub struct GraderPair {
 }
 
 impl GraderPair {
+    /// `language_prompt_prefix` is forwarded into both graders
+    /// so the agent system prompts share one pre-rendered
+    /// language context block. The audit crate doesn't know
+    /// which non-Solidity languages exist — the consumer binary
+    /// renders the prefix and threads it in. Two graders sharing
+    /// one prefix also means callers can't accidentally pair a
+    /// verdict grader and a severity grader configured for
+    /// different languages.
     pub async fn new(
         repo: &RepoDatabase,
         repo_root: &std::path::Path,
+        language_prompt_prefix: String,
         llm: &LLM,
         options: GraderOptions,
     ) -> Result<Self> {
-        let verdict = VerdictGrader::new(repo, repo_root, llm, options.clone()).await?;
+        let verdict = VerdictGrader::new(
+            repo,
+            repo_root,
+            language_prompt_prefix.clone(),
+            llm,
+            options.clone(),
+        )
+        .await?;
         let severity = SeverityGrader::new_with_index(
             llm,
             repo_root,
+            language_prompt_prefix,
             verdict.project_index().clone(),
             options,
         );

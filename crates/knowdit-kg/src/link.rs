@@ -89,6 +89,15 @@ pub struct FindingLinkOptions {
     pub concurrency: usize,
     pub input_token_budget: Option<usize>,
     pub finding_token_budget: Option<usize>,
+    /// Hard ceiling on findings per batch — independent of token
+    /// budget. The token-based partitioner would happily pack 400+
+    /// findings into a single batch on small-finding KGs (e.g. the
+    /// Move KG: ~150 tok/finding × 459 findings ≈ 70K tok, fits
+    /// in one 72K budget), but agents in practice can only stably
+    /// emit decisions for a few dozen findings per attempt before
+    /// finalizing prematurely. Cap both ways: token budget AND
+    /// finding count. `None` ⇒ uses [`DEFAULT_MAX_FINDINGS_PER_BATCH`].
+    pub max_findings_per_batch: Option<usize>,
     /// Max attempts per (finding-batch × semantic-chunk) — if the agent
     /// finalizes without covering every finding in the batch, the runner
     /// re-runs a fresh agent restricted to the still-missing findings.
@@ -229,18 +238,23 @@ impl FindingLinkContextKey {
     }
 
     fn slug(&self) -> String {
-        if self.categories.is_empty() {
-            return "none".to_string();
-        }
-
-        let base = sanitize_prompt_prefix(
-            &self
-                .categories
-                .iter()
-                .map(DeFiCategory::as_str)
-                .collect::<Vec<_>>()
-                .join("-"),
-        );
+        // Always include `chunk-<n>` — even for the empty-categories
+        // "all-canonical" pass, the semantic library is split into N
+        // chunks and each becomes its own batch. Without the chunk
+        // suffix all N parallel batches log identically and the user
+        // can't tell which one is still running.
+        let base = if self.categories.is_empty() {
+            "none".to_string()
+        } else {
+            sanitize_prompt_prefix(
+                &self
+                    .categories
+                    .iter()
+                    .map(DeFiCategory::as_str)
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            )
+        };
 
         format!("{}-chunk-{}", base, self.semantic_chunk_index)
     }
@@ -358,11 +372,20 @@ impl FindingLinkExecutionPlan {
     }
 }
 
+/// Hard cap on findings per batch when [`FindingLinkOptions::max_findings_per_batch`]
+/// isn't set. Empirically ~50 is what the post-step-cap-200 agent
+/// handles reliably across both Move and Solidity KGs without
+/// finalizing prematurely. Override with `--max-findings-per-batch`.
+const DEFAULT_MAX_FINDINGS_PER_BATCH: usize = 50;
+
 #[derive(Debug, Clone, Copy)]
 struct FindingLinkBudgets {
     input_token_budget: usize,
     semantic_token_target: usize,
     finding_token_target: usize,
+    /// Independent of token budget: hard cap on findings per batch.
+    /// `partition_finding_link_entries` honours `min(token, count)`.
+    max_findings_per_batch: usize,
 }
 
 impl FindingLinkBudgets {
@@ -379,11 +402,16 @@ impl FindingLinkBudgets {
             .unwrap_or(shared_target)
             .min(shared_target)
             .max(1);
+        let max_findings_per_batch = options
+            .max_findings_per_batch
+            .unwrap_or(DEFAULT_MAX_FINDINGS_PER_BATCH)
+            .max(1);
 
         Self {
             input_token_budget,
             semantic_token_target: shared_target,
             finding_token_target,
+            max_findings_per_batch,
         }
     }
 
@@ -530,6 +558,14 @@ pub async fn link_pending_findings(
             };
             match runner.run().await {
                 Ok(results) => {
+                    // Mirror the concurrent branch: persist this batch's
+                    // per-finding sfl rows BEFORE the in-memory merge.
+                    // `commit_completed_findings` only writes the
+                    // `finding_link_status` row — it relies on this
+                    // call to have already landed the link edges, so
+                    // the sfl payload must hit DB here or it's lost.
+                    persist_batch_partials(db, &failed_findings, &committed_findings, &results)
+                        .await;
                     if let Err(e) =
                         merge_finding_link_batch_results(&mut aggregated_results, results)
                     {
@@ -619,6 +655,17 @@ pub async fn link_pending_findings(
             let (batch, results) = handle;
             match results {
                 Ok(results) => {
+                    // Durably persist this batch's per-finding decisions
+                    // before merging into the in-memory aggregate. A
+                    // kill / billing-cap abort here leaves the sfl rows
+                    // in place; the finding stays out of
+                    // `finding_link_status` until the last batch
+                    // completes, so downstream consumers don't see the
+                    // partial state. Without this step the entire run's
+                    // work would live in `aggregated_results` only and
+                    // evaporate on exit.
+                    persist_batch_partials(db, &failed_findings, &committed_findings, &results)
+                        .await;
                     if let Err(e) =
                         merge_finding_link_batch_results(&mut aggregated_results, results)
                     {
@@ -719,13 +766,16 @@ pub async fn link_pending_findings(
 fn partition_finding_link_entries(
     entries: Vec<FindingLinkBatchEntry>,
     token_budget: usize,
+    max_count: usize,
 ) -> Vec<Vec<FindingLinkBatchEntry>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_tokens = 0usize;
 
     for entry in entries {
-        if !current.is_empty() && current_tokens + entry.token_count > token_budget {
+        let count_exceeded = current.len() >= max_count;
+        let tokens_exceeded = current_tokens + entry.token_count > token_budget;
+        if !current.is_empty() && (count_exceeded || tokens_exceeded) {
             batches.push(current);
             current = Vec::new();
             current_tokens = 0;
@@ -862,7 +912,11 @@ fn build_finding_link_batches(
             })
             .collect();
 
-        for batch_entries in partition_finding_link_entries(entries, finding_token_budget) {
+        for batch_entries in partition_finding_link_entries(
+            entries,
+            finding_token_budget,
+            budgets.max_findings_per_batch,
+        ) {
             let finding_token_count = batch_entries.iter().map(|entry| entry.token_count).sum();
             if finding_token_count > finding_token_budget {
                 tracing::warn!(
@@ -1044,11 +1098,46 @@ fn mark_batch_findings_failed(failed_findings: &mut HashSet<i32>, batch: &Findin
     failed_findings.extend(batch.entries.iter().map(|entry| entry.pending.finding_id));
 }
 
+/// Per-batch durable write: every finding's batch-level decision lands
+/// in `semantic_finding_link` immediately. The finding stays out of
+/// `finding_link_status` until the last batch completes, so downstream
+/// consumers (mapper, spec-gen) don't see the partial state via
+/// `load_knowledge_graph`. The upsert is strongest-strength-wins so
+/// repeated batches over the same (semantic, finding) edge keep the
+/// strongest tier seen — making resume idempotent: a re-run merges on
+/// top of any rows the prior abort left behind.
+async fn persist_batch_partials(
+    db: &HistoricalDatabase,
+    failed_findings: &HashSet<i32>,
+    committed_findings: &HashSet<i32>,
+    results: &[PersistedFindingLinkResult],
+) {
+    for result in results {
+        if failed_findings.contains(&result.finding_id)
+            || committed_findings.contains(&result.finding_id)
+        {
+            continue;
+        }
+        if let Err(e) = db.upsert_finding_link_partial(result).await {
+            tracing::error!(
+                "Failed to persist partial batch links for finding #{}: {}",
+                result.finding_id,
+                e
+            );
+            // Don't add to failed_findings here — the in-memory
+            // aggregate still wants the merge so the finding can
+            // either succeed via a later batch's write or fall
+            // through to the final-flush diagnostic. The retry
+            // dance lives at the batch-runner layer.
+        }
+    }
+}
+
 /// Drains any aggregated findings whose every expected context has now been
-/// merged, persists them to the DB, and tracks the outcome. Lets a long
-/// link run survive a mid-flight kill / billing-cap abort: anything fully
-/// linked before the abort lands in `finding_link_status`, so the next
-/// `--include-unlinked` re-run picks up only what was actually missing.
+/// merged and inserts their `finding_link_status` row. The actual link
+/// rows were already durably written by `persist_batch_partials` after each
+/// batch; this is the one transactional step that promotes them from
+/// "partial" (sfl-only) to "queryable by downstream consumers" (sfl + fls).
 async fn commit_completed_findings<I: IntoIterator<Item = i32>>(
     db: &HistoricalDatabase,
     aggregated_results: &mut HashMap<i32, AggregatedFindingLinkResult>,
@@ -1075,13 +1164,8 @@ async fn commit_completed_findings<I: IntoIterator<Item = i32>>(
             .remove(&fid)
             .expect("readiness check just confirmed presence");
         let link_count = agg.semantic_links.len();
-        let result = PersistedFindingLinkResult {
-            finding_id: agg.finding_id,
-            link_target_finding_id: agg.link_target_finding_id,
-            semantic_links: agg.semantic_links.into_values().collect(),
-        };
-        let finding_id = result.finding_id;
-        match db.write_finding_link_result(&result).await {
+        let finding_id = agg.finding_id;
+        match db.mark_finding_link_complete(finding_id).await {
             Ok(()) => {
                 committed_findings.insert(finding_id);
                 tracing::debug!(
@@ -1092,11 +1176,7 @@ async fn commit_completed_findings<I: IntoIterator<Item = i32>>(
             }
             Err(e) => {
                 failed_findings.insert(finding_id);
-                tracing::error!(
-                    "Failed to incrementally save finding links for #{}: {}",
-                    finding_id,
-                    e
-                );
+                tracing::error!("Failed to mark finding #{} complete: {}", finding_id, e);
             }
         }
     }
@@ -1122,6 +1202,16 @@ struct EmitFindingLinkDecisionTool {
     valid_finding_ids: Arc<HashSet<String>>,
     /// Set of `Candidate ID` values the prompt actually listed.
     valid_semantic_ids: Arc<HashSet<String>>,
+    /// Per-attempt heartbeat label so progress logs can identify which
+    /// batch+attempt is making forward progress. Set by the batch
+    /// runner before installing the tool.
+    label: String,
+    /// Total findings this attempt was asked to emit decisions for.
+    /// Used as the denominator in the progress heartbeat.
+    target_finding_count: usize,
+    /// Running count of accepted emit calls during this attempt.
+    /// Atomic so the tool's `&self` invoke can mutate without locks.
+    emit_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Minimum byte length of `why_finding_can_fire` per strength tier. Low
@@ -1197,12 +1287,33 @@ impl EmitFindingLinkDecisionTool {
                 ));
             }
         }
-        Ok(self
+        let response = self
             .buffer
             .push_with_message(args, "finding link decision")
-            .await)
+            .await;
+        // Heartbeat: print one line per `LINK_PROGRESS_HEARTBEAT_EVERY`
+        // accepted emits so a stuck attempt is visible as a flatline,
+        // not as ambiguous silence between attempts.
+        let n = self
+            .emit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n.is_multiple_of(LINK_PROGRESS_HEARTBEAT_EVERY) || n == self.target_finding_count {
+            tracing::info!(
+                "{}: progress {}/{} decisions emitted",
+                self.label,
+                n,
+                self.target_finding_count,
+            );
+        }
+        Ok(response)
     }
 }
+
+/// Emit one heartbeat log line for every N accepted emits. Tuned so a
+/// 100-finding batch logs ~4 times per attempt; large batches still
+/// stay readable without flooding.
+const LINK_PROGRESS_HEARTBEAT_EVERY: usize = 25;
 
 #[derive(Debug, Clone)]
 #[tool(
@@ -1271,6 +1382,22 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             self.max_response_attempts,
         );
 
+        // Step budget sanity: agent needs ~1 step per emit + 1 finalize
+        // + reasoning headroom. If the step cap looks tight, warn so
+        // the operator can raise --link-max-agent-steps before the run
+        // burns through 3 attempts hitting the step ceiling.
+        let max_agent_steps = self.agent_options.max_agent_steps;
+        let step_headroom = max_agent_steps.saturating_sub(self.batch.entries.len() + 1);
+        if step_headroom < 4 {
+            tracing::warn!(
+                "Finding batch {} may not fit the step budget: {} finding(s) need ≥{} steps (emit+finalize), but --link-max-agent-steps is {}. Expect premature finalize / no-link defaults. Lower --max-findings-per-batch or raise --link-max-agent-steps.",
+                self.batch,
+                self.batch.entries.len(),
+                self.batch.entries.len() + 1,
+                max_agent_steps,
+            );
+        }
+
         let valid_semantic_ids: Arc<HashSet<String>> =
             Arc::new(self.context.candidate_map.keys().cloned().collect());
         // `collected[finding_id]` holds the most recent decision the agent
@@ -1301,6 +1428,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             }
             let cache_key = format!("{}-attempt{:02}", self.context.cache_key, attempt);
             let label = format!("finding-link-{}-attempt{:02}", self.batch, attempt);
+            let target_finding_count = still_missing.len();
             let agent_decisions = self
                 .run_one_attempt(
                     user_prompt,
@@ -1309,6 +1437,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
                     valid_finding_ids,
                     valid_semantic_ids.clone(),
                     attempt,
+                    target_finding_count,
                 )
                 .await?;
             tracing::info!(
@@ -1405,6 +1534,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
         valid_finding_ids: Arc<HashSet<String>>,
         valid_semantic_ids: Arc<HashSet<String>>,
         attempt: usize,
+        target_finding_count: usize,
     ) -> Result<Vec<FindingLinkDecision>> {
         let buffer = AgentChunkBuffer::<FindingLinkDecision>::new();
         let mut tools = ToolBox::new();
@@ -1412,6 +1542,9 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             buffer: buffer.clone(),
             valid_finding_ids,
             valid_semantic_ids,
+            label: label.clone(),
+            target_finding_count,
+            emit_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         tools.add_tool(FinalizeFindingLinkTool {
             buffer: buffer.clone(),
@@ -1579,7 +1712,11 @@ pub async fn retro_link_pending_semantics(
         .collect();
 
     let total = entries.len();
-    let batches = partition_finding_link_entries(entries, finding_token_budget);
+    let batches = partition_finding_link_entries(
+        entries,
+        finding_token_budget,
+        budgets.max_findings_per_batch,
+    );
     tracing::info!(
         "Retro-link: {} pending canonical semantic(s) × {} pre-linked finding(s) → {} batch(es)",
         context.candidate_map.len(),
@@ -1707,6 +1844,7 @@ mod tests {
                 sample_batch_entry(103, 50),
             ],
             60,
+            usize::MAX,
         );
 
         assert_eq!(batches.len(), 2);
@@ -1731,6 +1869,7 @@ mod tests {
         let batches = partition_finding_link_entries(
             vec![sample_batch_entry(201, 120), sample_batch_entry(202, 30)],
             100,
+            usize::MAX,
         );
 
         assert_eq!(batches.len(), 2);
@@ -1738,6 +1877,27 @@ mod tests {
         assert_eq!(batches[0][0].pending.finding_id, 201);
         assert_eq!(batches[1].len(), 1);
         assert_eq!(batches[1][0].pending.finding_id, 202);
+    }
+
+    #[test]
+    fn partition_finding_link_entries_honours_count_cap_under_token_budget() {
+        // Tokens-wise everything fits; count cap should still split.
+        let batches = partition_finding_link_entries(
+            vec![
+                sample_batch_entry(301, 10),
+                sample_batch_entry(302, 10),
+                sample_batch_entry(303, 10),
+                sample_batch_entry(304, 10),
+                sample_batch_entry(305, 10),
+            ],
+            10_000,
+            2,
+        );
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 2);
+        assert_eq!(batches[2].len(), 1);
     }
 
     #[test]

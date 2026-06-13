@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::harness::solidity::FuzzOutcome;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::SpecGenOutcome;
@@ -39,7 +40,7 @@ use serde::Serialize;
 
 use crate::cmd::audit::extract_semantics::{ExtractSemanticsArgs, ExtractSemanticsSharedArgs};
 use crate::cmd::audit::fuzz::{FuzzArgs, FuzzSharedArgs};
-use crate::cmd::audit::fuzz_common::HarnessSharedArgs;
+use crate::cmd::audit::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
 use crate::cmd::audit::gen_specs::{GenSpecsArgs, GenSpecsSharedArgs};
 use crate::cmd::audit::map_semantics::{MapSemanticsArgs, MapSemanticsSharedArgs};
 use crate::cmd::audit::profile::{ProfileArgs, ProfileSharedArgs};
@@ -132,29 +133,51 @@ impl AutoloopArgs {
         // regen entries we delegate to pick it up without the user
         // having to also pass `--harness-via-ir`.
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
-        // Resolve the forge runtime once for the entire autoloop run.
-        // This is the preflight check (errors out if no forge is
-        // reachable) AND the source of truth for both fuzz and regen
-        // inside the cycle loop — they share the same backend so the
-        // `forge coverage --help` probe runs only once per pipeline
-        // invocation, not once per phase per cycle.
-        let forge_backend = self.harness.to_forge_backend()?;
 
         let loaded = self
             .project
             .to_repo_database(self.db.database_path.clone())
             .await?;
-        let kg = self.kg.connect().await?;
+        let kg = self.kg.connect_init_for_consumer().await?;
         let spec_name = loaded.spec.name.clone();
         let repo_root = loaded.spec.root.clone();
         let repo = loaded.repo;
+
+        // Stage 7 of plan_move_lang.md: autoloop stays Solidity-only on
+        // purpose. It's the cycle-based driver kept for benchmarking +
+        // regression comparison against past runs; `workflow streamloop`
+        // is the unified bounded-pipeline entry that dispatches on
+        // language. Refuse a Move project here with a hard pointer to
+        // streamloop rather than silently failing the forge preflight.
+        let detected_language = self.project.to_project_data().await?.language;
+        if detected_language == knowdit_project::SourceLanguage::Move {
+            return Err(eyre!(
+                "`workflow autoloop` is Solidity-only — Sui Move projects must run via \
+                 `workflow streamloop`, which dispatches on language."
+            ));
+        }
+
+        // Resolve the forge runtime + per-pass options into one
+        // [`SolidityHarness`] up front. That handle is the source of
+        // truth for both fuzz and regen inside the cycle loop — they
+        // share the same backend, so the `forge coverage --help`
+        // probe runs only once per pipeline invocation, not once per
+        // phase per cycle.
+        let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+            repo_root: repo_root.clone(),
+            default_cache_key: format!("{}-knowdit-fuzz", spec_name),
+            max_specs: self.fuzz.fuzz_max_specs,
+            concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
+            regenerate: self.fuzz.fuzz_regenerate,
+            via_ir: self.harness.harness_via_ir,
+        })?;
 
         // Preflight the forge environment NOW, before any LLM stage
         // touches the project. Misconfigured projects fail in seconds
         // here instead of after hours of extract/map/spec-gen.
         tracing::info!("[autoloop preflight] verifying forge environment");
-        self.harness
-            .preflight(&forge_backend, &repo_root)
+        harness_backend
+            .preflight(&repo_root)
             .await
             .wrap_err("forge environment preflight failed — fix the project's foundry config / forge-std install and re-run")?;
         tracing::info!("[autoloop preflight] forge environment OK");
@@ -205,12 +228,20 @@ impl AutoloopArgs {
             profile.core_components.len(),
         );
 
+        let language_prompt_prefix = harness_backend.prompt_prefix().to_string();
+
         let match_set = repo.load_semantic_match_results().await?;
         if match_set.matches.is_empty() {
             tracing::info!("No mapped semantics yet — running map-semantics phase");
-            let outcome: MapperOutcome =
-                MapSemanticsArgs::map_semantics(&repo, &kg, primary_llm, &spec_name, &self.map)
-                    .await?;
+            let outcome: MapperOutcome = MapSemanticsArgs::map_semantics(
+                &repo,
+                &kg,
+                primary_llm,
+                &spec_name,
+                language_prompt_prefix.clone(),
+                &self.map,
+            )
+            .await?;
             tracing::info!(
                 "Mapper finished: {} matched pair(s) (High={}/Medium={}/Low={}), {} unmatched extract(s)",
                 outcome.matched_pair_count,
@@ -224,8 +255,14 @@ impl AutoloopArgs {
         for cycle in 1..=self.max_cycles {
             tracing::info!("Audit loop cycle {cycle}");
 
-            let spec_outcome: SpecGenOutcome =
-                GenSpecsArgs::gen_specs(&repo, primary_llm, &spec_name, &self.gen_specs).await?;
+            let spec_outcome: SpecGenOutcome = GenSpecsArgs::gen_specs(
+                &repo,
+                primary_llm,
+                &spec_name,
+                language_prompt_prefix.clone(),
+                &self.gen_specs,
+            )
+            .await?;
             tracing::info!(
                 "Cycle {cycle} gen-specs: {} link(s), {} built, {} abandoned, {} spec(s)",
                 spec_outcome.link_count,
@@ -234,16 +271,8 @@ impl AutoloopArgs {
                 spec_outcome.total_specs,
             );
 
-            let fuzz_outcome: FuzzOutcome = FuzzArgs::fuzz(
-                &repo,
-                primary_llm,
-                &spec_name,
-                &repo_root,
-                &self.harness,
-                &self.fuzz,
-                &forge_backend,
-            )
-            .await?;
+            let fuzz_outcome: FuzzOutcome =
+                FuzzArgs::fuzz(&harness_backend, &repo, primary_llm).await?;
             tracing::info!(
                 "Cycle {cycle} fuzz: processed={} completed={} violated={}",
                 fuzz_outcome.processed_count,
@@ -264,13 +293,12 @@ impl AutoloopArgs {
             );
 
             let regen_stats: RegenStats = RegenArgs::regen(
+                &harness_backend,
                 &repo,
                 primary_llm,
                 &spec_name,
-                &repo_root,
                 &self.harness,
                 &self.regen,
-                &forge_backend,
             )
             .await?;
             tracing::info!(

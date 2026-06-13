@@ -1,11 +1,56 @@
-//! `learn retro-link` subcommand. Re-link existing globally-linked findings
-//! against the canonical semantics queued in `pending_semantic` (typically
-//! the canonicals introduced by recently-admitted projects). After the LLM
-//! decides which new edges to add, the pending queue is cleared.
+//! `learn retro-link` subcommand. Patches a specific corner of the
+//! `(finding, canonical_semantic)` link grid that the regular global
+//! `learn link` pass can't reach.
 //!
-//! Use this in the incremental `learn-new-project` flow between admission
-//! and the standard global `learn link` pass so that prior projects' findings
-//! get a chance to attach to the new project's canonical semantics.
+//! # Why this command exists — responsibility table
+//!
+//! Each (finding, canonical_semantic) pair in the historical KG must be
+//! judged by the LLM exactly once. Two separate passes cover the four
+//! quadrants of "is the finding/semantic newly admitted this run or
+//! already in the KG":
+//!
+//! | | **new finding** (this learn run) | **old finding** (already in `finding_link_status`) |
+//! |---|---|---|
+//! | **new canonical semantic** (this learn run) | `learn link` | **`learn retro-link`** |
+//! | **old canonical semantic** (already in the KG) | `learn link` | covered by that finding's earlier learn run |
+//!
+//! `learn link` ([`crate::cmd::learn::link::LinkArgs`]) iterates findings
+//! that do NOT yet have a `finding_link_status` row and judges them against
+//! [`HistoricalDatabase::all_canonical_semantic_link_candidates`] — i.e.
+//! every canonical in the KG, old or new. So both "new finding × old
+//! canonical" and "new finding × new canonical" land here naturally.
+//!
+//! `learn retro-link` covers the one remaining quadrant — **already-linked
+//! findings against canonicals that were just introduced**. `learn link`
+//! skips already-linked findings by design (`finding_link_status` is the
+//! skip-list), so without `learn retro-link` this quadrant would silently
+//! go un-judged in the incremental flow.
+//!
+//! `workflow learn`'s module doc labels these passes "Phase 2" (retro-link)
+//! and "Phase 3" (link) for its own staging story; that labeling is local
+//! to `workflow learn` and isn't part of the cross-command contract here.
+//!
+//! # When to call it
+//!
+//! - **Incremental learn** (`workflow learn` on top of an already-linked
+//!   KG): MUST run this between admission and `learn link`. The new project
+//!   introduces both new findings AND new canonicals, and the existing
+//!   linked findings need a chance to bind to those new canonicals.
+//!
+//! - **Bulk learn** (`learn moves` / `learn c4` / `learn projects` on a
+//!   fresh KG): NOT needed. There are no "old findings" yet — every
+//!   finding flows through `learn link` and is judged against the full
+//!   canonical set in one sweep. Running retro-link here is a no-op modulo
+//!   budget burn.
+//!
+//! # Implementation note: the `pending_semantic` queue
+//!
+//! [`HistoricalDatabase::write_project_completed`] enqueues every
+//! `MergeAction::New` canonical into `pending_semantic`. retro-link reads
+//! the queue, fans out the LLM judgement over `pending × already_linked`,
+//! then truncates the queue. The queue is just the mechanism for "which
+//! canonicals are new this run"; the conceptual responsibility table
+//! above is the invariant the queue serves.
 use crate::cmd::learn::finding_link_args::FindingLinkCliArgs;
 use clap::Args;
 use color_eyre::eyre::Result;

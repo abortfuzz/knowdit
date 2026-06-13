@@ -7,4 +7,5 @@ mod chain;
 mod findings;
 mod link;
 mod link_resume;
+mod move_lang;
 mod repo;
