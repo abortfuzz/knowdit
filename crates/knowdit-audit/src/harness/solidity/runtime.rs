@@ -46,8 +46,7 @@ use super::{HarnessKind, harness as handler_mode, poc as poc_mode};
 use crate::harness::forge::{ForgeBackend, ForgeRunner};
 use crate::spec::{
     LinkInput, LookupCallGraphTool, LookupStateVariableXrefsTool, ProjectIndex,
-    ReadContractSourceTool, ReadFunctionSourceTool, build_link_inputs, build_link_memory,
-    spec_memory_criteria,
+    ReadContractSourceTool, ReadFunctionSourceTool, build_link_memory, spec_memory_criteria,
 };
 use crate::types::AuditSpecification;
 
@@ -111,7 +110,7 @@ impl FuzzRuntime {
             .map(|r| (r.semantic.id, r.clone()))
             .collect();
         let link_inputs =
-            build_link_inputs(&match_set.matches, &extracted_by_id, &historical_by_id);
+            LinkInput::build_all(&match_set.matches, &extracted_by_id, &historical_by_id);
         let mut link_by_pair: BTreeMap<(i32, i32), LinkInput> = BTreeMap::new();
         for li in link_inputs {
             link_by_pair

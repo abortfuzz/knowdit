@@ -77,7 +77,6 @@ pub struct StreamloopArgs {
     #[command(flatten)]
     pub backend: crate::cli::ProjectBackendCliOptions,
 
-
     #[command(flatten)]
     pub reflect_llm: OptOpenAISetup,
 
@@ -386,6 +385,7 @@ impl StreamloopArgs {
         );
         Ok(())
     }
+
 
     /// Fill in every per-phase concurrency knob that the user did
     /// NOT pass explicitly with `--default-concurrency`. Per-phase
@@ -901,6 +901,7 @@ fn snapshot_status(s: LinkSpecStatus) -> &'static str {
         LinkSpecStatus::Abandoned => "abandoned",
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Scheduler

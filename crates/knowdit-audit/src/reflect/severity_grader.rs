@@ -35,7 +35,6 @@ use crate::spec::{
     LookupCallGraphTool, LookupStateVariableXrefsTool, ProjectIndex, ReadContractSourceTool,
     ReadFunctionSourceTool,
 };
-use crate::types::AuditSpecification;
 
 use super::agent_loop::{
     AttemptHandle, CoverageSummary, GraderOptions, RunSummary, drive_agent_loop,
@@ -50,7 +49,7 @@ use super::prompt::severity_system;
 pub struct SeverityInput {
     pub run_id: i32,
     pub spec_id: i32,
-    pub spec: AuditSpecification,
+    pub spec: serde_json::Value,
     pub harness_source: String,
     pub finding_title: Option<String>,
     pub run: RunSummary,

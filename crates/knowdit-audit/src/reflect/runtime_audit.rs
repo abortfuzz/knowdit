@@ -108,7 +108,6 @@ mod tests {
     use super::*;
     use crate::harness::solidity::CounterCall;
     use crate::types::{AuditStateSpecification, SuqenceCallStep};
-    use std::collections::BTreeMap;
 
     fn fake_spec() -> AuditSpecification {
         AuditSpecification {
@@ -120,6 +119,7 @@ mod tests {
                 function: "dispatch".into(),
                 intention: String::new(),
             }],
+            ..Default::default()
         }
     }
 

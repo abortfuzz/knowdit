@@ -330,7 +330,12 @@ pub struct ReflectStats {
 struct ReflectionRunner {
     repo: RepoDatabase,
     graders: Option<GraderPair>,
-    spec_by_id: HashMap<i32, AuditSpecification>,
+    /// Specs kept as raw JSON `Value` so the grader path is language-agnostic
+    /// (Solidity `AuditSpecification` and Move `MoveAuditSpecification` both
+    /// flow through unchanged — the grader serializes the spec for the LLM and
+    /// never introspects its fields). The Solidity-only coverage gate
+    /// re-derives the typed `AuditSpecification` via `from_value` on demand.
+    spec_by_id: HashMap<i32, serde_json::Value>,
     code_gens: Vec<LoadedCodeGen>,
     concurrency: usize,
 }
@@ -687,8 +692,19 @@ impl ReflectionRunner {
         let coverage_summary = if coverage_rows.is_empty() {
             None
         } else {
+            // Coverage fidelity is a Solidity-only gate; re-derive the typed
+            // spec from the stored JSON (Move never reaches here — it produces
+            // no coverage rows).
+            let typed: AuditSpecification = serde_json::from_value(spec.clone()).wrap_err_with(
+                || {
+                    format!(
+                        "coverage gate expected a Solidity AuditSpecification for spec_id={}",
+                        code_gen.core.spec_id
+                    )
+                },
+            )?;
             let cg = self.repo.load_call_graph().await?;
-            let report = coverage_audit::collect_report(&spec, &coverage_rows, &cg);
+            let report = coverage_audit::collect_report(&typed, &coverage_rows, &cg);
             Some(CoverageSummary {
                 fidelity: report.fidelity,
                 hit_fns: report.hit_fns,
@@ -812,10 +828,10 @@ fn run_summary_of(run: &LoadedHarnessRun) -> RunSummary {
     }
 }
 
-fn decode_specs(specs: &[LoadedSpecification]) -> Result<HashMap<i32, AuditSpecification>> {
+fn decode_specs(specs: &[LoadedSpecification]) -> Result<HashMap<i32, serde_json::Value>> {
     let mut out = HashMap::with_capacity(specs.len());
     for spec in specs {
-        let parsed: AuditSpecification = serde_json::from_str(&spec.specification_json)
+        let parsed: serde_json::Value = serde_json::from_str(&spec.specification_json)
             .wrap_err_with(|| {
                 format!("failed to parse specification.json for spec_id={}", spec.id)
             })?;

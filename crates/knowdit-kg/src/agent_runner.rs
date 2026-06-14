@@ -34,7 +34,7 @@ use llmy::agent::StepResult;
 use llmy::agent::tool::ToolBox;
 use llmy::client::client::LLM;
 use llmy::client::settings::LLMSettings;
-use llmy::harness::Agent;
+use llmy::harness::{Agent, AgentConfig};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -268,7 +268,17 @@ impl<T> AgentChunkRunner<T> {
             label,
         } = self;
 
-        let mut agent = Agent::new(system_prompt, tools, cache_key);
+        // Sequential tool calls: every agent routed through this driver
+        // exposes `emit_* … finalize_*` tools, where a same-turn parallel
+        // `finalize` can win the buffer lock and make the concurrent
+        // `emit` hit `AlreadyFinalized` — silently dropping that record.
+        // Forcing sequential execution makes emit-before-finalize hold.
+        let mut agent = Agent::new_with_config(
+            system_prompt,
+            tools,
+            cache_key,
+            AgentConfig::default().sequential_toolcall(),
+        );
 
         let initial = agent
             .step_with_user(

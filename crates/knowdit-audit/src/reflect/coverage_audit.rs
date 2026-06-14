@@ -273,6 +273,7 @@ mod tests {
                 function: "dispatch".to_string(),
                 intention: String::new(),
             }],
+            ..Default::default()
         }
     }
 
