@@ -4,8 +4,8 @@
 //! Split out of `spec/mod.rs`: the `#[llmy::agent::tool]` structs, the
 //! shared `SpecDraft` they build up, and the commit-time `post_attack`
 //! shape gate. `build_tool_box` assembles the full set so each tool's
-//! fields stay private to this module — only `LinkInput::run` (in
-//! `agent.rs`) needs the resulting `ToolBox` plus the `DraftHandle` to
+//! fields stay private to this module — only `PlannedLinkWork::run_agent`
+//! (in `spec::mod`) needs the resulting `ToolBox` plus the `DraftHandle` to
 //! read the committed result back out.
 
 use std::collections::BTreeMap;

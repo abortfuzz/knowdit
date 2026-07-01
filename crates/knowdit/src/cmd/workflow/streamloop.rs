@@ -39,16 +39,17 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
-    LinkKey, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork, SpecGenOptions, SpecGenStream,
-    SpecificationGenerator,
+    BillingExhausted, LinkKey, LinkSource, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork,
+    SpecGenOptions, SpecGenStream, SpecificationGenerator, billing_exhaustion,
 };
 use knowdit_audit::types::AuditSpecification;
 use knowdit_kg::db::HistoricalDatabase;
-use knowdit_kg_model::db::semantic_finding_link;
 use knowdit_project::{ProjectData, SourceLanguage};
-use knowdit_repo_model::{CodeGenStatus, LoadedValidFinding, RepoDatabase, SemanticMatch};
+use knowdit_repo_model::{CodeGenStatus, FindingProvenance, LoadedValidFinding, RepoDatabase};
 use llmy::clap::OptOpenAISetup;
+use llmy::client::billing::TokenUsage;
 use llmy::client::client::LLM;
+use llmy::client::rust_decimal::Decimal;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -62,6 +63,8 @@ use crate::cmd::audit::profile::{ProfileArgs, ProfileSharedArgs};
 use crate::cmd::audit::reflect::{ReflectArgs, ReflectSharedArgs};
 use crate::cmd::audit::regen::{RegenArgs, RegenSharedArgs};
 use crate::cmd::solidity::SolidityCallGraphStaticArgs;
+use crate::cmd::workflow::review_findings;
+use crate::cmd::workflow::utils::write_json_atomic;
 
 #[derive(Args, Debug, Clone)]
 pub struct StreamloopArgs {
@@ -146,11 +149,24 @@ pub struct StreamloopArgs {
     /// resume works.
     #[arg(short, long)]
     pub force_clean_output: bool,
+
+    /// After the link pipeline finishes, run the `review-findings` report
+    /// phase (review → dedup-merge → write → export `audit_report.md`) into
+    /// the same output folder. Off by default; run it standalone via
+    /// `workflow review-findings` to iterate on the report without re-fuzzing.
+    #[arg(short = 'r', long = "review-findings", default_value_t = false)]
+    pub review_findings: bool,
+
+    #[command(flatten)]
+    pub review: crate::cmd::workflow::review_findings::ReviewFindingsSharedArgs,
 }
 
 impl StreamloopArgs {
     pub async fn run(mut self, primary_llm: &LLM) -> Result<()> {
         self.apply_default_concurrency();
+        // Validate --mapper-extra-categories up front so a typo aborts before
+        // any LLM work instead of mid-pipeline at the map phase.
+        self.map.extra_categories()?;
         tracing::info!("[streamloop stage 1/8] preparing output folder");
         self.prepare_output_folder()?;
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
@@ -191,8 +207,12 @@ impl StreamloopArgs {
         tracing::info!(
             "[streamloop stage 3/8] running profile (language discovery + project framing)"
         );
+        // `profile` is the first scoped global phase; `extract` / `mapper` are
+        // scoped inside the backend runners, per-link scopes under root.
+        let profile_llm = primary_llm.scope(Some("profile".to_string()), None);
         let profile =
-            ProfileArgs::profile(&repo, primary_llm, &spec_name, &repo_root, &self.profile).await?;
+            ProfileArgs::profile(&repo, &profile_llm, &spec_name, &repo_root, &self.profile)
+                .await?;
         tracing::info!(
             "[streamloop stage 3/8] profile ready: language={:?}, {} subsystem(s), {} core component(s)",
             profile.language,
@@ -208,7 +228,7 @@ impl StreamloopArgs {
         // `MoveExtractor::ingest_to_db`). Post-CG work
         // ([`Self::run_with_backend`]) is generic over
         // `B: HarnessBackend`.
-        match profile.language {
+        let mut usage = match profile.language {
             SourceLanguage::Solidity => {
                 let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
                     repo_root: repo_root.clone(),
@@ -264,7 +284,42 @@ impl StreamloopArgs {
                 .await
             }
             SourceLanguage::Move => Err(eyre!("Move language not supported in this build")),
+        }?;
+
+        // Stamp the profile phase + run total, then write the centralized
+        // per-link / per-phase token + USD report. This write happens even on a
+        // billing abort, so the partial spend (and the abort reason) is on disk
+        // before we bail.
+        usage.profile = PhaseUsage::snapshot(&profile_llm);
+        usage.finalize_total();
+        usage
+            .write(&self.output_folder)
+            .wrap_err("failed to write run usage report")?;
+        tracing::info!(
+            "[streamloop] usage: run total ${} ({} input + {} output tokens) across {} link(s) → {}/usage/run_usage.json",
+            usage.run_total.usd,
+            usage.run_total.tokens.input_tokens,
+            usage.run_total.tokens.output_tokens,
+            usage.links.len(),
+            self.output_folder.display(),
+        );
+
+        // A billing-cap exhaustion is run-fatal: surface it as an error (non-zero
+        // exit) instead of letting the run report success after silently
+        // abandoning the rest of the queue.
+        if let Some(abort) = &usage.billing_abort {
+            return Err(eyre!(
+                "billing cap exhausted: scope `{}` hit cap ${} (spent ${}); run aborted after \
+                 {} processed link(s). Partial usage written to {}/usage/run_usage.json — raise \
+                 the cap or narrow the link set and re-run (resume is DB-driven).",
+                abort.scope.as_deref().unwrap_or("root"),
+                abort.cap,
+                abort.current,
+                usage.links.len(),
+                self.output_folder.display(),
+            ));
         }
+        Ok(())
     }
 
     /// Backend-generic post-ingest pipeline. Profile + CG ingest
@@ -283,14 +338,20 @@ impl StreamloopArgs {
         spec_name: String,
         project_data: ProjectData,
         kg: &HistoricalDatabase,
-    ) -> Result<()>
+    ) -> Result<RunUsageReport>
     where
         B: HarnessBackend + Clone + Send + Sync + 'static,
     {
+        // Global-phase billing scopes (llmy 0.16). `extract` / `mapper` each
+        // bill their own scope; per-link scopes are children of root created in
+        // `LinkContext::run_link`. `profile` is scoped by the caller (`run`).
+        let extract_llm = primary_llm.scope(Some("extract".to_string()), None);
+        let mapper_llm = primary_llm.scope(Some("mapper".to_string()), None);
+
         tracing::info!("[streamloop stage 4/8] extracting project semantics");
         let semantics = ExtractSemanticsArgs::extract_semantics(
             &repo,
-            &primary_llm,
+            &extract_llm,
             &project_data,
             &self.extract,
         )
@@ -299,6 +360,7 @@ impl StreamloopArgs {
             "[streamloop stage 4/8] extracted {} project semantic(s)",
             semantics.len()
         );
+        self.warn_if_only_others(&semantics);
 
         // Prefix dispatch lives on the harness backend (each
         // language's wording sits next to its `HarnessBackend`
@@ -313,7 +375,7 @@ impl StreamloopArgs {
             let outcome: MapperOutcome = MapSemanticsArgs::map_semantics(
                 &repo,
                 kg,
-                &primary_llm,
+                &mapper_llm,
                 &spec_name,
                 language_prompt_prefix.clone(),
                 &self.map,
@@ -334,57 +396,54 @@ impl StreamloopArgs {
             );
         }
 
-        tracing::info!("[streamloop stage 7/8] preparing spec-gen stream");
-        let gen_options =
-            build_spec_options(&spec_name, language_prompt_prefix.clone(), &self.gen_specs);
-        let stream = match SpecificationGenerator::new()
-            .prepare_stream(&repo, &gen_options)
-            .await?
-        {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    "[streamloop stage 7/8] no pending links after planner/resume filters — nothing to do"
-                );
-                return Ok(());
-            }
-        };
-
-        tracing::info!(
-            "[streamloop stage 8/8] running bounded link pipeline: {} link(s), active_limit={}",
-            stream.total_links(),
-            self.stream_link_concurrency.unwrap_or(1).max(1),
+        // Stages 7–8 (prepare spec-gen stream → bounded gen-specs → fuzz →
+        // reflect → regen pipeline) are shared with `external-validate` via
+        // [`run_link_pipeline`]; only the upstream way links land in the DB
+        // differs (LLM mapper here, JSON ingest there).
+        let gen_options = self.gen_specs.build_spec_options(
+            &spec_name,
+            language_prompt_prefix.clone(),
+            LinkSource::Mapper,
         );
-        // `language_prompt_prefix` flows into LinkContext too so the
-        // per-link reflect path can prepend it to the grader system
-        // prompt without re-walking the harness backend each call.
-        let ctx = Arc::new(LinkContext {
-            repo,
-            primary_llm: primary_llm.clone(),
+        // When `--review-findings` is set, the link pipeline drains review +
+        // merge after each completed link and finalizes (writer + export) at
+        // the end — all via the shared report context.
+        let report_cfg = if self.review_findings {
+            Some(review_findings::ReportInlineCfg {
+                scope_override: review_findings::resolve_scope_override(
+                    self.review.scope_file.as_deref(),
+                )?,
+                options: self.review.grader_options(&spec_name),
+                window_ratio: self.review.review_context_window_ratio,
+                concurrency: self.review.review_concurrency.unwrap_or(1).max(1),
+            })
+        } else {
+            None
+        };
+        let mut usage = LinkPipelineInputs {
+            backend: harness_backend,
+            primary_llm,
             reflect_llm,
-            spec_name,
+            repo,
             repo_root,
-            harness_backend,
+            spec_name,
+            language_prompt_prefix,
+            gen_options,
             harness: self.harness.clone(),
             reflect: self.reflect.clone(),
             regen: self.regen.clone(),
             output_folder: self.output_folder.clone(),
             max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
-            language_prompt_prefix,
-        });
-        let scheduler = LinkScheduler {
-            ctx,
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
-        };
-        let stats = scheduler.run(stream).await?;
-        tracing::info!(
-            "Streamloop finished: processed_links={} built_specs={} abandoned_links={}",
-            stats.processed_links,
-            stats.built_specs,
-            stats.abandoned_links,
-        );
-        Ok(())
+            report_cfg,
+        }
+        .run()
+        .await?;
+        usage.extract = PhaseUsage::snapshot(&extract_llm);
+        usage.mapper = PhaseUsage::snapshot(&mapper_llm);
+        Ok(usage)
     }
+
 
 
     /// Fill in every per-phase concurrency knob that the user did
@@ -402,6 +461,7 @@ impl StreamloopArgs {
         self.reflect.reflect_concurrency.get_or_insert(d);
         self.regen.regen_concurrency.get_or_insert(d);
         self.stream_link_concurrency.get_or_insert(d);
+        self.review.review_concurrency.get_or_insert(d);
         tracing::info!(
             "[streamloop] --default-concurrency={d} fills in map={} gen-specs={} fuzz={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
             self.map.map_concurrency.unwrap_or(1),
@@ -411,6 +471,27 @@ impl StreamloopArgs {
             self.regen.regen_concurrency.unwrap_or(1),
             self.stream_link_concurrency.unwrap_or(1),
         );
+    }
+
+    /// After extract-semantics, if the project auto-classified into *only*
+    /// `Others` (no Lending/Dexes/Services/… signal) and the user did not
+    /// already widen the pool with `--mapper-extra-categories`, warn: an
+    /// Others-only project pulls only Others-category historical knowledge,
+    /// which can miss cross-domain findings (e.g. a P2P-escrow project's
+    /// signature-without-deadline bug lives under `Services` historically).
+    fn warn_if_only_others(&self, semantics: &[knowdit_kg_model::ExtractedSemantic]) {
+        use knowdit_kg_model::category::DeFiCategory;
+        let only_others =
+            !semantics.is_empty() && semantics.iter().all(|s| s.category == DeFiCategory::Others);
+        if only_others && self.map.mapper_extra_categories.is_none() {
+            tracing::warn!(
+                "[streamloop] project auto-classified into ONLY `Others` — the Knowledge Mapper \
+                 will pull only Others-category historical semantics and may miss cross-domain \
+                 findings. If you know the protocol's domain (e.g. it uses signatures / escrow / \
+                 a service-like flow), re-run with `--mapper-extra-categories Services` (comma-\
+                 separated for several, e.g. `Services,Dexes`) to widen the candidate pool."
+            );
+        }
     }
 
     fn prepare_output_folder(&self) -> Result<()> {
@@ -429,34 +510,6 @@ impl StreamloopArgs {
         std::fs::create_dir_all(out)
             .wrap_err_with(|| format!("failed to create output folder {}", out.display()))?;
         Ok(())
-    }
-}
-
-fn build_spec_options(
-    project_name: &str,
-    language_prompt_prefix: String,
-    shared: &GenSpecsSharedArgs,
-) -> SpecGenOptions {
-    SpecGenOptions {
-        max_agent_steps: shared.gen_specs_max_agent_steps,
-        max_specs_per_link: shared.gen_specs_max_specs_per_link,
-        compact_context_threshold_tokens: shared.gen_specs_compact_context_threshold_tokens,
-        cache_key: shared
-            .gen_specs_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-spec", project_name)),
-        debug_prefix: shared.gen_specs_debug_prefix.clone(),
-        llm_settings: None,
-        max_links: (shared.gen_specs_max_links > 0).then_some(shared.gen_specs_max_links),
-        max_findings_per_historical: (shared.gen_specs_max_findings_per_historical > 0)
-            .then_some(shared.gen_specs_max_findings_per_historical),
-        max_links_per_extract: (shared.gen_specs_max_links_per_extract > 0)
-            .then_some(shared.gen_specs_max_links_per_extract),
-        concurrency: 1,
-        regenerate: shared.gen_specs_regenerate,
-        min_strength: shared.gen_specs_min_strength.into(),
-        min_link_strength: shared.gen_specs_min_link_strength.into(),
-        language_prompt_prefix,
     }
 }
 
@@ -526,8 +579,15 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             key.historical_id,
             key.finding_id,
         );
+        // Per-link billing scopes (llmy 0.16): spec/codegen/regen bill the
+        // primary tree, reflect bills the reflect tree; every phase call below
+        // goes through its scope so the snapshot is exact under concurrency.
+        let scopes = LinkScopes::new(&self.primary_llm, &self.reflect_llm, ordinal);
+
         let gen_specs_started = std::time::Instant::now();
-        let outcome = work.run(&self.repo, &self.primary_llm).await;
+        // `?` here only fires on a billing-cap exhaustion (run-fatal); a
+        // per-link agent failure comes back as an `Abandoned` outcome.
+        let outcome = work.run(&self.repo, &scopes.spec).await?;
         tracing::info!(
             "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) usable, {} step(s), {} compaction(s) ({})",
             snapshot_status(outcome.status),
@@ -551,7 +611,14 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
                     break;
                 }
                 active = self
-                    .advance_cycle(ordinal, cycle, &active, &mut drain, &mut code_gen_ids)
+                    .advance_cycle(
+                        ordinal,
+                        cycle,
+                        &active,
+                        &mut drain,
+                        &mut code_gen_ids,
+                        &scopes,
+                    )
                     .await?;
                 cycles_run = cycle;
             }
@@ -561,7 +628,16 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             );
         }
 
-        self.write_snapshot(ordinal, total, &key, &outcome, &drain, &code_gen_ids)?;
+        let usage = scopes.report();
+        self.write_snapshot(
+            ordinal,
+            total,
+            &key,
+            &outcome,
+            &drain,
+            &code_gen_ids,
+            &usage,
+        )?;
         self.dump_valid_findings().await?;
         tracing::info!(
             "[streamloop link {ordinal:04}/{total}] DONE — {} cycle(s), {} codegen(s), \
@@ -578,6 +654,13 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         Ok(LinkTally {
             specs: outcome.specification_ids.len(),
             abandoned: matches!(outcome.status, LinkSpecStatus::Abandoned),
+            usage_row: LinkUsageRow {
+                ordinal,
+                extract_id: key.extract_id,
+                historical_id: key.historical_id,
+                finding_id: key.finding_id,
+                usage,
+            },
         })
     }
 
@@ -609,22 +692,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             if final_path.exists() {
                 continue;
             }
-            let reflection_id = loaded.reflection_id;
-            let spec_id = loaded.spec_id;
-            let link = self.repo.load_link_for_spec(spec_id).await?;
-            let on_disk = OnDiskFinding::build(loaded, link);
-            let tmp_path = dir.join(format!("finding_{}.json.tmp", reflection_id));
-            let body = serde_json::to_string_pretty(&on_disk)
-                .wrap_err("failed to JSON-serialize valid finding")?;
-            std::fs::write(&tmp_path, body)
-                .wrap_err_with(|| format!("failed to write {}", tmp_path.display()))?;
-            std::fs::rename(&tmp_path, &final_path).wrap_err_with(|| {
-                format!(
-                    "failed to atomically rename {} → {}",
-                    tmp_path.display(),
-                    final_path.display()
-                )
-            })?;
+            let provenance = self.repo.load_provenance_for_spec(loaded.spec_id).await?;
+            let on_disk = OnDiskFinding::build(loaded, provenance);
+            write_json_atomic(&final_path, &on_disk)?;
         }
         Ok(())
     }
@@ -640,6 +710,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         active_spec_ids: &[i32],
         drain: &mut LinkDrainCounts,
         code_gen_ids: &mut Vec<i32>,
+        scopes: &LinkScopes,
     ) -> Result<Vec<i32>> {
         let cycle_started = std::time::Instant::now();
         tracing::info!(
@@ -648,15 +719,15 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             active_spec_ids.len(),
         );
         let produced = self
-            .fuzz_active_specs(ordinal, cycle, active_spec_ids, drain)
+            .fuzz_active_specs(ordinal, cycle, active_spec_ids, drain, &scopes.codegen)
             .await?;
         code_gen_ids.extend(produced.iter().copied());
 
-        self.reflect_produced_codegens(ordinal, cycle, &produced, drain)
+        self.reflect_produced_codegens(ordinal, cycle, &produced, drain, &scopes.reflect)
             .await?;
 
         let (children, child_code_gens) = self
-            .regen_active_specs(ordinal, cycle, active_spec_ids, drain)
+            .regen_active_specs(ordinal, cycle, active_spec_ids, drain, &scopes.regen)
             .await?;
         code_gen_ids.extend(child_code_gens);
         tracing::info!(
@@ -674,6 +745,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         cycle: usize,
         active_spec_ids: &[i32],
         drain: &mut LinkDrainCounts,
+        codegen_llm: &LLM,
     ) -> Result<Vec<i32>> {
         let total = active_spec_ids.len();
         tracing::info!(
@@ -695,7 +767,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             );
             if let Some(fuzzed) = self
                 .harness_backend
-                .fuzz_one_existing_spec(&self.repo, &self.primary_llm, spec_id)
+                .fuzz_one_existing_spec(&self.repo, codegen_llm, spec_id)
                 .await?
             {
                 let was_completed = matches!(fuzzed.status, CodeGenStatus::Completed);
@@ -743,6 +815,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         cycle: usize,
         produced: &[i32],
         drain: &mut LinkDrainCounts,
+        reflect_llm: &LLM,
     ) -> Result<()> {
         tracing::info!(
             "[streamloop link {ordinal:04}] cycle {cycle}/{}: reflect {} codegen(s) starting",
@@ -752,7 +825,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let phase_started = std::time::Instant::now();
         let stats = ReflectArgs::reflect_code_gens(
             &self.repo,
-            &self.reflect_llm,
+            reflect_llm,
             &self.spec_name,
             &self.repo_root,
             self.language_prompt_prefix.clone(),
@@ -793,6 +866,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         cycle: usize,
         active_spec_ids: &[i32],
         drain: &mut LinkDrainCounts,
+        regen_llm: &LLM,
     ) -> Result<(Vec<i32>, Vec<i32>)> {
         tracing::info!(
             "[streamloop link {ordinal:04}] cycle {cycle}/{}: regen scoped to {} spec(s) starting",
@@ -803,7 +877,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let (stats, child_specs, child_code_gens) = RegenArgs::regen_specs(
             &self.harness_backend,
             &self.repo,
-            &self.primary_llm,
+            regen_llm,
             &self.spec_name,
             &self.harness,
             &self.regen,
@@ -859,6 +933,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         outcome: &LinkSpecOutcome,
         drain: &LinkDrainCounts,
         code_gen_ids: &[i32],
+        usage: &LinkUsageReport,
     ) -> Result<()> {
         let dir = self.output_folder.join("summaries");
         std::fs::create_dir_all(&dir)
@@ -877,21 +952,10 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             steps: outcome.steps,
             compact_count: outcome.compact_count,
             drain: drain.clone(),
+            usage: usage.clone(),
         };
         let final_path = self.snapshot_path(key);
-        let tmp_path = final_path.with_extension("json.tmp");
-        let body = serde_json::to_string_pretty(&snapshot)
-            .wrap_err("failed to JSON-serialize link snapshot")?;
-        std::fs::write(&tmp_path, body)
-            .wrap_err_with(|| format!("failed to write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &final_path).wrap_err_with(|| {
-            format!(
-                "failed to atomically rename {} → {}",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })?;
-        Ok(())
+        write_json_atomic(&final_path, &snapshot)
     }
 }
 
@@ -899,6 +963,156 @@ fn snapshot_status(s: LinkSpecStatus) -> &'static str {
     match s {
         LinkSpecStatus::Built => "built",
         LinkSpecStatus::Abandoned => "abandoned",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-link / per-phase token + USD accounting (llmy 0.16 scope API)
+// ---------------------------------------------------------------------------
+
+/// One billing scope's accumulated tokens + USD, read from
+/// [`LLM::node_snapshot`]. `node_snapshot` already aggregates a scope's
+/// children, so a link scope's `total` includes all its phase children.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct PhaseUsage {
+    /// Reused from llmy (Serialize + `saturating_add`); `#[serde(flatten)]`
+    /// keeps the JSON flat (`input_tokens` … alongside `usd`). We deliberately
+    /// don't wrap the whole `TokenBilling`: its `cap` is the same global cap on
+    /// every scope (noise per phase) and can't be summed.
+    #[serde(flatten)]
+    tokens: TokenUsage,
+    usd: Decimal,
+}
+
+impl PhaseUsage {
+    pub(crate) fn snapshot(llm: &LLM) -> Self {
+        let b = llm.node_snapshot();
+        Self {
+            tokens: b.tokens,
+            usd: b.current,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.usd += other.usd;
+    }
+
+    fn sum<'a>(parts: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut out = Self::default();
+        for p in parts {
+            out.add(p);
+        }
+        out
+    }
+}
+
+/// One link's token/USD breakdown. `total` = the link's primary scope +
+/// reflect scope (reflect can be a separate billing tree when a distinct
+/// reflect model is configured); the per-phase fields are read from the
+/// link's child scopes.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct LinkUsageReport {
+    total: PhaseUsage,
+    spec: PhaseUsage,
+    codegen: PhaseUsage,
+    regen: PhaseUsage,
+    reflect: PhaseUsage,
+}
+
+/// A per-link row for the centralized run usage file.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LinkUsageRow {
+    ordinal: usize,
+    extract_id: i32,
+    historical_id: i32,
+    finding_id: i32,
+    #[serde(flatten)]
+    usage: LinkUsageReport,
+}
+
+/// Centralized run-level usage report written to
+/// `<output_folder>/usage/run_usage.json`. `run_total` is the sum of every
+/// named scope (global phases + per-link totals), so it does not depend on the
+/// root-snapshot / reflect-tree identity.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct RunUsageReport {
+    run_total: PhaseUsage,
+    pub(crate) profile: PhaseUsage,
+    pub(crate) extract: PhaseUsage,
+    pub(crate) mapper: PhaseUsage,
+    pub(crate) links: Vec<LinkUsageRow>,
+    /// Present only when the run aborted on a billing-cap exhaustion. Recorded
+    /// in the report so the on-disk `run_usage.json` shows *why* the run stopped
+    /// (which scope, the cap, and how much was spent) alongside the partial
+    /// per-link spend collected before the abort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) billing_abort: Option<BillingExhausted>,
+}
+
+impl RunUsageReport {
+    /// Compute `run_total` = profile + extract + mapper + Σ(per-link totals).
+    pub(crate) fn finalize_total(&mut self) {
+        let mut total = PhaseUsage::sum([&self.profile, &self.extract, &self.mapper]);
+        for row in &self.links {
+            total.add(&row.usage.total);
+        }
+        self.run_total = total;
+    }
+
+    /// Write to `<output_folder>/usage/run_usage.json` (atomic tmp+rename).
+    pub(crate) fn write(&self, output_folder: &std::path::Path) -> Result<()> {
+        let dir = output_folder.join("usage");
+        std::fs::create_dir_all(&dir)
+            .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+        let final_path = dir.join("run_usage.json");
+        write_json_atomic(&final_path, self)
+    }
+}
+
+/// The per-link billing scopes (llmy 0.16). `link` / `link_reflect` are the
+/// roll-up scopes (on the primary and reflect billing trees respectively); the
+/// rest are the per-phase children billed by each phase. Created once per link;
+/// every call in a phase goes through its scope so the snapshot is exact even
+/// under concurrent links.
+struct LinkScopes {
+    link: LLM,
+    link_reflect: LLM,
+    spec: LLM,
+    codegen: LLM,
+    regen: LLM,
+    reflect: LLM,
+}
+
+impl LinkScopes {
+    fn new(primary: &LLM, reflect: &LLM, ordinal: usize) -> Self {
+        let link = primary.scope(Some(format!("link-{ordinal:04}")), None);
+        let link_reflect = reflect.scope(Some(format!("link-{ordinal:04}")), None);
+        let spec = link.scope(Some("spec".to_string()), None);
+        let codegen = link.scope(Some("codegen".to_string()), None);
+        let regen = link.scope(Some("regen".to_string()), None);
+        let reflect = link_reflect.scope(Some("reflect".to_string()), None);
+        Self {
+            link,
+            link_reflect,
+            spec,
+            codegen,
+            regen,
+            reflect,
+        }
+    }
+
+    fn report(&self) -> LinkUsageReport {
+        LinkUsageReport {
+            total: PhaseUsage::sum([
+                &PhaseUsage::snapshot(&self.link),
+                &PhaseUsage::snapshot(&self.link_reflect),
+            ]),
+            spec: PhaseUsage::snapshot(&self.spec),
+            codegen: PhaseUsage::snapshot(&self.codegen),
+            regen: PhaseUsage::snapshot(&self.regen),
+            reflect: PhaseUsage::snapshot(&self.reflect),
+        }
     }
 }
 
@@ -914,10 +1128,17 @@ fn snapshot_status(s: LinkSpecStatus) -> &'static str {
 struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
     ctx: Arc<LinkContext<B>>,
     concurrency: usize,
+    /// When set, review + merge are drained into it after each completed link
+    /// (serial — this runs in the scheduler's single-threaded join loop, so no
+    /// lock is needed). Returned to the caller to finalize.
+    report: Option<review_findings::ReportContext>,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
-    async fn run(self, stream: SpecGenStream) -> Result<StreamStats> {
+    async fn run(
+        mut self,
+        stream: SpecGenStream,
+    ) -> Result<(StreamStats, Option<review_findings::ReportContext>)> {
         let total = stream.total_links();
         let stream = Arc::new(Mutex::new(stream));
         // Per-link return = [`LinkTally`]. The full
@@ -930,7 +1151,10 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
         let mut launched = 0usize;
 
         loop {
-            while tasks.len() < self.concurrency {
+            // Stop claiming new links once a billing cap has been hit — every
+            // launch would just fast-fail the pre-flight `check_cap`. In-flight
+            // tasks are still drained below.
+            while stats.billing_abort.is_none() && tasks.len() < self.concurrency {
                 let work = stream.lock().await.pop_next_work();
                 let Some(work) = work else { break };
                 let ctx = self.ctx.clone();
@@ -953,10 +1177,39 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                     if tally.abandoned {
                         stats.abandoned_links += 1;
                     }
+                    stats.link_usages.push(tally.usage_row);
+                    // Drain review + merge for whatever findings this link
+                    // produced. Serial (we're in the single-threaded join
+                    // loop) so the merge accumulator needs no lock. A drain
+                    // failure is logged, not fatal to the fuzz run.
+                    if let Some(report) = self.report.as_mut() {
+                        if let Err(err) = report.review_pending().await {
+                            tracing::error!("[streamloop] inline review drain failed: {err:#}");
+                        }
+                        if let Err(err) = report.merge_pending().await {
+                            tracing::error!("[streamloop] inline merge drain failed: {err:#}");
+                        }
+                    }
                 }
                 Ok(Err(err)) => {
-                    tracing::error!("link pipeline failed: {err:#}");
-                    stats.errors += 1;
+                    // A billing-cap exhaustion is run-fatal: record it, stop
+                    // launching, and drain remaining tasks. Any other error is a
+                    // per-link failure the run can survive.
+                    if let Some(billing) = billing_exhaustion(&err) {
+                        if stats.billing_abort.is_none() {
+                            tracing::error!(
+                                "[streamloop scheduler] 💸 billing cap exhausted (scope {}, cap ${}, spent ${}) — stopping link launch, draining {} in-flight",
+                                billing.scope.as_deref().unwrap_or("root"),
+                                billing.cap,
+                                billing.current,
+                                tasks.len(),
+                            );
+                            stats.billing_abort = Some(billing);
+                        }
+                    } else {
+                        tracing::error!("link pipeline failed: {err:#}");
+                        stats.errors += 1;
+                    }
                 }
                 Err(join_err) => {
                     tracing::error!("link pipeline task panicked: {join_err:#}");
@@ -968,7 +1221,148 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
             "[streamloop scheduler] launched {launched} link pipeline(s); processed_links={}",
             stats.processed_links,
         );
-        Ok(stats)
+        Ok((stats, self.report))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared post-mapper pipeline
+// ---------------------------------------------------------------------------
+
+/// Inputs for the post-mapper link pipeline (gen-specs → fuzz → reflect →
+/// regen). Shared by `streamloop` (after its LLM Knowledge Mapper) and
+/// `external-validate` (after its JSON ingest): by the time either calls this,
+/// the project DB holds mapper-output rows and the rest is identical
+/// DB-driven work.
+pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + 'static> {
+    pub(crate) backend: B,
+    pub(crate) primary_llm: LLM,
+    pub(crate) reflect_llm: LLM,
+    pub(crate) repo: RepoDatabase,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) spec_name: String,
+    pub(crate) language_prompt_prefix: String,
+    pub(crate) gen_options: SpecGenOptions,
+    pub(crate) harness: HarnessSharedArgs,
+    pub(crate) reflect: ReflectSharedArgs,
+    pub(crate) regen: RegenSharedArgs,
+    pub(crate) output_folder: PathBuf,
+    pub(crate) max_inner_cycles: usize,
+    pub(crate) concurrency: usize,
+    /// When set, the pipeline drains review + merge after each completed link
+    /// and finalizes (writer + export) at the end. `None` for plain runs and
+    /// for `external-validate` (which has its own reporting).
+    pub(crate) report_cfg: Option<review_findings::ReportInlineCfg>,
+}
+
+impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
+    /// Prepare the spec-gen stream from the DB and drive the bounded
+    /// [`LinkScheduler`] (gen-specs → fuzz → reflect → regen) over it. Returns a
+    /// [`RunUsageReport`] with `links` + `billing_abort` populated; the caller
+    /// fills the global-phase scopes (`profile` / `extract` / `mapper`) it owns
+    /// and then finalizes / writes the report.
+    pub(crate) async fn run(self) -> Result<RunUsageReport> {
+        let LinkPipelineInputs {
+            backend,
+            primary_llm,
+            reflect_llm,
+            repo,
+            repo_root,
+            spec_name,
+            language_prompt_prefix,
+            gen_options,
+            harness,
+            reflect,
+            regen,
+            output_folder,
+            max_inner_cycles,
+            concurrency,
+            report_cfg,
+        } = self;
+        let concurrency = concurrency.max(1);
+
+        tracing::info!("[link pipeline] preparing spec-gen stream");
+        let stream = match SpecificationGenerator::new()
+            .prepare_stream(&repo, &gen_options)
+            .await?
+        {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "[link pipeline] no pending links after planner/resume filters — nothing to do"
+                );
+                return Ok(RunUsageReport::default());
+            }
+        };
+
+        tracing::info!(
+            "[link pipeline] running bounded pipeline: {} link(s), active_limit={}",
+            stream.total_links(),
+            concurrency,
+        );
+        // Build the shared report context up front (when enabled), using
+        // clones — the scheduler drains review + merge into it after each
+        // completed link, and we finalize (writer + export) once the pipeline
+        // drains.
+        let report = match report_cfg {
+            Some(cfg) => Some(
+                review_findings::ReportContext::build(cfg.into_run(
+                    repo.clone(),
+                    primary_llm.clone(),
+                    spec_name.clone(),
+                    repo_root.clone(),
+                    language_prompt_prefix.clone(),
+                    output_folder.clone(),
+                ))
+                .await?,
+            ),
+            None => None,
+        };
+        // `language_prompt_prefix` flows into LinkContext too so the per-link
+        // reflect path can prepend it to the grader system prompt without
+        // re-walking the harness backend each call.
+        let ctx = Arc::new(LinkContext {
+            repo,
+            primary_llm,
+            reflect_llm,
+            spec_name,
+            repo_root,
+            harness_backend: backend,
+            harness,
+            reflect,
+            regen,
+            output_folder,
+            max_inner_cycles: max_inner_cycles.max(1),
+            language_prompt_prefix,
+        });
+        let scheduler = LinkScheduler {
+            ctx,
+            concurrency,
+            report,
+        };
+        let (stats, report) = scheduler.run(stream).await?;
+        if let Some(mut report) = report {
+            report
+                .finalize()
+                .await
+                .wrap_err("review-findings finalize (export) failed")?;
+            tracing::info!(
+                "[link pipeline] review-findings: reviewed={} canonicals={}",
+                report.stats.reviewed,
+                report.stats.canonicals,
+            );
+        }
+        tracing::info!(
+            "[link pipeline] finished: processed_links={} built_specs={} abandoned_links={}",
+            stats.processed_links,
+            stats.built_specs,
+            stats.abandoned_links,
+        );
+        Ok(RunUsageReport {
+            links: stats.link_usages,
+            billing_abort: stats.billing_abort,
+            ..Default::default()
+        })
     }
 }
 
@@ -986,6 +1380,12 @@ struct StreamStats {
     built_specs: usize,
     abandoned_links: usize,
     errors: usize,
+    /// Per-link token/USD rows collected for the centralized usage report.
+    link_usages: Vec<LinkUsageRow>,
+    /// Set when a link pipeline failed with a billing-cap exhaustion. The
+    /// scheduler stops launching new links and drains the in-flight ones; the
+    /// run then aborts with a clear error instead of silently "finishing".
+    billing_abort: Option<BillingExhausted>,
 }
 
 /// Minimal per-link summary returned by [`LinkContext::run_link`] —
@@ -995,6 +1395,7 @@ struct StreamStats {
 struct LinkTally {
     specs: usize,
     abandoned: bool,
+    usage_row: LinkUsageRow,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1021,6 +1422,8 @@ struct LinkSnapshot {
     steps: usize,
     compact_count: usize,
     drain: LinkDrainCounts,
+    /// Per-phase token + USD spend for this link (llmy 0.16 scopes).
+    usage: LinkUsageReport,
 }
 
 /// On-disk shape of a `valid_finding` row written to
@@ -1035,40 +1438,40 @@ struct LinkSnapshot {
 ///   string). `None` only if the column fails to parse — shouldn't
 ///   happen, we wrote it ourselves, and the raw string is still
 ///   reachable as `specification_json` in the flattened section.
-/// * `link`: the `(extract, historical, finding)` triple from
-///   [`RepoDatabase::load_link_for_spec`], with both halves' strength
-///   / evidence pair.
-#[derive(Debug, Serialize)]
-struct OnDiskFinding {
+/// * `provenance`: the self-contained `(extract, historical semantic,
+///   historical finding)` chain with FULL content + both graded edges
+///   (mapper match + KG link), from
+///   [`RepoDatabase::load_provenance_for_spec`] — so the file explains its
+///   origin without the historical KG database.
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub(crate) struct OnDiskFinding {
     #[serde(flatten)]
     loaded: LoadedValidFinding,
     specification: Option<AuditSpecification>,
-    /// The mapper's `semantic_matched` row that ties this spec's
-    /// project extract to the chosen historical semantic. `None` only
-    /// when [`RepoDatabase::load_link_for_spec`] couldn't recover the
-    /// link chain.
-    extract_match: Option<SemanticMatch>,
-    /// The KG-side `semantic_finding_link::Model` that ties the chosen
-    /// historical semantic to the finding.
-    link: Option<semantic_finding_link::Model>,
+    /// Self-contained origin chain: the project extract semantic, the
+    /// historical semantic it matched, and the historical finding that
+    /// motivated the spec — each with full content (not just ids) — plus the
+    /// mapper match + KG link strength/evidence. `None` only when the spec or
+    /// one of the content rows couldn't be recovered.
+    provenance: Option<FindingProvenance>,
+    /// The complete unique (deduplicated) finding this raw finding was folded
+    /// into by the `review-findings` report phase — the full canonical plus
+    /// every cluster member, embedded inline. `None` until (and unless) the
+    /// report phase merges it; stamped in place on disk by
+    /// [`crate::cmd::workflow::review_findings::ReportContext`].
+    #[serde(default)]
+    pub(crate) merged_to: Option<crate::cmd::workflow::review_findings::OnDiskUniqueFinding>,
 }
 
 impl OnDiskFinding {
-    fn build(
-        loaded: LoadedValidFinding,
-        pair: Option<(SemanticMatch, semantic_finding_link::Model)>,
-    ) -> Self {
+    fn build(loaded: LoadedValidFinding, provenance: Option<FindingProvenance>) -> Self {
         let specification =
             serde_json::from_str::<AuditSpecification>(&loaded.specification_json).ok();
-        let (extract_match, link) = match pair {
-            Some((m, l)) => (Some(m), Some(l)),
-            None => (None, None),
-        };
         Self {
             loaded,
             specification,
-            extract_match,
-            link,
+            provenance,
+            merged_to: None,
         }
     }
 }

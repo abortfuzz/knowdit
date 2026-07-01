@@ -19,10 +19,12 @@ pub use move_lang::{
 };
 
 pub use repo::{
-    CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, FullSpecRegenIds, HarnessRunRecord,
+    CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, FindingMergeDecision,
+    FindingProvenance, FindingReviewRecord, FullSpecRegenIds, HarnessRunRecord,
     HistoricalLinkedFinding, HistoricalSemanticRecord, LinkResumeState, LoadedCodeGen,
-    LoadedHarnessRun, LoadedSpecification, LoadedValidFinding, METADATA_KEY_PROFILE, MatchStrength,
-    PendingReflection, ProjectComponent, ProjectProfile, ProjectSubsystem, ReflectionRecord,
-    ReflectionResult, ReflectionWipeStats, RegenEventRecord, RepoDatabase, RunKind, SemanticMatch,
-    SemanticMatchSet, ValidFindingRecord,
+    LoadedHarnessRun, LoadedReportFinding, LoadedSpecification, LoadedValidFinding,
+    METADATA_KEY_PROFILE, MatchStrength, PendingReflection, ProjectComponent, ProjectProfile,
+    ProjectSubsystem, RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats,
+    RegenEventRecord, RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding, RunKind,
+    SemanticMatch, SemanticMatchSet, ValidFindingRecord,
 };

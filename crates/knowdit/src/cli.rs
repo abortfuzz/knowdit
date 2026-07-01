@@ -33,16 +33,21 @@ pub struct ProjectArgs {
     pub project: String,
 }
 
-/// `--database-path`. The optional per-project SQLite override that
-/// pairs with [`ProjectArgs`]. Kept as its own struct so subcommands
-/// flatten it independently — and the override flows into
-/// [`ProjectArgs::to_repo_database`] as a parameter instead of
-/// living on either struct as a redundant field.
+/// `--repo-database` (alias `--database-path`). The optional per-project
+/// SQLite override that pairs with [`ProjectArgs`]. Kept as its own struct
+/// so subcommands flatten it independently — and the override flows into
+/// [`ProjectArgs::to_repo_database`] as a parameter instead of living on
+/// either struct as a redundant field.
 #[derive(Args, Debug, Clone, Default)]
 pub struct DatabaseArgs {
     /// Per-project SQLite path. Defaults to
     /// `<project_root>/knowdit.sqlite3`.
-    #[arg(short = 'r', long, env = "REPO_DATABASE_PATH")]
+    #[arg(
+        long = "repo-database",
+        visible_alias = "database-path",
+        value_name = "REPO_DATABASE",
+        env = "REPO_DATABASE_PATH"
+    )]
     pub database_path: Option<PathBuf>,
 }
 

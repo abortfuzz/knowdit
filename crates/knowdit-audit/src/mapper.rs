@@ -72,6 +72,12 @@ pub struct MapperOptions {
     /// system prompt. See [`crate::profile::ProfileOptions::language_prompt_prefix`]
     /// for the same dispatch convention.
     pub language_prompt_prefix: String,
+    /// Extra historical categories to consider on top of the project's own
+    /// extracted-semantic categories (which always include `Others`). Lets a
+    /// caller widen the candidate pool when the project auto-classified too
+    /// narrowly — e.g. a P2P-escrow project tagged only `Others` can add
+    /// `Services` to surface signature/authorization historical knowledge.
+    pub extra_categories: Vec<DeFiCategory>,
 }
 
 impl Default for MapperOptions {
@@ -81,6 +87,7 @@ impl Default for MapperOptions {
             concurrency: 1,
             cache_key: Some("knowdit-mapper".to_string()),
             language_prompt_prefix: String::new(),
+            extra_categories: Vec::new(),
         }
     }
 }
@@ -129,7 +136,17 @@ impl KnowledgeMapper {
             .map(|(i, sem)| ((i as i32) + 1, sem))
             .collect();
 
-        let categories = collect_categories(&extracted);
+        let categories = collect_categories(&extracted, &options.extra_categories);
+        if !options.extra_categories.is_empty() {
+            tracing::info!(
+                "Knowledge Mapper: --mapper-extra-categories added {}",
+                options
+                    .extra_categories
+                    .iter()
+                    .map(|c| c.as_str())
+                    .join(", "),
+            );
+        }
         tracing::info!(
             "Knowledge Mapper considering {} historical categories: {}",
             categories.len(),
@@ -460,9 +477,7 @@ async fn run_one_batch(
 
     let response: MatchResponse = llm
         .prompt_json_with_retry(system_prompt, &user_prompt, None, cache_key, None)
-        .await
-        .map_err(|err| eyre!("{label} request failed: {err}"))?
-        .ok_or_else(|| eyre!("{label} returned no JSON payload"))?;
+        .await?;
 
     let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
 
@@ -594,9 +609,13 @@ impl StrengthCounts {
     }
 }
 
-fn collect_categories(extracted: &[ExtractedSemantic]) -> Vec<DeFiCategory> {
+fn collect_categories(
+    extracted: &[ExtractedSemantic],
+    extra: &[DeFiCategory],
+) -> Vec<DeFiCategory> {
     let mut cats: BTreeSet<DeFiCategory> = extracted.iter().map(|s| s.category).collect();
     cats.insert(DeFiCategory::Others);
+    cats.extend(extra.iter().copied());
     cats.into_iter().collect()
 }
 

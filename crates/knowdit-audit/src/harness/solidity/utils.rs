@@ -587,31 +587,36 @@ impl ProjectConventions {
     }
 }
 
-/// `min(s.len(), max)`-prefix string + "[N bytes truncated]" suffix —
-/// stored verbatim in `HarnessRunRecord.stdout/stderr` and surfaced
-/// downstream to the reflect grader.
+/// `~max`-byte prefix of `s` + "[N bytes truncated]" suffix — stored
+/// verbatim in `HarnessRunRecord.stdout/stderr` and surfaced downstream to
+/// the reflect grader. The cut is snapped DOWN to the nearest UTF-8 char
+/// boundary so slicing forge trace output (which contains multi-byte box
+/// characters like `┗`/`━`) never panics.
 pub(super) fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!(
-            "{} … [{} bytes truncated]",
-            &s[..max.min(s.len())],
-            s.len().saturating_sub(max)
-        )
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} … [{} bytes truncated]", &s[..end], s.len() - end)
 }
 
-/// Last `n` bytes of `s` with a "…[N bytes earlier]" marker — only used
-/// when assembling agent-facing tool feedback. Snap is byte-based so it
-/// doesn't bother with UTF-8 boundaries; forge output is ASCII enough
-/// that this hasn't bit us yet.
+/// Last `~n` bytes of `s` with a "…[N bytes earlier]" marker — only used
+/// when assembling agent-facing tool feedback. The cut is snapped UP to the
+/// nearest UTF-8 char boundary so slicing forge trace output (which contains
+/// multi-byte box characters like `┗`/`━`) never panics.
 pub(super) fn tail_str(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("…[{} bytes earlier]\n{}", s.len() - n, &s[s.len() - n..])
+        return s.to_string();
     }
+    let cut = s.len() - n;
+    let mut start = cut;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…[{} bytes earlier]\n{}", cut, &s[start..])
 }
 
 /// Re-export of the kg::audit_finding map type used by the runtime
@@ -619,3 +624,42 @@ pub(super) fn tail_str(s: &str, n: usize) -> String {
 /// to re-import.
 #[allow(dead_code)]
 pub(super) type RunByKind = HashMap<RunKind, Vec<HarnessRunRecord>>;
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::{tail_str, truncate_str};
+
+    /// Build a string whose byte length forces the cut at `cut_byte` to land
+    /// inside a 3-byte box character (`┗` = bytes `E2 94 97`), reproducing the
+    /// forge-trace panic.
+    fn box_line(repeat: usize) -> String {
+        "┗".repeat(repeat)
+    }
+
+    #[test]
+    fn tail_str_snaps_to_char_boundary() {
+        // 10 × '┗' = 30 bytes. n=20 → cut at byte 10, which is mid-'┗'
+        // (boundaries are multiples of 3). Must not panic, and the result
+        // must be valid UTF-8 starting at a real char.
+        let s = box_line(10);
+        let out = tail_str(&s, 20);
+        assert!(out.contains("bytes earlier"));
+        assert!(out.ends_with(&box_line(6))); // snapped up: 12..30 = 6 chars
+    }
+
+    #[test]
+    fn truncate_str_snaps_to_char_boundary() {
+        // max=10 lands mid-'┗'; snap down to byte 9 = 3 chars kept.
+        let s = box_line(10);
+        let out = truncate_str(&s, 10);
+        assert!(out.contains("bytes truncated"));
+        assert!(out.starts_with(&box_line(3)));
+    }
+
+    #[test]
+    fn short_strings_pass_through() {
+        let s = "┗━┛";
+        assert_eq!(tail_str(s, 1_000), s);
+        assert_eq!(truncate_str(s, 1_000), s);
+    }
+}

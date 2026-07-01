@@ -46,7 +46,7 @@ use super::{HarnessKind, harness as handler_mode, poc as poc_mode};
 use crate::harness::forge::{ForgeBackend, ForgeRunner};
 use crate::spec::{
     LinkInput, LookupCallGraphTool, LookupStateVariableXrefsTool, ProjectIndex,
-    ReadContractSourceTool, ReadFunctionSourceTool, build_link_memory, spec_memory_criteria,
+    ReadContractSourceTool, ReadFunctionSourceTool, spec_memory_criteria,
 };
 use crate::types::AuditSpecification;
 
@@ -352,7 +352,7 @@ impl AgentLoopState {
             coverage_via_ir_unsupported,
         );
         let user_prompt = kind.build_user_prompt(spec_id);
-        let memory = build_link_memory(project_index)?;
+        let memory = project_index.build_link_memory()?;
         let memory_criteria = spec_memory_criteria();
         let cache_key_base = format!("{}-spec{}", options.cache_key, spec_id);
         let debug_prefix = options

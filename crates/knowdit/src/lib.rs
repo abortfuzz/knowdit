@@ -61,12 +61,18 @@ pub enum WorkflowCommands {
     /// after each committed spec.
     Streamloop(cmd::workflow::streamloop::StreamloopArgs),
 
+    /// Turn raw `valid_finding` rows into a client-facing audit report:
+    /// review + re-grade each, dedup-merge into canonical findings, write
+    /// client prose + PoC, and export `audit_report.md`.
+    ReviewFindings(cmd::workflow::review_findings::ReviewFindingsArgs),
+
     /// Admit one new project into the historical KG: categorize +
     /// extract + dedup-merge, then retro-link prior findings
     /// against the new canonical semantics, then link the new
     /// findings against every canonical. One LLM budget shared
     /// across all three phases.
     Learn(cmd::workflow::learn::WorkflowLearnArgs),
+
 }
 
 /// `knowdit db ...` — non-LLM tools that operate on the historical
@@ -295,6 +301,7 @@ impl WorkflowCommand {
         match command {
             WorkflowCommands::Autoloop(args) => args.run(&llm).await?,
             WorkflowCommands::Streamloop(args) => args.run(&llm).await?,
+            WorkflowCommands::ReviewFindings(args) => args.run(&llm).await?,
             WorkflowCommands::Learn(args) => args.run(&llm).await?,
         }
         Ok(())

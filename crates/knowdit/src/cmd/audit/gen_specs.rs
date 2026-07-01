@@ -11,7 +11,7 @@ use clap::{Args, ValueEnum};
 use color_eyre::eyre::Result;
 use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::spec::{
-    LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecificationGenerator,
+    LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecificationGenerator,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use knowdit_repo_model::{MatchStrength, RepoDatabase};
@@ -126,6 +126,42 @@ pub struct GenSpecsSharedArgs {
     /// Debug prefix passed to llmy.
     #[arg(long = "gen-specs-debug-prefix")]
     pub gen_specs_debug_prefix: Option<String>,
+}
+
+impl GenSpecsSharedArgs {
+    /// Build the [`SpecGenOptions`] for one Specification Generator pass from
+    /// these CLI knobs. The cache key defaults to `{project_name}-knowdit-spec`;
+    /// `link_source` frames the gen-spec agent (mapper topic-hint vs external
+    /// reported finding).
+    pub(crate) fn build_spec_options(
+        &self,
+        project_name: &str,
+        language_prompt_prefix: String,
+        link_source: LinkSource,
+    ) -> SpecGenOptions {
+        SpecGenOptions {
+            max_agent_steps: self.gen_specs_max_agent_steps,
+            max_specs_per_link: self.gen_specs_max_specs_per_link,
+            compact_context_threshold_tokens: self.gen_specs_compact_context_threshold_tokens,
+            cache_key: self
+                .gen_specs_cache_key
+                .clone()
+                .unwrap_or_else(|| format!("{}-knowdit-spec", project_name)),
+            debug_prefix: self.gen_specs_debug_prefix.clone(),
+            llm_settings: None,
+            max_links: (self.gen_specs_max_links > 0).then_some(self.gen_specs_max_links),
+            max_findings_per_historical: (self.gen_specs_max_findings_per_historical > 0)
+                .then_some(self.gen_specs_max_findings_per_historical),
+            max_links_per_extract: (self.gen_specs_max_links_per_extract > 0)
+                .then_some(self.gen_specs_max_links_per_extract),
+            concurrency: 1,
+            regenerate: self.gen_specs_regenerate,
+            min_strength: self.gen_specs_min_strength.into(),
+            min_link_strength: self.gen_specs_min_link_strength.into(),
+            language_prompt_prefix,
+            link_source,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -245,6 +281,7 @@ impl GenSpecsArgs {
             min_strength: shared.gen_specs_min_strength.into(),
             min_link_strength: shared.gen_specs_min_link_strength.into(),
             language_prompt_prefix,
+            link_source: LinkSource::Mapper,
         };
         SpecificationGenerator::new().run(repo, llm, &options).await
     }

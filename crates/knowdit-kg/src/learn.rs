@@ -620,9 +620,7 @@ impl ProjectData {
                 Some(&cache_key),
                 None,
             )
-            .await
-            .map_err(|err| KgError::other(format!("in-project linking request failed: {err}")))?
-            .ok_or_else(|| KgError::other("in-project linking returned no JSON payload"))?;
+            .await?;
 
         let mut edges: Vec<(usize, usize)> = Vec::new();
         let mut seen: HashSet<(usize, usize)> = HashSet::new();

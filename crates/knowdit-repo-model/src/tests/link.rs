@@ -186,6 +186,121 @@ async fn returns_pair_when_chain_exists() {
 }
 
 #[tokio::test]
+async fn provenance_is_self_contained() {
+    let temp = temp_db().await;
+    // Content-rich rows so we can assert the provenance embeds the actual
+    // text, not just ids.
+    project_semantic_model::Entity::insert(project_semantic_model::ActiveModel {
+        id: Set(101),
+        name: Set("Signature-Authorized Safe Op".to_string()),
+        category: Set(DeFiCategory::Services),
+        definition: Set("EIP-712 signed safeCancel/safeFill".to_string()),
+        description: Set("verifies a typed-data signature".to_string()),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await
+    .unwrap();
+    historical_semantic_model::Entity::insert(historical_semantic_model::ActiveModel {
+        id: Set(555),
+        name: Set("Meta-Tx Forwarding".to_string()),
+        definition: Set("signed payload includes a deadline".to_string()),
+        description: Set("rejects expired signatures".to_string()),
+        category: Set(DeFiCategory::Services),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await
+    .unwrap();
+    historical_finding_model::Entity::insert(historical_finding_model::ActiveModel {
+        id: Set(7),
+        title: Set("Lack of deadline check in forwarded request".to_string()),
+        severity: Set(FindingSeverity::High),
+        root_cause: Set("signed request omits any expiry field".to_string()),
+        description: Set("signature stays valid indefinitely".to_string()),
+        patterns: Set("missing deadline in typehash".to_string()),
+        exploits: Set("replay the signed op later".to_string()),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await
+    .unwrap();
+    let spec_id = insert_spec(&temp.repo, 101, 555, 7).await;
+    insert_match(
+        &temp.repo,
+        101,
+        555,
+        MatchStrength::High,
+        "shared sig mechanism",
+    )
+    .await;
+    insert_link(
+        &temp.repo,
+        555,
+        7,
+        LinkStrength::Medium,
+        "same failure mode",
+    )
+    .await;
+
+    let prov = temp
+        .repo
+        .load_provenance_for_spec(spec_id)
+        .await
+        .expect("query should succeed")
+        .expect("provenance should resolve");
+
+    // Extract: the actual project_semantic row, full content (not just an id).
+    assert_eq!(prov.extract.id, 101);
+    assert_eq!(prov.extract.name, "Signature-Authorized Safe Op");
+    assert_eq!(prov.extract.category, DeFiCategory::Services);
+    assert_eq!(
+        prov.extract.definition,
+        "EIP-712 signed safeCancel/safeFill"
+    );
+    // Mapper match edge.
+    let m = prov.semantic_match.as_ref().expect("match edge present");
+    assert_eq!(m.strength, MatchStrength::High);
+    assert_eq!(m.evidence, "shared sig mechanism");
+    // Historical semantic: the actual row.
+    assert_eq!(prov.historical_semantic.id, 555);
+    assert_eq!(prov.historical_semantic.name, "Meta-Tx Forwarding");
+    assert_eq!(
+        prov.historical_semantic.definition,
+        "signed payload includes a deadline"
+    );
+    // KG link edge.
+    let l = prov.finding_link.as_ref().expect("link edge present");
+    assert_eq!(l.strength, LinkStrength::Medium);
+    assert_eq!(l.evidence, "same failure mode");
+    // Historical finding: the actual row, full body.
+    assert_eq!(prov.historical_finding.id, 7);
+    assert_eq!(
+        prov.historical_finding.title,
+        "Lack of deadline check in forwarded request"
+    );
+    assert_eq!(prov.historical_finding.severity, FindingSeverity::High);
+    assert_eq!(
+        prov.historical_finding.root_cause,
+        "signed request omits any expiry field"
+    );
+    assert_eq!(
+        prov.historical_finding.exploits,
+        "replay the signed op later"
+    );
+
+    // Round-trips through serde (the on-disk shape) without loss, and the
+    // serialized models carry NO relation-field noise (`functions`,
+    // `semantic_node`, …) — `#[sea_orm::model]` strips them.
+    let json = serde_json::to_string(&prov).unwrap();
+    assert!(json.contains("Lack of deadline check in forwarded request"));
+    assert!(!json.contains("functions"));
+    assert!(!json.contains("semantic_node"));
+    let back: crate::repo::FindingProvenance = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.historical_finding.id, 7);
+}
+
+#[tokio::test]
 async fn returns_none_when_spec_missing() {
     let temp = temp_db().await;
     let pair = temp

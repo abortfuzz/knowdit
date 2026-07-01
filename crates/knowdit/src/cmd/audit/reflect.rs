@@ -695,14 +695,13 @@ impl ReflectionRunner {
             // Coverage fidelity is a Solidity-only gate; re-derive the typed
             // spec from the stored JSON (Move never reaches here — it produces
             // no coverage rows).
-            let typed: AuditSpecification = serde_json::from_value(spec.clone()).wrap_err_with(
-                || {
+            let typed: AuditSpecification =
+                serde_json::from_value(spec.clone()).wrap_err_with(|| {
                     format!(
                         "coverage gate expected a Solidity AuditSpecification for spec_id={}",
                         code_gen.core.spec_id
                     )
-                },
-            )?;
+                })?;
             let cg = self.repo.load_call_graph().await?;
             let report = coverage_audit::collect_report(&typed, &coverage_rows, &cg);
             Some(CoverageSummary {

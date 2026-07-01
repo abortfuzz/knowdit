@@ -13,9 +13,11 @@
 //! automatically there.
 use clap::Args;
 use color_eyre::eyre::{Result, eyre};
+use itertools::Itertools;
 use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::mapper::{KnowledgeMapper, MapperOptions, MapperOutcome};
 use knowdit_kg::db::HistoricalDatabase;
+use knowdit_kg_model::category::DeFiCategory;
 use knowdit_repo_model::RepoDatabase;
 use llmy::client::client::LLM;
 
@@ -46,6 +48,41 @@ pub struct MapSemanticsSharedArgs {
     /// tell "unset" from an explicit value.
     #[arg(long = "map-concurrency")]
     pub map_concurrency: Option<usize>,
+
+    /// Comma-separated extra historical categories to widen the mapper's
+    /// candidate pool beyond the project's own auto-classified categories
+    /// (which always include `Others`). Use this when a project
+    /// auto-classifies too narrowly — e.g. a P2P-escrow project tagged only
+    /// `Others` can pass `--mapper-extra-categories Services` to surface
+    /// signature/authorization historical knowledge. Names are case- and
+    /// separator-insensitive (`Services`, `real world assets`, …); unknown
+    /// names abort with the list of valid categories.
+    #[arg(long = "mapper-extra-categories")]
+    pub mapper_extra_categories: Option<String>,
+}
+
+impl MapSemanticsSharedArgs {
+    /// Resolve `--mapper-extra-categories` (a comma-separated string) into
+    /// typed categories, erroring on any unknown name (with the valid list) so
+    /// a typo fails fast rather than silently widening nothing. Empty / unset
+    /// yields no extra categories.
+    pub fn extra_categories(&self) -> Result<Vec<DeFiCategory>> {
+        self.mapper_extra_categories
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                DeFiCategory::parse(s).ok_or_else(|| {
+                    eyre!(
+                        "unknown --mapper-extra-categories value '{s}'; valid categories: {}",
+                        DeFiCategory::ALL.iter().map(|c| c.as_str()).join(", "),
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Args)]
@@ -137,6 +174,7 @@ impl MapSemanticsArgs {
             concurrency: shared.map_concurrency.unwrap_or(8).max(1),
             cache_key: Some(cache_key),
             language_prompt_prefix: language_prompt_prefix.clone(),
+            extra_categories: shared.extra_categories()?,
         };
         KnowledgeMapper::new(profile, language_prompt_prefix)
             .run(repo, kg, llm, &options)

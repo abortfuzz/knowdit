@@ -30,6 +30,7 @@ pub mod agent_loop;
 pub mod coverage_audit;
 pub mod grader;
 mod prompt;
+pub mod review_grader;
 pub mod runtime_audit;
 pub mod severity_grader;
 

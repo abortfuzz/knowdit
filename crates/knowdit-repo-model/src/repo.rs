@@ -20,6 +20,7 @@ use crate::cg::{
     location_to_db,
 };
 pub use crate::db::code_gen::CodeGenStatus;
+pub use crate::db::finding_review::ReviewSeverity;
 pub use crate::db::harness_run::RunKind;
 use crate::db::r#move::{
     move_function_metadata as move_function_metadata_model, move_struct as move_struct_model,
@@ -30,7 +31,8 @@ pub use crate::db::semantic_matched::MatchStrength;
 use crate::db::{
     code_gen as code_gen_model, code_gen_regen as code_gen_regen_model, contract as contract_model,
     contract_functions as contract_functions_model, contract_inherit as contract_inherit_model,
-    contract_variable as contract_variable_model, function as function_model,
+    contract_variable as contract_variable_model, finding_merge as finding_merge_model,
+    finding_review as finding_review_model, function as function_model,
     function_call as function_call_model, function_state_variable as function_state_variable_model,
     harness_run as harness_run_model, historical_finding as historical_finding_model,
     historical_semantic as historical_semantic_model,
@@ -39,9 +41,9 @@ use crate::db::{
     line_coverage as line_coverage_model, project_metadata as project_metadata_model,
     project_semantic as project_semantic_model,
     project_semantic_function as project_semantic_function_model, reflection as reflection_model,
-    semantic_matched as semantic_matched_model, specification as specification_model,
-    specification_regen as specification_regen_model, state_variable as state_variable_model,
-    valid_finding as valid_finding_model,
+    report_finding as report_finding_model, semantic_matched as semantic_matched_model,
+    specification as specification_model, specification_regen as specification_regen_model,
+    state_variable as state_variable_model, valid_finding as valid_finding_model,
 };
 use crate::inheritance::{ContractInherit, InheritanceGraph};
 use crate::move_lang::{
@@ -181,6 +183,12 @@ impl RepoDatabase {
             schema.create_table_from_entity(harness_run_model::Entity),
             schema.create_table_from_entity(reflection_model::Entity),
             schema.create_table_from_entity(valid_finding_model::Entity),
+            // Report tables (`review-findings` workflow). Ordered after
+            // reflection: finding_review references reflection; finding_merge
+            // references both finding_review and report_finding.
+            schema.create_table_from_entity(finding_review_model::Entity),
+            schema.create_table_from_entity(report_finding_model::Entity),
+            schema.create_table_from_entity(finding_merge_model::Entity),
             // Lineage tables — must come after their referenced parents
             // (specification / code_gen / reflection) to keep the FK
             // ordering happy on backends that enforce it.
@@ -1266,12 +1274,38 @@ pub struct HistoricalSemanticRecord {
 /// One mapper-emitted match between a project extract and a historical
 /// semantic, with the v2 mapper's `strength` label and free-form
 /// `evidence` rationale.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SemanticMatch {
     pub extract_id: i32,
     pub historical_id: i32,
     pub strength: MatchStrength,
     pub evidence: String,
+}
+
+/// Self-contained provenance for one finding: a thin bundle of the actual
+/// project-DB rows (the existing sea_orm `Model`s, serialized to their scalar
+/// columns — relation fields are stripped by `#[sea_orm::model]`) that explain
+/// where a spec's finding came from, so an on-disk finding JSON needs no KG
+/// database to be understood. Built by
+/// [`RepoDatabase::load_provenance_for_spec`].
+///
+/// Reuses the row models directly rather than re-declaring their fields:
+/// `extract` / `historical_semantic` / `historical_finding` carry the full
+/// content; `semantic_match` / `finding_link` are the two graded edges
+/// (`strength` + `evidence`) and are `Option` because a spec can outlive its
+/// mapper / link rows.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FindingProvenance {
+    /// The project semantic (extract) row the spec was generated from.
+    pub extract: project_semantic_model::Model,
+    /// Mapper match on the `(extract, historical)` pair.
+    pub semantic_match: Option<semantic_matched_model::Model>,
+    /// The historical (KG) semantic the extract was matched to.
+    pub historical_semantic: historical_semantic_model::Model,
+    /// KG link on the `(historical_semantic, historical_finding)` edge.
+    pub finding_link: Option<historical_semantic_finding_link_model::Model>,
+    /// The historical (KG) finding that motivated the spec.
+    pub historical_finding: historical_finding_model::Model,
 }
 
 /// Aggregate output of one Knowledge Mapper pass, ready to be written into a
@@ -2327,7 +2361,7 @@ pub struct LoadedHarnessRun {
 /// [`code_gen`] + [`harness_run`] join. The strings are the raw
 /// column values — callers (`workflow autoloop` for the per-cycle
 /// dump) parse them as JSON / Solidity / etc. as needed.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoadedValidFinding {
     pub reflection_id: i32,
     pub run_id: i32,
@@ -2343,6 +2377,153 @@ pub struct LoadedValidFinding {
     pub run_violated: bool,
     pub run_stdout: String,
     pub run_sequence_json: Option<String>,
+}
+
+// ============================================================================
+// Report findings (`review-findings` workflow: Review → Merge → Writer)
+// ============================================================================
+
+/// One Review-agent verdict to persist into `finding_review`. Written via
+/// [`RepoDatabase::insert_finding_review`], which upserts on `reflection_id`
+/// so a re-review replaces in place.
+#[derive(Debug, Clone)]
+pub struct FindingReviewRecord {
+    pub reflection_id: i32,
+    pub title: String,
+    pub severity: ReviewSeverity,
+    pub review_reason: String,
+    pub root_cause: String,
+    pub description: String,
+    pub location: String,
+    pub impact: String,
+    pub recommendation: String,
+    pub primary_contract: String,
+    pub primary_function: String,
+    pub severity_reason: String,
+}
+
+/// A loaded `finding_review` row — the structured, client-facing shape the
+/// Merge agent clusters on and the report renderer reads back per cluster
+/// member (title / description / impact / location / recommendation are all
+/// rendered directly; there is no separate Writer stage).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReviewedFinding {
+    pub reflection_id: i32,
+    pub title: String,
+    pub severity: ReviewSeverity,
+    pub review_reason: String,
+    pub root_cause: String,
+    pub description: String,
+    pub location: String,
+    pub impact: String,
+    pub recommendation: String,
+    pub primary_contract: String,
+    pub primary_function: String,
+    pub severity_reason: String,
+}
+
+impl From<finding_review_model::Model> for ReviewedFinding {
+    fn from(m: finding_review_model::Model) -> Self {
+        Self {
+            reflection_id: m.reflection_id,
+            title: m.title,
+            severity: m.severity,
+            review_reason: m.review_reason,
+            root_cause: m.root_cause,
+            description: m.description,
+            location: m.location,
+            impact: m.impact,
+            recommendation: m.recommendation,
+            primary_contract: m.primary_contract,
+            primary_function: m.primary_function,
+            severity_reason: m.severity_reason,
+        }
+    }
+}
+
+/// Identity seed for a brand-new canonical, taken from the cluster's first
+/// (representative) reviewed finding.
+#[derive(Debug, Clone)]
+pub struct ReportFindingSeed {
+    pub title: String,
+    pub severity: ReviewSeverity,
+    pub root_cause: String,
+    pub description: String,
+    pub primary_contract: String,
+    pub primary_function: String,
+}
+
+/// The Merge agent's decision for one raw finding, persisted atomically by
+/// [`RepoDatabase::commit_finding_merge`].
+#[derive(Debug, Clone)]
+pub enum FindingMergeDecision {
+    /// This finding starts a new canonical.
+    NewCanonical(ReportFindingSeed),
+    /// Fold into an existing canonical; `raise_to` lifts the canonical's
+    /// severity when this member outranks it (max-reconcile).
+    MergeInto {
+        report_finding_id: i32,
+        raise_to: Option<ReviewSeverity>,
+    },
+}
+
+/// A loaded canonical `report_finding` — pure cluster identity (no nullable
+/// client columns, no status). The client report is derived at export from
+/// the cluster's representative member.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoadedReportFinding {
+    pub id: i32,
+    pub title: String,
+    pub severity: ReviewSeverity,
+    pub root_cause: String,
+    pub description: String,
+    pub primary_contract: String,
+    pub primary_function: String,
+}
+
+impl From<report_finding_model::Model> for LoadedReportFinding {
+    fn from(m: report_finding_model::Model) -> Self {
+        Self {
+            id: m.id,
+            title: m.title,
+            severity: m.severity,
+            root_cause: m.root_cause,
+            description: m.description,
+            primary_contract: m.primary_contract,
+            primary_function: m.primary_function,
+        }
+    }
+}
+
+/// One raw member of a canonical: its structured review, the underlying source
+/// material (spec + PoC harness + forge run), and the two graded edge
+/// strengths used to pick the cluster's representative — sort key
+/// `(review.severity, link_strength, mapper_strength)` then shortest harness.
+#[derive(Debug, Clone)]
+pub struct RawFindingMember {
+    pub review: ReviewedFinding,
+    pub source: LoadedValidFinding,
+    /// Mapper match strength on the `(extract, historical)` pair (`None` if the
+    /// mapper row is gone).
+    pub mapper_strength: Option<MatchStrength>,
+    /// KG link strength on the `(historical, finding)` edge (`None` if the link
+    /// row is gone).
+    pub link_strength: Option<knowdit_kg_model::link_strength::LinkStrength>,
+}
+
+impl RawFindingMember {
+    /// Descending sort key for representative selection: higher review
+    /// severity, then stronger KG link, then stronger mapper match, then
+    /// SHORTER harness (negated length so it sorts last-but-ascending). The
+    /// member that sorts greatest is the representative.
+    pub fn representative_key(&self) -> (u8, u8, u8, i64) {
+        (
+            self.review.severity.rank(),
+            self.link_strength.map(|s| s.rank()).unwrap_or(0),
+            self.mapper_strength.map(|s| s.rank()).unwrap_or(0),
+            -(self.source.harness_source.len() as i64),
+        )
+    }
 }
 
 // ============================================================================
@@ -2562,6 +2743,23 @@ impl RepoDatabase {
             .all(&self.db)
             .await
             .wrap_err("failed to load ValidFinding reflections")?;
+        self.load_valid_findings_for(reflections).await
+    }
+
+    /// Hydrate a pre-selected set of `ValidFinding` reflections into
+    /// [`LoadedValidFinding`] rows (join spec + code_gen + harness_run).
+    /// Shared by [`Self::load_valid_findings`] (all of them),
+    /// [`Self::load_unreviewed_valid_findings`] (those still lacking a
+    /// `finding_review`), and [`Self::load_report_finding_members`] (one
+    /// canonical's cluster). Callers pass reflections already filtered to
+    /// `Result == ValidFinding`; non-ValidFinding rows error on the missing
+    /// `valid_finding` sibling.
+    async fn load_valid_findings_for(
+        &self,
+        reflections: Vec<reflection_model::Model>,
+    ) -> Result<Vec<LoadedValidFinding>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
         if reflections.is_empty() {
             return Ok(Vec::new());
         }
@@ -2654,6 +2852,348 @@ impl RepoDatabase {
         Ok(out)
     }
 
+    /// `ValidFinding` raw findings that do NOT yet have a `finding_review`
+    /// row — the Review agent's work queue. Resume-safe: a re-run only
+    /// reviews what's new.
+    pub async fn load_unreviewed_valid_findings(&self) -> Result<Vec<LoadedValidFinding>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let reviewed: BTreeSet<i32> = finding_review_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_review ids")?
+            .into_iter()
+            .map(|r| r.reflection_id)
+            .collect();
+        let reflections = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Result.eq(ReflectionResult::ValidFinding))
+            .order_by_asc(reflection_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load ValidFinding reflections")?
+            .into_iter()
+            .filter(|r| !reviewed.contains(&r.id))
+            .collect();
+        self.load_valid_findings_for(reflections).await
+    }
+
+    /// Upsert one structured review into `finding_review`, keyed on
+    /// `reflection_id` (a re-review overwrites in place). Single statement:
+    /// no transient partial-review state.
+    pub async fn insert_finding_review(&self, rec: &FindingReviewRecord) -> Result<()> {
+        use sea_orm::sea_query::OnConflict;
+
+        let am = finding_review_model::ActiveModel {
+            reflection_id: Set(rec.reflection_id),
+            title: Set(rec.title.clone()),
+            severity: Set(rec.severity),
+            review_reason: Set(rec.review_reason.clone()),
+            root_cause: Set(rec.root_cause.clone()),
+            description: Set(rec.description.clone()),
+            location: Set(rec.location.clone()),
+            impact: Set(rec.impact.clone()),
+            recommendation: Set(rec.recommendation.clone()),
+            primary_contract: Set(rec.primary_contract.clone()),
+            primary_function: Set(rec.primary_function.clone()),
+            severity_reason: Set(rec.severity_reason.clone()),
+            ..Default::default()
+        };
+        finding_review_model::Entity::insert(am)
+            .on_conflict(
+                OnConflict::column(finding_review_model::Column::ReflectionId)
+                    .update_columns([
+                        finding_review_model::Column::Title,
+                        finding_review_model::Column::Severity,
+                        finding_review_model::Column::ReviewReason,
+                        finding_review_model::Column::RootCause,
+                        finding_review_model::Column::Description,
+                        finding_review_model::Column::Location,
+                        finding_review_model::Column::Impact,
+                        finding_review_model::Column::Recommendation,
+                        finding_review_model::Column::PrimaryContract,
+                        finding_review_model::Column::PrimaryFunction,
+                        finding_review_model::Column::SeverityReason,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to upsert finding_review for reflection {}",
+                    rec.reflection_id
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Reviewed raw findings that have NOT been folded into a canonical yet
+    /// (no `finding_merge` edge) — the Merge agent's drain queue. "Merged"
+    /// is derived purely from edge presence; there is no boolean flag.
+    pub async fn load_unmerged_finding_reviews(&self) -> Result<Vec<ReviewedFinding>> {
+        let merged: BTreeSet<i32> = finding_merge_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_merge edges")?
+            .into_iter()
+            .map(|e| e.from_reflection_id)
+            .collect();
+        let reviews = finding_review_model::Entity::find()
+            .order_by_asc(finding_review_model::Column::ReflectionId)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_review rows")?;
+        Ok(reviews
+            .into_iter()
+            .filter(|r| !merged.contains(&r.reflection_id))
+            .map(ReviewedFinding::from)
+            .collect())
+    }
+
+    /// All canonical `report_finding` rows, ordered by id. The Merge agent
+    /// compares each new raw finding against these; export reads the
+    /// `Written` ones.
+    pub async fn load_report_findings(&self) -> Result<Vec<LoadedReportFinding>> {
+        let rows = report_finding_model::Entity::find()
+            .order_by_asc(report_finding_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load report_finding rows")?;
+        Ok(rows.into_iter().map(LoadedReportFinding::from).collect())
+    }
+
+    /// Which canonical a raw finding was folded into, if any.
+    pub async fn report_finding_of(&self, reflection_id: i32) -> Result<Option<i32>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let edge = finding_merge_model::Entity::find()
+            .filter(finding_merge_model::Column::FromReflectionId.eq(reflection_id))
+            .one(&self.db)
+            .await
+            .wrap_err("failed to look up finding_merge edge")?;
+        Ok(edge.map(|e| e.to_report_finding_id))
+    }
+
+    /// One canonical `report_finding` by id (for incremental on-disk dumps).
+    pub async fn load_report_finding(&self, id: i32) -> Result<Option<LoadedReportFinding>> {
+        Ok(report_finding_model::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load report_finding by id")?
+            .map(LoadedReportFinding::from))
+    }
+
+    /// The structured reviews of one canonical's cluster members (no heavy
+    /// source material). Lighter than [`Self::load_report_finding_members`];
+    /// used to embed members into the on-disk unique-finding JSON.
+    pub async fn load_report_finding_member_reviews(
+        &self,
+        report_finding_id: i32,
+    ) -> Result<Vec<ReviewedFinding>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let reflection_ids: Vec<i32> = finding_merge_model::Entity::find()
+            .filter(finding_merge_model::Column::ToReportFindingId.eq(report_finding_id))
+            .order_by_asc(finding_merge_model::Column::FromReflectionId)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_merge edges for canonical")?
+            .into_iter()
+            .map(|e| e.from_reflection_id)
+            .collect();
+        if reflection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(finding_review_model::Entity::find()
+            .filter(finding_review_model::Column::ReflectionId.is_in(reflection_ids))
+            .order_by_asc(finding_review_model::Column::ReflectionId)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_review rows for canonical")?
+            .into_iter()
+            .map(ReviewedFinding::from)
+            .collect())
+    }
+
+    /// The raw cluster members of one canonical: each member's structured
+    /// review, its source material (spec + PoC harness + forge run), and the
+    /// two graded edge strengths (mapper match + KG link) used to pick the
+    /// representative. Consumed by the report renderer.
+    pub async fn load_report_finding_members(
+        &self,
+        report_finding_id: i32,
+    ) -> Result<Vec<RawFindingMember>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let reflection_ids: Vec<i32> = finding_merge_model::Entity::find()
+            .filter(finding_merge_model::Column::ToReportFindingId.eq(report_finding_id))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_merge edges for canonical")?
+            .into_iter()
+            .map(|e| e.from_reflection_id)
+            .collect();
+        if reflection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut review_by_id: HashMap<i32, ReviewedFinding> = finding_review_model::Entity::find()
+            .filter(finding_review_model::Column::ReflectionId.is_in(reflection_ids.clone()))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_review rows for canonical")?
+            .into_iter()
+            .map(|r| (r.reflection_id, ReviewedFinding::from(r)))
+            .collect();
+
+        let reflections = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Id.is_in(reflection_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load reflections for canonical members")?;
+        let sources = self.load_valid_findings_for(reflections).await?;
+
+        // Strength lookup tables for representative selection: spec → its
+        // (extract, historical, finding) triple, then the two edge tables
+        // keyed by the relevant pair. The edge tables are per-project small;
+        // loading them whole avoids per-member composite-key queries.
+        let spec_ids: Vec<i32> = sources.iter().map(|s| s.spec_id).collect();
+        let triple_by_spec: HashMap<i32, (i32, i32, i32)> = specification_model::Entity::find()
+            .filter(specification_model::Column::Id.is_in(spec_ids))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load specifications for canonical members")?
+            .into_iter()
+            .map(|s| (s.id, (s.semantic_id, s.historical_id, s.finding_id)))
+            .collect();
+        let mapper_by_pair: HashMap<(i32, i32), MatchStrength> =
+            semantic_matched_model::Entity::find()
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load semantic_matched for member strengths")?
+                .into_iter()
+                .map(|m| ((m.extract_id, m.historical_id), m.strength))
+                .collect();
+        let link_by_pair: HashMap<(i32, i32), knowdit_kg_model::link_strength::LinkStrength> =
+            historical_semantic_finding_link_model::Entity::find()
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load historical_semantic_finding_link for member strengths")?
+                .into_iter()
+                .map(|l| {
+                    (
+                        (l.historical_semantic_id, l.historical_finding_id),
+                        l.strength,
+                    )
+                })
+                .collect();
+
+        let mut out = Vec::with_capacity(sources.len());
+        for source in sources {
+            let Some(review) = review_by_id.remove(&source.reflection_id) else {
+                continue;
+            };
+            let (mapper_strength, link_strength) = match triple_by_spec.get(&source.spec_id) {
+                Some(&(extract_id, historical_id, finding_id)) => (
+                    mapper_by_pair.get(&(extract_id, historical_id)).copied(),
+                    link_by_pair.get(&(historical_id, finding_id)).copied(),
+                ),
+                None => (None, None),
+            };
+            out.push(RawFindingMember {
+                review,
+                source,
+                mapper_strength,
+                link_strength,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Atomic: persist one Merge-agent decision for a raw finding.
+    ///
+    /// * `NewCanonical` → insert a `report_finding` (`status = Merged`) and
+    ///   the edge.
+    /// * `MergeInto` → optionally raise the canonical's severity (only when
+    ///   the new member outranks it), then the edge.
+    ///
+    /// One transaction: an interruption leaves no edge, so the next drain
+    /// re-processes the raw finding. The `UNIQUE(from_reflection_id)`
+    /// constraint rejects a double-merge of the same raw finding. Returns
+    /// the canonical id the finding now belongs to.
+    pub async fn commit_finding_merge(
+        &self,
+        from_reflection_id: i32,
+        decision: FindingMergeDecision,
+    ) -> Result<i32> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+
+        let txn = self
+            .db
+            .begin()
+            .await
+            .wrap_err("failed to begin finding-merge transaction")?;
+
+        let to_report_finding_id = match decision {
+            FindingMergeDecision::NewCanonical(seed) => {
+                let inserted =
+                    report_finding_model::Entity::insert(report_finding_model::ActiveModel {
+                        title: Set(seed.title),
+                        severity: Set(seed.severity),
+                        root_cause: Set(seed.root_cause),
+                        description: Set(seed.description),
+                        primary_contract: Set(seed.primary_contract),
+                        primary_function: Set(seed.primary_function),
+                        ..Default::default()
+                    })
+                    .exec(&txn)
+                    .await
+                    .wrap_err("failed to insert new canonical report_finding")?;
+                inserted.last_insert_id
+            }
+            FindingMergeDecision::MergeInto {
+                report_finding_id,
+                raise_to,
+            } => {
+                if let Some(sev) = raise_to {
+                    let current = report_finding_model::Entity::find_by_id(report_finding_id)
+                        .one(&txn)
+                        .await
+                        .wrap_err("failed to load merge-target canonical")?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "merge target report_finding {report_finding_id} not found"
+                            )
+                        })?;
+                    if sev.rank() > current.severity.rank() {
+                        let mut am = current.into_active_model();
+                        am.severity = Set(sev);
+                        am.update(&txn)
+                            .await
+                            .wrap_err("failed to raise canonical severity")?;
+                    }
+                }
+                report_finding_id
+            }
+        };
+
+        finding_merge_model::Entity::insert(finding_merge_model::ActiveModel {
+            from_reflection_id: Set(from_reflection_id),
+            to_report_finding_id: Set(to_report_finding_id),
+            ..Default::default()
+        })
+        .exec(&txn)
+        .await
+        .wrap_err_with(|| {
+            format!("failed to insert finding_merge edge for reflection {from_reflection_id}")
+        })?;
+
+        txn.commit()
+            .await
+            .wrap_err("failed to commit finding-merge transaction")?;
+        Ok(to_report_finding_id)
+    }
+
     /// The mapper-side match + KG-side finding link that together
     /// produced the given spec.
     ///
@@ -2739,6 +3279,75 @@ impl RepoDatabase {
             },
             link.into(),
         )))
+    }
+
+    /// Self-contained provenance for one spec's finding — the project DB rows
+    /// for the extract semantic, the historical semantic it matched, and the
+    /// historical finding that motivated it (FULL content, as the actual
+    /// models), plus the two graded edges (mapper match + KG link). Lets an
+    /// on-disk finding JSON fully explain its origin without the KG database.
+    ///
+    /// Returns `None` only when the spec or one of the three content rows is
+    /// missing (the project DB copies all three at map / spec time, so this is
+    /// effectively always `Some` for a real spec). The two edges are `Option`
+    /// — a spec can outlive its mapper / link rows.
+    pub async fn load_provenance_for_spec(
+        &self,
+        spec_id: i32,
+    ) -> Result<Option<FindingProvenance>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let Some(spec) = specification_model::Entity::find_by_id(spec_id)
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| format!("failed to load specification {spec_id}"))?
+        else {
+            return Ok(None);
+        };
+        let extract = project_semantic_model::Entity::find_by_id(spec.semantic_id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load project_semantic for provenance")?;
+        let historical_semantic = historical_semantic_model::Entity::find_by_id(spec.historical_id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic for provenance")?;
+        let historical_finding = historical_finding_model::Entity::find_by_id(spec.finding_id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load historical_finding for provenance")?;
+        let (Some(extract), Some(historical_semantic), Some(historical_finding)) =
+            (extract, historical_semantic, historical_finding)
+        else {
+            return Ok(None);
+        };
+
+        let semantic_match = semantic_matched_model::Entity::find()
+            .filter(semantic_matched_model::Column::ExtractId.eq(spec.semantic_id))
+            .filter(semantic_matched_model::Column::HistoricalId.eq(spec.historical_id))
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load semantic_matched for provenance")?;
+        let finding_link = historical_semantic_finding_link_model::Entity::find()
+            .filter(
+                historical_semantic_finding_link_model::Column::HistoricalSemanticId
+                    .eq(spec.historical_id),
+            )
+            .filter(
+                historical_semantic_finding_link_model::Column::HistoricalFindingId
+                    .eq(spec.finding_id),
+            )
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic_finding_link for provenance")?;
+
+        Ok(Some(FindingProvenance {
+            extract,
+            semantic_match,
+            historical_semantic,
+            finding_link,
+            historical_finding,
+        }))
     }
 
     /// True if this `harness_run` already has a reflection row.

@@ -34,7 +34,7 @@ use llmy::harness::Agent;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::spec::{ProjectIndex, build_link_memory, spec_memory_criteria};
+use crate::spec::{ProjectIndex, spec_memory_criteria};
 
 /// 80% of the model's max input tokens — same default as
 /// `SpecificationGenerator` and `SolidityFuzzGenerator`.
@@ -159,7 +159,7 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
     tools: ToolBox,
     attempt: &AttemptHandle<T>,
 ) -> Result<usize> {
-    let memory = build_link_memory(project_index)?;
+    let memory = project_index.build_link_memory()?;
 
     let cache_key = format!("{}-{}", options.cache_key, cache_key_suffix);
     let debug_prefix = options

@@ -10,7 +10,7 @@
 use knowdit_kg_model::ExtractedFunction;
 use knowdit_kg_model::audit_finding::FindingSeverity;
 
-use super::{LinkInput, ProjectIndex, SpecRegenMode};
+use super::{LinkInput, LinkSource, ProjectIndex, SpecRegenMode};
 
 pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str) -> String {
     match mode {
@@ -52,17 +52,30 @@ pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str)
     }
 }
 
-pub(super) fn build_system_prompt(link: &LinkInput) -> String {
+pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let finding = &link.finding;
     let extract_functions = render_extracted_functions(&extract.functions);
+    // The task framing + finding-section header depend on where the finding came
+    // from: a Knowledge Mapper topic hint (explore for related issues) vs an
+    // externally-reported finding (validate this specific issue).
+    let (task_paragraph, finding_header) = match source {
+        LinkSource::Mapper => (
+            "You are given a `(project_semantic, historical_semantic, historical_finding)` link from the Knowledge Mapper. The historical finding is a *topic hint* drawn from another project — it likely will not fit the current project verbatim. **Your task is to use the historical finding as a starting point to look for any plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the historical finding (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.",
+            "## Historical finding (use as topic hint, not strict template)",
+        ),
+        LinkSource::External => (
+            "The finding below was **reported against this exact project** (e.g. by an external audit) and localized to the project semantic below. **Your task is to emit `AuditSpecification`(s) that reproduce this specific reported issue on the current code**, encoding its reported impact as the post_attack invariant. This is a concrete claim to validate — NOT a topic hint to generalize from: stay faithful to the reported root cause and the named target functions. If, after reading the code, the issue genuinely cannot occur, `abandoned` with the reason is the correct outcome (it documents that the report does not reproduce).",
+            "## Reported finding (validate this specific issue)",
+        ),
+    };
     format!(
         r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
 
 ## Your task
 
-You are given a `(project_semantic, historical_semantic, historical_finding)` link from the Knowledge Mapper. The historical finding is a *topic hint* drawn from another project — it likely will not fit the current project verbatim. **Your task is to use the historical finding as a starting point to look for any plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the historical finding (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.
+{task_paragraph}
 
 You operate per-link. The link below stays in your system prompt for the entire run.
 
@@ -84,7 +97,7 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
 - definition: {historical_definition}
 - description: {historical_description}
 
-## Historical finding (use as topic hint, not strict template)
+{finding_header}
 - id: {finding_id}
 - title: {finding_title}
 - severity: {finding_severity}

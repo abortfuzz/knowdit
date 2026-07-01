@@ -92,10 +92,69 @@ impl DeFiCategory {
             Self::Others => "Others",
         }
     }
+
+    /// Parse a category from its display name, tolerant of case and of
+    /// space/underscore/hyphen separators (so `services`, `Real World Assets`,
+    /// `real-world-assets`, `NFT_Marketplace` all resolve). Returns `None` for
+    /// an unknown name.
+    pub fn parse(s: &str) -> Option<Self> {
+        let norm = |x: &str| {
+            x.trim()
+                .to_ascii_lowercase()
+                .replace(['_', '-'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let target = norm(s);
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| norm(c.as_str()) == target)
+    }
 }
 
 impl fmt::Display for DeFiCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::DeFiCategory;
+
+    #[test]
+    fn parses_case_and_separator_insensitive() {
+        assert_eq!(
+            DeFiCategory::parse("Services"),
+            Some(DeFiCategory::Services)
+        );
+        assert_eq!(
+            DeFiCategory::parse("services"),
+            Some(DeFiCategory::Services)
+        );
+        assert_eq!(
+            DeFiCategory::parse("  SERVICES "),
+            Some(DeFiCategory::Services)
+        );
+        assert_eq!(
+            DeFiCategory::parse("real_world_assets"),
+            Some(DeFiCategory::RealWorldAssets)
+        );
+        assert_eq!(
+            DeFiCategory::parse("Real World Assets"),
+            Some(DeFiCategory::RealWorldAssets)
+        );
+        assert_eq!(
+            DeFiCategory::parse("nft-marketplace"),
+            Some(DeFiCategory::NftMarketplace)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown() {
+        assert_eq!(DeFiCategory::parse("Sevices"), None);
+        assert_eq!(DeFiCategory::parse(""), None);
     }
 }
