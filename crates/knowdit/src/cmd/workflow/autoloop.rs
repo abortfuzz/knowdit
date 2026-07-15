@@ -136,7 +136,7 @@ impl AutoloopArgs {
 
         let loaded = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let kg = self.kg.connect_init_for_consumer().await?;
         let spec_name = loaded.spec.name.clone();

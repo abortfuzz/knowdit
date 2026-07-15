@@ -209,7 +209,7 @@ contract Test_{spec_id} is Test {{
         finding_id = link.finding_id,
         finding_title = link.finding.title,
         finding_root_cause = link.finding.root_cause.trim(),
-        finding_description = link.finding.description.trim(),
+        finding_description = link.finding_rendered_description.trim(),
         spec_id = spec_id,
         spec_json = spec_json,
         harness_dir = harness_dir.display(),

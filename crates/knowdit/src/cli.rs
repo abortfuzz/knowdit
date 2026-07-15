@@ -49,6 +49,14 @@ pub struct DatabaseArgs {
         env = "REPO_DATABASE_PATH"
     )]
     pub database_path: Option<PathBuf>,
+
+    /// Max merged-variant notes rendered under each mirrored historical
+    /// canonical (semantic description / finding fields) when the spec /
+    /// harness / PoC prompts read the Knowledge Mapper output. Each folded
+    /// raw's `appended_*` delta beyond the bounded canonical; bounds the prompt
+    /// for heavily-merged canonicals.
+    #[arg(long, default_value_t = knowdit_repo_model::DEFAULT_VARIANT_RENDER_CAP)]
+    pub variant_render_cap: usize,
 }
 
 /// Result of [`ProjectArgs::to_repo_database`]: the parsed project
@@ -376,12 +384,14 @@ impl ProjectArgs {
     pub async fn to_repo_database(
         &self,
         db_override: Option<PathBuf>,
+        variant_render_cap: usize,
     ) -> Result<LoadedRepoDatabase> {
         let spec = self.to_project_spec()?;
         let database_path = RepoDatabase::default_sqlite_path(&spec.root, db_override);
         let repo = RepoDatabase::open_sqlite(database_path.clone())
             .await
-            .wrap_err_with(|| format!("failed to open project DB {}", database_path.display()))?;
+            .wrap_err_with(|| format!("failed to open project DB {}", database_path.display()))?
+            .with_variant_render_cap(variant_render_cap);
         repo.init_schema()
             .await
             .wrap_err("failed to init project DB schema")?;

@@ -53,7 +53,7 @@
 //! above is the invariant the queue serves.
 use crate::cmd::learn::finding_link_args::FindingLinkCliArgs;
 use clap::Args;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::db::HistoricalDatabase;
 use llmy::clap::OpenAISetup;
 use llmy::client::client::LLM;
@@ -81,6 +81,11 @@ pub struct RetroLinkArgs {
 
     #[command(flatten)]
     pub shared: RetroLinkSharedArgs,
+
+    /// Fraction (0,1] of the model's context window a single retro-link prompt
+    /// may fill. Lower = more, smaller prompts with sharper attention.
+    #[arg(long, default_value_t = knowdit_kg::learn::DEFAULT_CONTEXT_WINDOW_UTILIZATION)]
+    pub context_window_utilization: f64,
 }
 
 impl RetroLinkArgs {
@@ -88,8 +93,19 @@ impl RetroLinkArgs {
     /// [`Self::retro_link`].
     pub async fn run(self, db: &HistoricalDatabase) -> Result<()> {
         self.finding_link.validate()?;
+        ensure!(
+            self.context_window_utilization > 0.0 && self.context_window_utilization <= 1.0,
+            "context_window_utilization must be in (0, 1]",
+        );
         let llm = self.llm.clone().to_llm().await;
-        Self::retro_link(db, &llm, &self.finding_link, &self.shared).await
+        Self::retro_link(
+            db,
+            &llm,
+            &self.finding_link,
+            &self.shared,
+            self.context_window_utilization,
+        )
+        .await
     }
 
     /// In-process entry: re-link existing globally-linked findings
@@ -100,8 +116,10 @@ impl RetroLinkArgs {
         llm: &LLM,
         finding_link: &FindingLinkCliArgs,
         shared: &RetroLinkSharedArgs,
+        context_window_utilization: f64,
     ) -> Result<()> {
-        let options = finding_link.to_options(shared.retro_link_concurrency);
+        let mut options = finding_link.to_options(shared.retro_link_concurrency);
+        options.context_window_utilization = context_window_utilization;
         knowdit_kg::link::retro_link_pending_semantics(db, llm, options).await?;
         Ok(())
     }

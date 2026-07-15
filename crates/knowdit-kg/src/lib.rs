@@ -6,6 +6,8 @@ pub mod error;
 pub mod knowledge_graph;
 pub mod learn;
 pub mod link;
+pub mod merge_kg;
 pub mod project_loader;
 pub mod prompts;
+pub mod stats;
 pub mod vulnerability;

@@ -72,7 +72,7 @@ impl ProfileArgs {
         // `language` value via `finalize_profile`.
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let profile = Self::profile(&repo, llm, &spec.name, &spec.root, &self.shared).await?;
         println!(

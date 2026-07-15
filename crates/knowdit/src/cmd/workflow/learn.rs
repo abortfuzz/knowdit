@@ -152,11 +152,25 @@ impl WorkflowLearnArgs {
         tracing::info!(
             "Phase 2: retro-link prior-project findings against new canonical semantics"
         );
-        RetroLinkArgs::retro_link(&kg, primary_llm, &self.finding_link, &self.retro_link).await?;
+        RetroLinkArgs::retro_link(
+            &kg,
+            primary_llm,
+            &self.finding_link,
+            &self.retro_link,
+            self.merge.context_window_utilization,
+        )
+        .await?;
 
         // ----- Phase 3: intra-project finding→semantic link -------
         tracing::info!("Phase 3: link new findings against every canonical semantic");
-        LinkArgs::link(&kg, primary_llm, &self.finding_link, &self.link).await?;
+        LinkArgs::link(
+            &kg,
+            primary_llm,
+            &self.finding_link,
+            &self.link,
+            self.merge.context_window_utilization,
+        )
+        .await?;
 
         tracing::info!("workflow learn complete for {}", self.project);
         Ok(())

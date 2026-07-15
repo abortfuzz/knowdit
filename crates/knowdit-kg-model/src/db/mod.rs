@@ -8,6 +8,7 @@ pub mod category;
 pub mod finding_category;
 pub mod finding_link_status;
 pub mod finding_merge;
+pub mod merge_status;
 pub mod pending_semantic;
 pub mod project;
 pub mod project_category;

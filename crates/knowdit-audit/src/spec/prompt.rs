@@ -211,14 +211,14 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
         historical_category = historical.category.as_str(),
         historical_name = historical.name,
         historical_definition = historical.definition.trim(),
-        historical_description = historical.description.trim(),
+        historical_description = link.historical_rendered_description.trim(),
         finding_id = link.finding_id,
         finding_title = finding.title,
         finding_severity = format_severity(finding.severity),
         finding_root_cause = finding.root_cause.trim(),
-        finding_description = finding.description.trim(),
-        finding_patterns = finding.patterns.trim(),
-        finding_exploits = finding.exploits.trim(),
+        finding_description = link.finding_rendered_description.trim(),
+        finding_patterns = link.finding_rendered_patterns.trim(),
+        finding_exploits = link.finding_rendered_exploits.trim(),
     )
 }
 

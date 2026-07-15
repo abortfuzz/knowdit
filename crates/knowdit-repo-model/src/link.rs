@@ -43,12 +43,32 @@ pub struct LinkInput {
     pub extract: ExtractedSemantic,
     pub historical: semantic_node::Model,
     pub finding: audit_finding::Model,
+    /// `historical.description` / `finding.{description,patterns,exploits}`
+    /// rendered with their merged-variant deltas from the mirror (bounded
+    /// canonical representative + each folded raw's concrete delta). Prompt
+    /// builders should read these instead of the raw fields; each falls back to
+    /// the raw field when the mirror carried no rendered value.
+    pub historical_rendered_description: String,
+    pub finding_rendered_description: String,
+    pub finding_rendered_patterns: String,
+    pub finding_rendered_exploits: String,
     /// Spec ids already committed for this link in a prior run. Empty for
     /// fresh links. When non-empty, a backend's per-link runner short-circuits
     /// the gen-spec agent and synthesizes an outcome from these ids so the
     /// caller drives fuzz / reflect / regen against them. Populated from
     /// [`crate::RepoDatabase::link_resume_state`].
     pub pre_committed_spec_ids: Vec<i32>,
+}
+
+/// Pick the mirror-rendered value, or fall back to the raw canonical field when
+/// the mirror carried nothing rendered (e.g. legacy project DBs written before
+/// merged-variant rendering).
+fn rendered_or(rendered: &str, raw: &str) -> String {
+    if rendered.trim().is_empty() {
+        raw.to_string()
+    } else {
+        rendered.to_string()
+    }
 }
 
 impl LinkInput {
@@ -110,6 +130,22 @@ impl LinkInput {
                     strength: m.strength,
                     link_strength: linked.strength,
                     extract: extract.clone(),
+                    historical_rendered_description: rendered_or(
+                        &record.rendered_description,
+                        &record.semantic.description,
+                    ),
+                    finding_rendered_description: rendered_or(
+                        &linked.rendered_description,
+                        &finding.description,
+                    ),
+                    finding_rendered_patterns: rendered_or(
+                        &linked.rendered_patterns,
+                        &finding.patterns,
+                    ),
+                    finding_rendered_exploits: rendered_or(
+                        &linked.rendered_exploits,
+                        &finding.exploits,
+                    ),
                     historical: record.semantic.clone(),
                     finding: finding.clone(),
                     pre_committed_spec_ids: Vec::new(),

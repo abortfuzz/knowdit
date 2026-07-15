@@ -114,8 +114,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      # Workaround for https://github.com/rust-lang/cargo/issues/17093, which breaks
+      # `cargo release`/`cargo publish` on stable. The latest nightly carries the
+      # fix; only needed when cutting a release (tag push). `@nightly` tracks the
+      # newest nightly (unpinned) and makes it the default toolchain, so the
+      # `cargo publish` that `cargo release` shells out to runs under nightly.
+      - name: '🌙 Set up nightly Rust for release'
+        if: startsWith(github.ref, 'refs/tags')
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Publish
         env:

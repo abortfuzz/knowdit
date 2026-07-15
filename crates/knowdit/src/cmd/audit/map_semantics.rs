@@ -116,7 +116,7 @@ impl MapSemanticsArgs {
         let kg = self.kg.connect_init_for_consumer().await?;
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let outcome = Self::map_semantics(
             &repo,

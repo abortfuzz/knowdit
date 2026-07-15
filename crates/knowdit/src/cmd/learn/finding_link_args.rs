@@ -4,23 +4,58 @@ use knowdit_kg::learn::FindingLinkOptions;
 
 #[derive(Args, Debug, Clone, Copy)]
 pub struct FindingLinkCliArgs {
-    /// Expected maximum total input tokens per linking prompt.
+    /// Absolute ceiling on total input tokens per linking prompt. Unset ⇒
+    /// derived from the model window × `--link-context-window-utilization`; can
+    /// only lower it, never exceed it.
     #[arg(long)]
     pub input_token_budget: Option<usize>,
 
-    /// Maximum tokens that finding payloads may occupy in each linking prompt.
-    #[arg(long)]
-    pub finding_token_budget: Option<usize>,
+    /// Share of the input budget reserved for the findings block. The
+    /// semantic-candidate block is NOT separately configured — it takes ALL
+    /// input left after findings + system + prefix, so it fills the window
+    /// automatically. LOWER this (e.g. 0.25) to leave more room for semantics →
+    /// all canonicals fit ONE prompt → no candidate chunking → global
+    /// competition (fewer, more selective links). Must be in (0, 1).
+    #[arg(long, default_value_t = 1.0 / 3.0)]
+    pub finding_token_ratio: f64,
+
+    /// Hard ceiling on canonical semantics per chunk — the count analogue of the
+    /// semantic token budget (which is just "all input left after findings").
+    /// Because raw-children semantics vary wildly in size, the token budget alone
+    /// can't pin the count; this does. Default is unbounded (token-only chunking);
+    /// set a number to cap how many semantics the model must weigh per prompt.
+    #[arg(long, default_value_t = usize::MAX)]
+    pub max_semantics_per_batch: usize,
 
     /// Hard ceiling on findings per batch — independent of token
-    /// budget. Token-based partitioning alone packs too many findings
-    /// when each finding's text is short (e.g. ~150 tok/finding on
-    /// the Move KG fits ~480 findings in a 72K budget); agents in
-    /// practice can only stably emit decisions for a few dozen
-    /// findings per attempt before finalizing prematurely. Leave
-    /// unset to use the built-in default.
-    #[arg(long)]
-    pub max_findings_per_batch: Option<usize>,
+    /// budget. Leave unset to use the built-in default (600), which is
+    /// deliberately an INERT ceiling: the finding token budget drives the
+    /// batch shape (binding at ~350 findings median on the c4 KG) and the
+    /// cap only stops the small-finding tail from ballooning (short
+    /// findings pack absurdly dense — ~150 tok/finding on the Move KG fits
+    /// ~480 in a 72K budget).
+    ///
+    /// This is ALSO the dominant knob for link density / precision —
+    /// more so than the context-window ratio, which barely moves it
+    /// (re-linking one KG at two different ratios changed density by
+    /// <2%). Mechanism: with fewer findings per request the agent
+    /// elaborates on each finding and links liberally; with more
+    /// findings per request it stays terse and emits only the strongest
+    /// link (or none). Holding everything else equal (same model,
+    /// prompt, and candidate set), requests carrying <60 findings
+    /// averaged ~0.85 links per finding while requests carrying >=150
+    /// averaged ~0.05 — a ~15x swing driven by batch size alone. End to
+    /// end that is the difference between ~6 cross-links per finding
+    /// (token-bound batches of 200+: fewer, better-calibrated links) and
+    /// ~16 (batches of ~50: more links, looser calibration). Lower it
+    /// toward ~50 for higher recall; do NOT push far beyond ~600 — huge
+    /// batches (700-finding agents, ~900 steps) finalize prematurely,
+    /// retry heavily, hit per-request timeouts, and blind-eval WORSE on
+    /// High calibration. `--link-max-agent-steps` auto-scales with this
+    /// (1.2×) unless set explicitly, so the agent always has a step per
+    /// finding.
+    #[arg(long, default_value_t = 600)]
+    pub max_findings_per_batch: usize,
 
     /// Maximum attempts per (finding-batch × semantic-chunk): if the agent
     /// finalizes without covering every finding in the batch, the runner
@@ -30,15 +65,61 @@ pub struct FindingLinkCliArgs {
     #[arg(long, default_value_t = 3)]
     pub max_response_attempts: usize,
 
-    /// Per-attempt cap on agent steps (one tool call = one step).
-    /// Rule of thumb: needs to be at least `max_findings_per_batch +
-    /// 4` (one emit per finding, one finalize, plus a few reasoning
-    /// steps). The runner logs a warning at batch start when this
-    /// looks too tight. Default 200 sized for the new ~50-finding
-    /// batches; raise alongside `--max-findings-per-batch` if you
-    /// crank it up.
-    #[arg(long, default_value_t = 200)]
-    pub link_max_agent_steps: usize,
+    /// Per-attempt cap on agent steps (one tool call = one step): one
+    /// emit per finding, one finalize, plus a few reasoning steps.
+    /// Unset ⇒ auto-sized to `ceil(1.2 × --max-findings-per-batch)`
+    /// (20% headroom over one emit per finding), so it tracks the batch
+    /// size automatically instead of needing a manual bump. Set an
+    /// explicit value to override. The runner logs a warning at batch
+    /// start when this looks too tight.
+    #[arg(long)]
+    pub link_max_agent_steps: Option<usize>,
+
+    /// Fraction (0,1] of the model's context window a single
+    /// finding-linking prompt may fill — governs how many findings +
+    /// semantic candidates are packed per prompt. Lower = more,
+    /// smaller prompts with sharper attention. (The blind-eval-validated
+    /// `v4_density` relink corresponds to 0.73 in REAL tokens — its
+    /// nominal 0.95 predates the `count_tokens` fix that removed the
+    /// ~1.3x chars/4 overcount.) Carries the `--link-` prefix so it can
+    /// be flattened next to the merge / extract
+    /// `--context-window-utilization` without colliding.
+    #[arg(long, default_value_t = 0.8)]
+    pub link_context_window_utilization: f64,
+
+    /// Turn OFF full raw-children rendering and fall back to the compact
+    /// `appended_*` delta notes under each candidate/finding. Raw-children
+    /// rendering — each folded child's FULL raw text, the richer link context
+    /// approaching the pre-Option-A inline density — is **on by default**
+    /// (applies to both the semantic candidate and the finding); this flag
+    /// disables it for smaller prompts with less context.
+    #[arg(long)]
+    pub link_no_render_raw_children: bool,
+
+    #[command(flatten)]
+    pub render: VariantRenderArgs,
+}
+
+/// The merged-variant render caps, shared by `link` (bounds the link prompt)
+/// and `validate-db` (measures the DB's rendered field lengths) so both speak
+/// the same caliber: pass the same values to see exactly the per-candidate /
+/// per-finding mass a link run would put in its prompts.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct VariantRenderArgs {
+    /// Max merged variants (count) rendered under each candidate AND each
+    /// finding. Kept SMALL for linking: many rendered variants bloat each
+    /// candidate (more match surface → more spurious High) and grow the
+    /// candidate block into extra chunks.
+    #[arg(long, default_value_t = 8)]
+    pub link_variant_render_cap: usize,
+
+    /// Per-variant char cap for raw-children rendering (0 = unbounded), so one
+    /// bloated raw child cannot dominate the prompt. Kept SHORT — exp-era
+    /// rendered folded raws as brief subordinate context; long variant dumps
+    /// broaden each candidate and drive spurious High. Ignored under
+    /// `--link-no-render-raw-children`.
+    #[arg(long, default_value_t = 400)]
+    pub link_raw_child_char_cap: usize,
 }
 
 impl FindingLinkCliArgs {
@@ -47,17 +128,31 @@ impl FindingLinkCliArgs {
             ensure!(budget > 0, "Input token budget must be greater than zero");
         }
 
-        if let Some(budget) = self.finding_token_budget {
-            ensure!(budget > 0, "Finding token budget must be greater than zero");
-        }
+        ensure!(
+            self.finding_token_ratio > 0.0 && self.finding_token_ratio < 1.0,
+            "finding_token_ratio must be in (0, 1) — the semantic block takes the remainder"
+        );
+
+        ensure!(
+            self.max_findings_per_batch > 0,
+            "Max findings per batch must be greater than zero"
+        );
+        ensure!(
+            self.max_semantics_per_batch > 0,
+            "Max semantics per batch must be greater than zero"
+        );
 
         ensure!(
             self.max_response_attempts > 0,
             "Max response attempts must be greater than zero"
         );
+        if let Some(steps) = self.link_max_agent_steps {
+            ensure!(steps > 0, "link_max_agent_steps must be greater than zero");
+        }
         ensure!(
-            self.link_max_agent_steps > 0,
-            "link_max_agent_steps must be greater than zero",
+            self.link_context_window_utilization > 0.0
+                && self.link_context_window_utilization <= 1.0,
+            "link_context_window_utilization must be in (0, 1]",
         );
 
         Ok(())
@@ -67,11 +162,19 @@ impl FindingLinkCliArgs {
         FindingLinkOptions {
             concurrency,
             input_token_budget: self.input_token_budget,
-            finding_token_budget: self.finding_token_budget,
+            finding_token_ratio: self.finding_token_ratio,
+            max_semantics_per_batch: self.max_semantics_per_batch,
             max_findings_per_batch: self.max_findings_per_batch,
             max_response_attempts: self.max_response_attempts,
-            max_agent_steps: self.link_max_agent_steps,
+            max_agent_steps: self
+                .link_max_agent_steps
+                .unwrap_or_else(|| (self.max_findings_per_batch as f64 * 1.2).ceil() as usize),
             include_unlinked: false,
+            candidate_max_semantic_id: None,
+            context_window_utilization: self.link_context_window_utilization,
+            variant_render_cap: self.render.link_variant_render_cap,
+            render_raw_children: !self.link_no_render_raw_children,
+            raw_child_char_cap: self.render.link_raw_child_char_cap,
         }
     }
 }

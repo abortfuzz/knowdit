@@ -3,7 +3,7 @@ use crate::agents::FinalizeArgs;
 use crate::category::DeFiCategory;
 use crate::db::HistoricalDatabase;
 use crate::error::{KgError, Result};
-use crate::learn::{ExtractedFinding, count_tokens, get_context_budget, sanitize_prompt_prefix};
+use crate::learn::{ExtractedFinding, get_context_budget, sanitize_prompt_prefix};
 use crate::prompts;
 use itertools::Itertools;
 use llmy::agent::tool::ToolBox;
@@ -87,8 +87,20 @@ pub struct PersistedFindingLinkResult {
 #[derive(Debug, Clone, Copy)]
 pub struct FindingLinkOptions {
     pub concurrency: usize,
+    /// Absolute ceiling on total input tokens per prompt. `None` ⇒ derived from
+    /// the model window × `context_window_utilization`; can only lower it.
     pub input_token_budget: Option<usize>,
-    pub finding_token_budget: Option<usize>,
+    /// Share of the input budget reserved for the findings block. The
+    /// semantic-candidate block is NOT separately configured — it takes ALL
+    /// remaining input after findings + system + prefix, so it fills the window
+    /// automatically (lower this ⇒ more room for semantics ⇒ fewer / zero
+    /// candidate chunks). Must be in (0, 1); the CLI defaults it to 1/3.
+    pub finding_token_ratio: f64,
+    /// Hard ceiling on canonical semantics (candidates) per chunk — the count
+    /// analogue of the token budget. Raw-children candidates vary wildly in size,
+    /// so the token budget alone can't pin the candidate *count*; this does.
+    /// `usize::MAX` ⇒ token-only chunking (the CLI default).
+    pub max_semantics_per_batch: usize,
     /// Hard ceiling on findings per batch — independent of token
     /// budget. The token-based partitioner would happily pack 400+
     /// findings into a single batch on small-finding KGs (e.g. the
@@ -96,8 +108,9 @@ pub struct FindingLinkOptions {
     /// in one 72K budget), but agents in practice can only stably
     /// emit decisions for a few dozen findings per attempt before
     /// finalizing prematurely. Cap both ways: token budget AND
-    /// finding count. `None` ⇒ uses [`DEFAULT_MAX_FINDINGS_PER_BATCH`].
-    pub max_findings_per_batch: Option<usize>,
+    /// finding count. The CLI defaults this to an inert 600 ceiling
+    /// (the token budget drives the batch shape); 0 is clamped to 1.
+    pub max_findings_per_batch: usize,
     /// Max attempts per (finding-batch × semantic-chunk) — if the agent
     /// finalizes without covering every finding in the batch, the runner
     /// re-runs a fresh agent restricted to the still-missing findings.
@@ -108,17 +121,43 @@ pub struct FindingLinkOptions {
     /// missing-coverage retry counter).
     pub max_agent_steps: usize,
     pub include_unlinked: bool,
+    /// Cross-seam scope for the merge-kg ③b pass: when `Some(max)`, only
+    /// canonical semantics with `id <= max` are offered as link candidates.
+    /// `None` (the default) presents every canonical, matching the standard
+    /// exhaustive `link` behaviour used by `workflow learn`.
+    pub candidate_max_semantic_id: Option<i32>,
+    /// Fraction of the model's context window a single link prompt may fill.
+    /// Defaults to [`crate::learn::DEFAULT_CONTEXT_WINDOW_UTILIZATION`];
+    /// overridable per-command (e.g. `merge-kg`).
+    pub context_window_utilization: f64,
+    /// Max merged variants (count) rendered under each canonical candidate AND
+    /// under each finding, so a heavily-merged node does not blow up the prompt.
+    /// The CLI defaults this to 8.
+    pub variant_render_cap: usize,
+    /// When true, render merged variants as each folded child's **full raw text**
+    /// ([`VariantMode::RawChildren`]) instead of the compact
+    /// `appended_*` deltas — richer link context (approaching the pre-Option-A
+    /// inline density exp linked on) at the cost of larger prompts. Applies to
+    /// both the semantic candidate and the finding entry.
+    pub render_raw_children: bool,
+    /// Per-variant char cap applied only in raw-children mode (`0` = unbounded),
+    /// so one bloated child cannot dominate the prompt. The CLI defaults this
+    /// to 400.
+    pub raw_child_char_cap: usize,
 }
 
 #[derive(Debug, Clone)]
-struct SemanticLinkCandidate {
-    candidate_id: String,
-    canonical_semantic_id: i32,
-    is_canonical: bool,
-    category: DeFiCategory,
-    name: String,
-    definition: String,
-    description: String,
+pub(crate) struct SemanticLinkCandidate {
+    pub(crate) candidate_id: String,
+    pub(crate) canonical_semantic_id: i32,
+    pub(crate) is_canonical: bool,
+    pub(crate) category: DeFiCategory,
+    pub(crate) name: String,
+    pub(crate) definition: String,
+    pub(crate) description: String,
+    /// `appended_description` notes of the raws folded into this canonical —
+    /// each variant's concrete delta beyond `description`.
+    pub(crate) variant_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,7 +321,7 @@ impl FindingLinkContext {
             prompts::finding_link_user_prefix(context_key.prompt_category(), &candidate_text);
 
         Self {
-            prompt_prefix_tokens: count_tokens(model, &prompt_prefix),
+            prompt_prefix_tokens: model.config.count_tokens_lossy(&prompt_prefix),
             prompt_prefix,
             candidate_token_count,
             candidate_map,
@@ -342,7 +381,44 @@ impl FindingLinkContextPlan {
             }
         }
 
-        let batches = build_finding_link_batches(model, expanded_pending, &contexts, budgets)?;
+        // In raw-children mode, fetch each finding's folded raw children so the
+        // finding entry can render its full merged variants (parity with the
+        // semantic candidate side). Compact mode renders the canonical only.
+        let finding_children: HashMap<i32, FindingRawChildren> = if budgets.render_raw_children {
+            let mut ids: Vec<i32> = expanded_pending
+                .values()
+                .flat_map(|pendings| pendings.iter().map(|p| p.finding_id))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            db.finding_children_with_notes(&ids)
+                .await?
+                .into_iter()
+                .map(|(finding_id, children)| {
+                    let mut raw = FindingRawChildren::default();
+                    for (child, _, _, _) in children {
+                        raw.root_causes
+                            .push(label_variant(&child.title, child.root_cause));
+                        raw.descriptions
+                            .push(label_variant(&child.title, child.description));
+                        raw.patterns
+                            .push(label_variant(&child.title, child.patterns));
+                        raw.exploits
+                            .push(label_variant(&child.title, child.exploits));
+                    }
+                    (finding_id, raw)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let batches = budgets.build_finding_link_batches(
+            model,
+            expanded_pending,
+            &contexts,
+            &finding_children,
+        )?;
 
         Ok(FindingLinkExecutionPlan {
             contexts,
@@ -372,46 +448,62 @@ impl FindingLinkExecutionPlan {
     }
 }
 
-/// Hard cap on findings per batch when [`FindingLinkOptions::max_findings_per_batch`]
-/// isn't set. Empirically ~50 is what the post-step-cap-200 agent
-/// handles reliably across both Move and Solidity KGs without
-/// finalizing prematurely. Override with `--max-findings-per-batch`.
-const DEFAULT_MAX_FINDINGS_PER_BATCH: usize = 50;
-
 #[derive(Debug, Clone, Copy)]
 struct FindingLinkBudgets {
     input_token_budget: usize,
-    semantic_token_target: usize,
     finding_token_target: usize,
     /// Independent of token budget: hard cap on findings per batch.
     /// `partition_finding_link_entries` honours `min(token, count)`.
     max_findings_per_batch: usize,
+    /// Count cap on candidate semantics per chunk (the semantic block otherwise
+    /// takes all input left after findings). `partition_finding_link_candidate_groups`
+    /// honours `min(token, count)`.
+    max_semantics_per_batch: usize,
+    /// Cross-seam candidate ceiling (merge-kg ③b). `None` ⇒ all canonicals.
+    candidate_max_semantic_id: Option<i32>,
+    /// Cap on merged-variant notes rendered per candidate.
+    variant_render_cap: usize,
+    /// Render merged variants as full raw child text vs compact deltas.
+    render_raw_children: bool,
+    /// Per-variant char cap in raw-children mode (0 = unbounded).
+    raw_child_char_cap: usize,
+}
+
+impl FindingLinkBudgets {
+    /// Per-variant char cap to pass the shared renderer: the configured cap in
+    /// raw-children mode, or 0 (no truncation) in compact mode where notes are
+    /// already short.
+    fn effective_child_char_cap(&self) -> usize {
+        if self.render_raw_children {
+            self.raw_child_char_cap
+        } else {
+            0
+        }
+    }
 }
 
 impl FindingLinkBudgets {
     fn from_options(model: &OpenAIModel, options: FindingLinkOptions) -> Self {
-        let max_input_budget = get_context_budget(model).max(1);
+        let max_input_budget = get_context_budget(model, options.context_window_utilization).max(1);
         let input_token_budget = options
             .input_token_budget
             .unwrap_or(max_input_budget)
             .min(max_input_budget)
             .max(1);
-        let shared_target = (input_token_budget / 3).max(1);
-        let finding_token_target = options
-            .finding_token_budget
-            .unwrap_or(shared_target)
-            .min(shared_target)
-            .max(1);
-        let max_findings_per_batch = options
-            .max_findings_per_batch
-            .unwrap_or(DEFAULT_MAX_FINDINGS_PER_BATCH)
-            .max(1);
+        let finding_token_target =
+            ((input_token_budget as f64 * options.finding_token_ratio) as usize).max(1);
+        let max_findings_per_batch = options.max_findings_per_batch.max(1);
+        let max_semantics_per_batch = options.max_semantics_per_batch.max(1);
 
         Self {
             input_token_budget,
-            semantic_token_target: shared_target,
             finding_token_target,
             max_findings_per_batch,
+            max_semantics_per_batch,
+            candidate_max_semantic_id: options.candidate_max_semantic_id,
+            variant_render_cap: options.variant_render_cap,
+            render_raw_children: options.render_raw_children,
+            raw_child_char_cap: options.raw_child_char_cap,
         }
     }
 
@@ -420,15 +512,19 @@ impl FindingLinkBudgets {
         model: &OpenAIModel,
         prompt_category: Option<DeFiCategory>,
     ) -> Result<usize> {
-        let system_tokens = count_tokens(model, prompts::GENERAL_ROLE_SYSTEM);
-        let stable_prefix_tokens = count_tokens(
-            model,
-            &prompts::finding_link_user_prefix(prompt_category, ""),
-        );
-        let available_for_candidates = self
+        let system_tokens = model
+            .config
+            .count_tokens_lossy(prompts::GENERAL_ROLE_SYSTEM);
+        let stable_prefix_tokens = model
+            .config
+            .count_tokens_lossy(&prompts::finding_link_user_prefix(prompt_category, ""));
+        // The semantic block takes ALL input left after findings + system +
+        // prefix — no separate semantic ratio. Lowering finding_token_ratio (or
+        // raising utilization) directly widens this, fitting more canonicals per
+        // prompt and reducing the number of candidate chunks.
+        let effective = self
             .input_token_budget
             .saturating_sub(system_tokens + stable_prefix_tokens + self.finding_token_target);
-        let effective = self.semantic_token_target.min(available_for_candidates);
 
         if effective == 0 {
             return Err(KgError::other(format!(
@@ -448,7 +544,9 @@ impl FindingLinkBudgets {
         model: &OpenAIModel,
         context: &FindingLinkContext,
     ) -> Result<usize> {
-        let system_tokens = count_tokens(model, prompts::GENERAL_ROLE_SYSTEM);
+        let system_tokens = model
+            .config
+            .count_tokens_lossy(prompts::GENERAL_ROLE_SYSTEM);
         let available = self
             .input_token_budget
             .saturating_sub(system_tokens + context.prompt_prefix_tokens);
@@ -478,289 +576,285 @@ struct AggregatedFindingLinkResult {
     semantic_links: BTreeMap<i32, PersistedSemanticLink>,
 }
 
-pub async fn link_pending_findings(
-    db: &HistoricalDatabase,
-    llm: &LLM,
-    options: FindingLinkOptions,
-) -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tokio::task::JoinSet;
+impl FindingLinkOptions {
+    pub async fn link_pending_findings(self, db: &HistoricalDatabase, llm: &LLM) -> Result<()> {
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio::task::JoinSet;
 
-    let pending_findings = db
-        .list_findings_for_linking(options.include_unlinked)
-        .await?;
-    if pending_findings.is_empty() {
-        tracing::info!("No findings pending linking.");
-        return Ok(());
-    }
-
-    let total_pending_findings = pending_findings.len();
-    let concurrency = options.concurrency.max(1);
-    let max_response_attempts = options.max_response_attempts.max(1);
-    let agent_options = AgentRunOptions::new(options.max_agent_steps);
-    let budgets = FindingLinkBudgets::from_options(&llm.model, options);
-    tracing::info!(
-        "Will link {} pending findings (concurrency={}, input token budget={}, target semantic tokens={}, target finding tokens={}, max response attempts={}, max agent steps={})",
-        total_pending_findings,
-        concurrency,
-        budgets.input_token_budget,
-        budgets.semantic_token_target,
-        budgets.finding_token_target,
-        max_response_attempts,
-        options.max_agent_steps,
-    );
-
-    let plan = FindingLinkContextPlan::from_pending_findings(pending_findings.clone());
-    let execution_plan = plan.materialize(db, &llm.model, &budgets).await?;
-    let mut aggregated_results: HashMap<i32, AggregatedFindingLinkResult> = pending_findings
-        .iter()
-        .map(|pending| {
-            (
-                pending.finding_id,
-                AggregatedFindingLinkResult {
-                    finding_id: pending.finding_id,
-                    link_target_finding_id: pending.link_target_finding_id,
-                    expected_contexts: execution_plan.expected_context_count(pending.finding_id),
-                    completed_contexts: 0,
-                    semantic_links: BTreeMap::new(),
-                },
-            )
-        })
-        .collect();
-    let task_count = execution_plan.task_count();
-    let FindingLinkExecutionPlan {
-        contexts, batches, ..
-    } = execution_plan;
-
-    tracing::info!(
-        "Prepared {} finding-link batch(es) covering {} finding-context task(s) for {} pending findings",
-        batches.len(),
-        task_count,
-        total_pending_findings
-    );
-
-    let mut failed_findings = HashSet::new();
-    let mut committed_findings: HashSet<i32> = HashSet::new();
-    if concurrency <= 1 {
-        for batch in batches {
-            let key = batch.context_key.clone();
-            let context = contexts.get(&key).ok_or_else(|| {
-                KgError::other(format!("Missing link context for key '{}'", key.label()))
-            })?;
-
-            let runner = FindingLinkBatchAgentRunner {
-                llm: llm.clone(),
-                batch: &batch,
-                context: context.as_ref(),
-                agent_options: agent_options.clone(),
-                max_response_attempts,
-            };
-            match runner.run().await {
-                Ok(results) => {
-                    // Mirror the concurrent branch: persist this batch's
-                    // per-finding sfl rows BEFORE the in-memory merge.
-                    // `commit_completed_findings` only writes the
-                    // `finding_link_status` row — it relies on this
-                    // call to have already landed the link edges, so
-                    // the sfl payload must hit DB here or it's lost.
-                    persist_batch_partials(db, &failed_findings, &committed_findings, &results)
-                        .await;
-                    if let Err(e) =
-                        merge_finding_link_batch_results(&mut aggregated_results, results)
-                    {
-                        mark_batch_findings_failed(&mut failed_findings, &batch);
-                        tracing::error!(
-                            "Failed to aggregate finding-link batch {} ({} finding-category task(s)): {}",
-                            &batch,
-                            batch.entries.len(),
-                            e
-                        );
-                    } else {
-                        commit_completed_findings(
-                            db,
-                            &mut aggregated_results,
-                            &mut failed_findings,
-                            &mut committed_findings,
-                            batch.entries.iter().map(|e| e.pending.finding_id),
-                        )
-                        .await;
-                    }
-                }
-                Err(e) => {
-                    mark_batch_findings_failed(&mut failed_findings, &batch);
-                    tracing::error!(
-                        "Failed to link finding batch {} ({} finding-category task(s)): {}",
-                        &batch,
-                        batch.entries.len(),
-                        e
-                    );
-                }
-            }
+        let pending_findings = db.list_findings_for_linking(self.include_unlinked).await?;
+        if pending_findings.is_empty() {
+            tracing::info!("No findings pending linking.");
+            return Ok(());
         }
-    } else {
-        let contexts = Arc::new(contexts);
-        let (tx, rx) = async_channel::bounded::<FindingLinkBatch>(batches.len() + 1);
-        let (out_tx, mut out_rx) = mpsc::channel::<(
-            FindingLinkBatch,
-            Result<Vec<PersistedFindingLinkResult>>,
-        )>(concurrency + 1);
-        let mut handles = JoinSet::new();
 
-        for _ in 0..concurrency {
-            let rx = rx.clone();
-            let out = out_tx.clone();
-            let llm_clone = llm.clone();
-            let contexts = contexts.clone();
-            let worker_agent_options = agent_options.clone();
+        let total_pending_findings = pending_findings.len();
+        let concurrency = self.concurrency.max(1);
+        let max_response_attempts = self.max_response_attempts.max(1);
+        let agent_options = AgentRunOptions::new(self.max_agent_steps);
+        let budgets = FindingLinkBudgets::from_options(&llm.model, self);
+        tracing::info!(
+            "Will link {} pending findings (concurrency={}, input token budget={}, finding token budget={}, semantic budget=rest of input after findings, max response attempts={}, max agent steps={})",
+            total_pending_findings,
+            concurrency,
+            budgets.input_token_budget,
+            budgets.finding_token_target,
+            max_response_attempts,
+            self.max_agent_steps,
+        );
 
-            handles.spawn(async move {
-                while let Ok(batch) = rx.recv().await {
-                    let result = match contexts.get(&batch.context_key) {
-                        Some(context) => {
-                            let runner = FindingLinkBatchAgentRunner {
-                                llm: llm_clone.clone(),
-                                batch: &batch,
-                                context: context.as_ref(),
-                                agent_options: worker_agent_options.clone(),
-                                max_response_attempts,
-                            };
-                            runner.run().await
+        let plan = FindingLinkContextPlan::from_pending_findings(pending_findings.clone());
+        let execution_plan = plan.materialize(db, &llm.model, &budgets).await?;
+        let mut aggregated_results: HashMap<i32, AggregatedFindingLinkResult> = pending_findings
+            .iter()
+            .map(|pending| {
+                (
+                    pending.finding_id,
+                    AggregatedFindingLinkResult {
+                        finding_id: pending.finding_id,
+                        link_target_finding_id: pending.link_target_finding_id,
+                        expected_contexts: execution_plan
+                            .expected_context_count(pending.finding_id),
+                        completed_contexts: 0,
+                        semantic_links: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        let task_count = execution_plan.task_count();
+        let FindingLinkExecutionPlan {
+            contexts, batches, ..
+        } = execution_plan;
+
+        tracing::info!(
+            "Prepared {} finding-link batch(es) covering {} finding-context task(s) for {} pending findings",
+            batches.len(),
+            task_count,
+            total_pending_findings
+        );
+
+        let mut failed_findings = HashSet::new();
+        let mut committed_findings: HashSet<i32> = HashSet::new();
+        if concurrency <= 1 {
+            for batch in batches {
+                let key = batch.context_key.clone();
+                let context = contexts.get(&key).ok_or_else(|| {
+                    KgError::other(format!("Missing link context for key '{}'", key.label()))
+                })?;
+
+                let runner = FindingLinkBatchAgentRunner {
+                    llm: llm.clone(),
+                    batch: &batch,
+                    context: context.as_ref(),
+                    agent_options: agent_options.clone(),
+                    max_response_attempts,
+                };
+                match runner.run().await {
+                    Ok(results) => {
+                        // Mirror the concurrent branch: persist this batch's
+                        // per-finding sfl rows BEFORE the in-memory merge.
+                        // `commit_completed_findings` only writes the
+                        // `finding_link_status` row — it relies on this
+                        // call to have already landed the link edges, so
+                        // the sfl payload must hit DB here or it's lost.
+                        persist_batch_partials(db, &failed_findings, &committed_findings, &results)
+                            .await;
+                        if let Err(e) =
+                            merge_finding_link_batch_results(&mut aggregated_results, results)
+                        {
+                            mark_batch_findings_failed(&mut failed_findings, &batch);
+                            tracing::error!(
+                                "Failed to aggregate finding-link batch {} ({} finding-category task(s)): {}",
+                                &batch,
+                                batch.entries.len(),
+                                e
+                            );
+                        } else {
+                            commit_completed_findings(
+                                db,
+                                &mut aggregated_results,
+                                &mut failed_findings,
+                                &mut committed_findings,
+                                batch.entries.iter().map(|e| e.pending.finding_id),
+                            )
+                            .await;
                         }
-                        None => Err(KgError::other(format!(
-                            "Missing link context for key '{}'",
-                            batch.context_key.label()
-                        ))),
-                    };
-
-                    out.send((batch, result))
-                        .await
-                        .expect("can not send finding link batch result");
-                }
-
-                Ok::<_, KgError>(())
-            });
-        }
-        drop(out_tx);
-        drop(rx);
-
-        for batch in batches {
-            tx.send(batch)
-                .await
-                .expect("fail to send out finding link batch");
-        }
-        drop(tx);
-
-        while let Some(handle) = out_rx.recv().await {
-            let (batch, results) = handle;
-            match results {
-                Ok(results) => {
-                    // Durably persist this batch's per-finding decisions
-                    // before merging into the in-memory aggregate. A
-                    // kill / billing-cap abort here leaves the sfl rows
-                    // in place; the finding stays out of
-                    // `finding_link_status` until the last batch
-                    // completes, so downstream consumers don't see the
-                    // partial state. Without this step the entire run's
-                    // work would live in `aggregated_results` only and
-                    // evaporate on exit.
-                    persist_batch_partials(db, &failed_findings, &committed_findings, &results)
-                        .await;
-                    if let Err(e) =
-                        merge_finding_link_batch_results(&mut aggregated_results, results)
-                    {
+                    }
+                    Err(e) => {
                         mark_batch_findings_failed(&mut failed_findings, &batch);
                         tracing::error!(
-                            "Failed to aggregate finding-link batch {} ({} finding-category task(s)): {}",
+                            "Failed to link finding batch {} ({} finding-category task(s)): {}",
                             &batch,
                             batch.entries.len(),
                             e
                         );
-                    } else {
-                        commit_completed_findings(
-                            db,
-                            &mut aggregated_results,
-                            &mut failed_findings,
-                            &mut committed_findings,
-                            batch.entries.iter().map(|e| e.pending.finding_id),
-                        )
-                        .await;
                     }
                 }
-                Err(e) => {
-                    mark_batch_findings_failed(&mut failed_findings, &batch);
-                    tracing::error!(
-                        "Finding-link batch {} ({} finding-category task(s)) failed: {}",
-                        &batch,
-                        batch.entries.len(),
-                        e
-                    );
+            }
+        } else {
+            let contexts = Arc::new(contexts);
+            let (tx, rx) = async_channel::bounded::<FindingLinkBatch>(batches.len() + 1);
+            let (out_tx, mut out_rx) = mpsc::channel::<(
+                FindingLinkBatch,
+                Result<Vec<PersistedFindingLinkResult>>,
+            )>(concurrency + 1);
+            let mut handles = JoinSet::new();
+
+            for _ in 0..concurrency {
+                let rx = rx.clone();
+                let out = out_tx.clone();
+                let llm_clone = llm.clone();
+                let contexts = contexts.clone();
+                let worker_agent_options = agent_options.clone();
+
+                handles.spawn(async move {
+                    while let Ok(batch) = rx.recv().await {
+                        let result = match contexts.get(&batch.context_key) {
+                            Some(context) => {
+                                let runner = FindingLinkBatchAgentRunner {
+                                    llm: llm_clone.clone(),
+                                    batch: &batch,
+                                    context: context.as_ref(),
+                                    agent_options: worker_agent_options.clone(),
+                                    max_response_attempts,
+                                };
+                                runner.run().await
+                            }
+                            None => Err(KgError::other(format!(
+                                "Missing link context for key '{}'",
+                                batch.context_key.label()
+                            ))),
+                        };
+
+                        out.send((batch, result))
+                            .await
+                            .expect("can not send finding link batch result");
+                    }
+
+                    Ok::<_, KgError>(())
+                });
+            }
+            drop(out_tx);
+            drop(rx);
+
+            for batch in batches {
+                tx.send(batch)
+                    .await
+                    .expect("fail to send out finding link batch");
+            }
+            drop(tx);
+
+            while let Some(handle) = out_rx.recv().await {
+                let (batch, results) = handle;
+                match results {
+                    Ok(results) => {
+                        // Durably persist this batch's per-finding decisions
+                        // before merging into the in-memory aggregate. A
+                        // kill / billing-cap abort here leaves the sfl rows
+                        // in place; the finding stays out of
+                        // `finding_link_status` until the last batch
+                        // completes, so downstream consumers don't see the
+                        // partial state. Without this step the entire run's
+                        // work would live in `aggregated_results` only and
+                        // evaporate on exit.
+                        persist_batch_partials(db, &failed_findings, &committed_findings, &results)
+                            .await;
+                        if let Err(e) =
+                            merge_finding_link_batch_results(&mut aggregated_results, results)
+                        {
+                            mark_batch_findings_failed(&mut failed_findings, &batch);
+                            tracing::error!(
+                                "Failed to aggregate finding-link batch {} ({} finding-category task(s)): {}",
+                                &batch,
+                                batch.entries.len(),
+                                e
+                            );
+                        } else {
+                            commit_completed_findings(
+                                db,
+                                &mut aggregated_results,
+                                &mut failed_findings,
+                                &mut committed_findings,
+                                batch.entries.iter().map(|e| e.pending.finding_id),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        mark_batch_findings_failed(&mut failed_findings, &batch);
+                        tracing::error!(
+                            "Finding-link batch {} ({} finding-category task(s)) failed: {}",
+                            &batch,
+                            batch.entries.len(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            while let Some(handle) = handles.join_next().await {
+                match handle {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("Finding-link worker task failed: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!("Finding-link worker task panicked: {}", e);
+                    }
                 }
             }
         }
 
-        while let Some(handle) = handles.join_next().await {
-            match handle {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!("Finding-link worker task failed: {}", e);
-                }
-                Err(e) => {
-                    tracing::error!("Finding-link worker task panicked: {}", e);
-                }
+        let final_results = finalize_finding_link_results(aggregated_results, &mut failed_findings);
+        for result in final_results {
+            if let Err(e) = db.write_finding_link_result(&result).await {
+                failed_findings.insert(result.finding_id);
+                tracing::error!(
+                    "Failed to save finding links for #{}: {}",
+                    result.finding_id,
+                    e
+                );
             }
         }
-    }
 
-    let final_results = finalize_finding_link_results(aggregated_results, &mut failed_findings);
-    for result in final_results {
-        if let Err(e) = db.write_finding_link_result(&result).await {
-            failed_findings.insert(result.finding_id);
-            tracing::error!(
-                "Failed to save finding links for #{}: {}",
-                result.finding_id,
-                e
+        if !failed_findings.is_empty() {
+            tracing::warn!(
+                "Finding linking failed for {} finding(s)",
+                failed_findings.len()
             );
         }
-    }
 
-    if !failed_findings.is_empty() {
-        tracing::warn!(
-            "Finding linking failed for {} finding(s)",
-            failed_findings.len()
-        );
-    }
+        let findings_without_links = db.list_processed_findings_without_semantic_links().await?;
+        if !findings_without_links.is_empty() {
+            let preview = findings_without_links
+                .iter()
+                .take(20)
+                .map(|finding_id| format!("finding-{finding_id}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remainder = findings_without_links.len().saturating_sub(20);
+            let more = if remainder > 0 {
+                format!(" and {remainder} more")
+            } else {
+                String::new()
+            };
+            let retry_hint = if self.include_unlinked {
+                "These findings were included in this run because `--include-unlinked` was enabled, but they still ended up without semantic links."
+            } else {
+                "To retry just these findings, run `knowdit link --include-unlinked`."
+            };
+            tracing::warn!(
+                "{} processed finding(s) still have no semantic links after this run: {}{}. {}",
+                findings_without_links.len(),
+                preview,
+                more,
+                retry_hint,
+            );
+        }
 
-    let findings_without_links = db.list_processed_findings_without_semantic_links().await?;
-    if !findings_without_links.is_empty() {
-        let preview = findings_without_links
-            .iter()
-            .take(20)
-            .map(|finding_id| format!("finding-{finding_id}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let remainder = findings_without_links.len().saturating_sub(20);
-        let more = if remainder > 0 {
-            format!(" and {remainder} more")
-        } else {
-            String::new()
-        };
-        let retry_hint = if options.include_unlinked {
-            "These findings were included in this run because `--include-unlinked` was enabled, but they still ended up without semantic links."
-        } else {
-            "To retry just these findings, run `knowdit link --include-unlinked`."
-        };
-        tracing::warn!(
-            "{} processed finding(s) still have no semantic links after this run: {}{}. {}",
-            findings_without_links.len(),
-            preview,
-            more,
-            retry_hint,
-        );
+        tracing::info!("Finding linking complete.");
+        Ok(())
     }
-
-    tracing::info!("Finding linking complete.");
-    Ok(())
 }
 
 fn partition_finding_link_entries(
@@ -771,11 +865,17 @@ fn partition_finding_link_entries(
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_tokens = 0usize;
+    // Tokens left on the table each time the COUNT cap closed a batch before the
+    // token budget was full (window under-filled because of the cap, not lack of room).
+    let mut count_capped_slack: Vec<usize> = Vec::new();
 
     for entry in entries {
         let count_exceeded = current.len() >= max_count;
         let tokens_exceeded = current_tokens + entry.token_count > token_budget;
         if !current.is_empty() && (count_exceeded || tokens_exceeded) {
+            if count_exceeded && !tokens_exceeded {
+                count_capped_slack.push(token_budget.saturating_sub(current_tokens));
+            }
             batches.push(current);
             current = Vec::new();
             current_tokens = 0;
@@ -789,25 +889,48 @@ fn partition_finding_link_entries(
         batches.push(current);
     }
 
+    warn_count_cap_waste(
+        "finding",
+        "--max-findings-per-batch",
+        "raise --finding-token-ratio",
+        max_count,
+        token_budget,
+        &count_capped_slack,
+    );
+
     batches
 }
 
 fn partition_finding_link_candidate_groups(
     groups: Vec<FindingLinkCandidateGroup>,
     token_budget: usize,
+    max_count: usize,
 ) -> Vec<Vec<FindingLinkCandidateEntry>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_tokens = 0usize;
+    let mut current_count = 0usize;
+    // Tokens left on the table each time the COUNT cap closed a chunk before the
+    // token budget was full (window under-filled because of the cap, not lack of room).
+    let mut count_capped_slack: Vec<usize> = Vec::new();
 
     for group in groups {
-        if !current.is_empty() && current_tokens + group.token_count > token_budget {
+        // Split on EITHER limit: token budget or candidate count. A group is one
+        // canonical (+ its aliases), so `current_count` tracks canonicals/chunk.
+        let over_tokens = current_tokens + group.token_count > token_budget;
+        let over_count = current_count + 1 > max_count;
+        if !current.is_empty() && (over_tokens || over_count) {
+            if over_count && !over_tokens {
+                count_capped_slack.push(token_budget.saturating_sub(current_tokens));
+            }
             batches.push(current);
             current = Vec::new();
             current_tokens = 0;
+            current_count = 0;
         }
 
         current_tokens += group.token_count;
+        current_count += 1;
         current.extend(group.entries);
     }
 
@@ -815,7 +938,51 @@ fn partition_finding_link_candidate_groups(
         batches.push(current);
     }
 
+    warn_count_cap_waste(
+        "semantic",
+        "--max-semantics-per-batch",
+        "lower --link-context-window-utilization or raise --finding-token-ratio",
+        max_count,
+        token_budget,
+        &count_capped_slack,
+    );
+
     batches
+}
+
+/// Warn when a COUNT cap closed one or more chunks/batches *before* the token
+/// budget filled — i.e. the window was left partly empty because of the cap,
+/// not because it ran out of room. Reports how much budget went unused so the
+/// operator can raise the cap (to pack more) or shrink the token budget (to fill
+/// the window without a cap). Silent when no cap bound (`count_capped_slack`
+/// empty), which is the case for the default unbounded caps.
+fn warn_count_cap_waste(
+    kind: &str,
+    cap_flag: &str,
+    shrink_budget_hint: &str,
+    max_count: usize,
+    token_budget: usize,
+    count_capped_slack: &[usize],
+) {
+    if count_capped_slack.is_empty() || token_budget == 0 {
+        return;
+    }
+    let n = count_capped_slack.len();
+    let total: usize = count_capped_slack.iter().sum();
+    let avg = total / n;
+    let pct = avg as f64 / token_budget as f64 * 100.0;
+    tracing::warn!(
+        "{} count cap {}={} closed {} chunk(s) before filling the {}-token budget: ~{} tokens unused total (~{}/chunk, ~{:.0}% of the budget wasted per capped chunk). The count cap bit before the token budget — raise it to pack more per prompt, or shrink the token budget ({}) so the window fills without a cap.",
+        kind,
+        cap_flag,
+        max_count,
+        n,
+        token_budget,
+        total,
+        avg,
+        pct,
+        shrink_budget_hint
+    );
 }
 
 fn group_finding_link_candidate_entries(
@@ -869,75 +1036,149 @@ fn group_finding_link_candidate_entries(
     Ok(groups)
 }
 
-fn build_finding_link_batches(
-    model: &OpenAIModel,
-    pending_by_context: BTreeMap<FindingLinkContextKey, Vec<PendingFindingForLinking>>,
-    contexts: &BTreeMap<FindingLinkContextKey, std::sync::Arc<FindingLinkContext>>,
-    budgets: &FindingLinkBudgets,
-) -> Result<Vec<FindingLinkBatch>> {
-    let mut batches = Vec::new();
+/// A canonical finding's folded raw children, split by field, so the finding
+/// entry can render its full merged variants in raw-children mode (parity with
+/// the semantic candidate side). Empty in compact mode.
+#[derive(Default)]
+struct FindingRawChildren {
+    root_causes: Vec<String>,
+    descriptions: Vec<String>,
+    patterns: Vec<String>,
+    exploits: Vec<String>,
+}
 
-    for (context_key, pending_findings) in pending_by_context {
-        let context = contexts.get(&context_key).ok_or_else(|| {
-            KgError::other(format!(
-                "Missing link context for key '{}'",
-                context_key.label()
-            ))
-        })?;
-        let finding_token_budget = budgets.finding_token_budget(model, context.as_ref())?;
-
-        let entries = pending_findings
-            .into_iter()
-            .map(|pending| {
-                let prompt_finding_id = prompt_finding_id(pending.finding_id);
-                let prompt_body = prompts::finding_link_finding_entry(
-                    &prompt_finding_id,
-                    &pending.categories,
-                    &pending.finding.title,
-                    pending.finding.severity,
-                    pending.finding.category,
-                    &pending.finding.subcategory,
-                    &pending.finding.root_cause,
-                    &pending.finding.description,
-                    &pending.finding.patterns,
-                    &pending.finding.exploits,
-                );
-                let token_count = count_tokens(model, &prompt_body);
-                FindingLinkBatchEntry {
-                    pending,
-                    prompt_finding_id,
-                    prompt_body,
-                    token_count,
-                }
-            })
-            .collect();
-
-        for batch_entries in partition_finding_link_entries(
-            entries,
-            finding_token_budget,
-            budgets.max_findings_per_batch,
-        ) {
-            let finding_token_count = batch_entries.iter().map(|entry| entry.token_count).sum();
-            if finding_token_count > finding_token_budget {
-                tracing::warn!(
-                    "Finding-link batch {} exceeds finding token budget {} with {} finding tokens; sending as singleton batch",
-                    finding_link_batch_entry_span(&batch_entries),
-                    finding_token_budget,
-                    finding_token_count
-                );
-            }
-
-            batches.push(FindingLinkBatch {
-                context_key: context_key.clone(),
-                entries: batch_entries,
-                finding_token_count,
-                finding_token_budget,
-                input_token_budget: budgets.input_token_budget,
-            });
-        }
+/// Prefix a folded raw's field text with its source name — `from raw "<name>":
+/// <text>` — so the merged-variant block reads as distinct, named sub-mechanisms
+/// (restores the labelling the anonymous `Merged variants` bullets had dropped).
+pub(crate) fn label_variant(name: &str, text: String) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        format!("additional context: {text}")
+    } else {
+        format!("additional context (from raw \"{name}\"): {text}")
     }
+}
 
-    Ok(batches)
+impl FindingRawChildren {
+    /// Render each finding field as the bounded canonical value followed by up
+    /// to `cap` folded raw children (each capped to `per_child_chars`).
+    /// Returns `(root_cause, description, patterns, exploits)`.
+    fn render(
+        &self,
+        finding: &ExtractedFinding,
+        cap: usize,
+        per_child_chars: usize,
+    ) -> (String, String, String, String) {
+        use knowdit_kg_model::render::render_with_variants_capped as render;
+        (
+            render(&finding.root_cause, &self.root_causes, cap, per_child_chars),
+            render(
+                &finding.description,
+                &self.descriptions,
+                cap,
+                per_child_chars,
+            ),
+            render(&finding.patterns, &self.patterns, cap, per_child_chars),
+            render(&finding.exploits, &self.exploits, cap, per_child_chars),
+        )
+    }
+}
+
+impl FindingLinkBudgets {
+    fn build_finding_link_batches(
+        &self,
+        model: &OpenAIModel,
+        pending_by_context: BTreeMap<FindingLinkContextKey, Vec<PendingFindingForLinking>>,
+        contexts: &BTreeMap<FindingLinkContextKey, std::sync::Arc<FindingLinkContext>>,
+        finding_children: &HashMap<i32, FindingRawChildren>,
+    ) -> Result<Vec<FindingLinkBatch>> {
+        let mut batches = Vec::new();
+
+        for (context_key, pending_findings) in pending_by_context {
+            let context = contexts.get(&context_key).ok_or_else(|| {
+                KgError::other(format!(
+                    "Missing link context for key '{}'",
+                    context_key.label()
+                ))
+            })?;
+            let finding_token_budget = self.finding_token_budget(model, context.as_ref())?;
+
+            let entries = pending_findings
+                .into_iter()
+                .map(|pending| {
+                    let prompt_finding_id = prompt_finding_id(pending.finding_id);
+                    // Raw-children mode renders the canonical fields + folded raw
+                    // children; compact mode (empty map) renders canonical only.
+                    let prompt_body = match finding_children.get(&pending.finding_id) {
+                        Some(children) => {
+                            let (root_cause, description, patterns, exploits) = children.render(
+                                &pending.finding,
+                                self.variant_render_cap,
+                                self.raw_child_char_cap,
+                            );
+                            prompts::finding_link_finding_entry(
+                                &prompt_finding_id,
+                                &pending.categories,
+                                &pending.finding.title,
+                                pending.finding.severity,
+                                pending.finding.category,
+                                &pending.finding.subcategory,
+                                &root_cause,
+                                &description,
+                                &patterns,
+                                &exploits,
+                            )
+                        }
+                        None => prompts::finding_link_finding_entry(
+                            &prompt_finding_id,
+                            &pending.categories,
+                            &pending.finding.title,
+                            pending.finding.severity,
+                            pending.finding.category,
+                            &pending.finding.subcategory,
+                            &pending.finding.root_cause,
+                            &pending.finding.description,
+                            &pending.finding.patterns,
+                            &pending.finding.exploits,
+                        ),
+                    };
+                    let token_count = model.config.count_tokens_lossy(&prompt_body);
+                    FindingLinkBatchEntry {
+                        pending,
+                        prompt_finding_id,
+                        prompt_body,
+                        token_count,
+                    }
+                })
+                .collect();
+
+            for batch_entries in partition_finding_link_entries(
+                entries,
+                finding_token_budget,
+                self.max_findings_per_batch,
+            ) {
+                let finding_token_count = batch_entries.iter().map(|entry| entry.token_count).sum();
+                if finding_token_count > finding_token_budget {
+                    tracing::warn!(
+                        "Finding-link batch {} exceeds finding token budget {} with {} finding tokens; sending as singleton batch",
+                        finding_link_batch_entry_span(&batch_entries),
+                        finding_token_budget,
+                        finding_token_count
+                    );
+                }
+
+                batches.push(FindingLinkBatch {
+                    context_key: context_key.clone(),
+                    entries: batch_entries,
+                    finding_token_count,
+                    finding_token_budget,
+                    input_token_budget: self.input_token_budget,
+                });
+            }
+        }
+
+        Ok(batches)
+    }
 }
 
 async fn build_finding_link_contexts(
@@ -951,15 +1192,45 @@ async fn build_finding_link_contexts(
     // categories. The empty key marks this all-canonical pass — there are no
     // merged aliases in the candidate set, so the canonical-target indirection
     // collapses to identity.
-    let candidates: Vec<SemanticLinkCandidate> = db
-        .all_canonical_semantic_link_candidates()
-        .await?
+    // Merged-variant entries per canonical, so each candidate renders its folded
+    // raws alongside the (bounded) canonical description. Compact mode uses the
+    // short `appended_description` deltas; raw-children mode uses each folded
+    // child's full raw description (bounded per-entry by the char cap).
+    let candidate_nodes = db.all_canonical_semantic_link_candidates().await?;
+    let mut variant_notes: HashMap<i32, Vec<String>> = if budgets.render_raw_children {
+        let candidate_ids: Vec<i32> = candidate_nodes.iter().map(|node| node.id).collect();
+        db.semantic_children_with_notes(&candidate_ids)
+            .await?
+            .into_iter()
+            .map(|(canonical_id, children)| {
+                (
+                    canonical_id,
+                    children
+                        .into_iter()
+                        .map(|(child, _note)| label_variant(&child.name, child.description))
+                        .collect(),
+                )
+            })
+            .collect()
+    } else {
+        db.semantic_merge_appended_notes().await?
+    };
+    let candidates: Vec<SemanticLinkCandidate> = candidate_nodes
         .into_iter()
+        // merge-kg ③b: restrict to the destination's pre-import (native)
+        // canonicals so a source finding is only cross-linked against the
+        // opposite KG's semantics; its own KG's links were carried verbatim.
+        .filter(|node| {
+            budgets
+                .candidate_max_semantic_id
+                .is_none_or(|max| node.id <= max)
+        })
         .map(|node| SemanticLinkCandidate {
             candidate_id: format!("sem-{}", node.id),
             canonical_semantic_id: node.id,
             is_canonical: true,
             category: node.category,
+            variant_notes: variant_notes.remove(&node.id).unwrap_or_default(),
             name: node.name,
             definition: node.definition,
             description: node.description,
@@ -969,14 +1240,17 @@ async fn build_finding_link_contexts(
     let candidate_entries: Vec<FindingLinkCandidateEntry> = candidates
         .into_iter()
         .map(|candidate| {
-            let prompt_body = render_finding_link_candidate(&candidate);
+            let prompt_body = candidate.render(
+                budgets.variant_render_cap,
+                budgets.effective_child_char_cap(),
+            );
             FindingLinkCandidateEntry {
                 candidate_id: candidate.candidate_id,
                 canonical_semantic_id: candidate.canonical_semantic_id,
                 is_canonical: candidate.is_canonical,
                 category: candidate.category,
                 name: candidate.name,
-                token_count: count_tokens(model, &prompt_body),
+                token_count: model.config.count_tokens_lossy(&prompt_body),
                 prompt_body,
             }
         })
@@ -992,8 +1266,11 @@ async fn build_finding_link_contexts(
     let semantic_token_budget =
         budgets.semantic_token_budget(model, base_context_key.prompt_category())?;
     let candidate_groups = group_finding_link_candidate_entries(candidate_entries)?;
-    let candidate_chunks =
-        partition_finding_link_candidate_groups(candidate_groups, semantic_token_budget);
+    let candidate_chunks = partition_finding_link_candidate_groups(
+        candidate_groups,
+        semantic_token_budget,
+        budgets.max_semantics_per_batch,
+    );
 
     Ok(candidate_chunks
         .into_iter()
@@ -1006,17 +1283,23 @@ async fn build_finding_link_contexts(
         .collect())
 }
 
-fn render_finding_link_candidate(candidate: &SemanticLinkCandidate) -> String {
-    // After the all-canonical pass refactor, every candidate is canonical and
-    // `is_canonical` is always true. Kept as one render path for simplicity.
-    format!(
-        "Candidate ID: {}\nCategory: {}\nName: {}\nDefinition: {}\nDescription: {}\n\n",
-        candidate.candidate_id,
-        candidate.category,
-        candidate.name,
-        candidate.definition,
-        candidate.description
-    )
+impl SemanticLinkCandidate {
+    /// Render this candidate for the link prompt: the bounded canonical
+    /// description followed by up to `variant_cap` merged-variant entries
+    /// (compact deltas or full raw children, per the caller), each capped to
+    /// `per_child_char_cap` chars.
+    pub(crate) fn render(&self, variant_cap: usize, per_child_char_cap: usize) -> String {
+        let description = knowdit_kg_model::render::render_with_variants_capped(
+            &self.description,
+            &self.variant_notes,
+            variant_cap,
+            per_child_char_cap,
+        );
+        format!(
+            "Candidate ID: {}\nCategory: {}\nName: {}\nDefinition: {}\nDescription: {}\n\n",
+            self.candidate_id, self.category, self.name, self.definition, description
+        )
+    }
 }
 
 fn merge_finding_link_batch_results(
@@ -1659,18 +1942,24 @@ pub async fn retro_link_pending_semantics(
                 canonical_semantic_id: node.id,
                 is_canonical: true,
                 category: node.category,
+                // Retro-linked semantics are freshly-imported canonicals with
+                // no folded children yet, so there are no variant notes.
+                variant_notes: Vec::new(),
                 name: node.name.clone(),
                 definition: node.definition.clone(),
                 description: node.description.clone(),
             };
-            let prompt_body = render_finding_link_candidate(&candidate);
+            let prompt_body = candidate.render(
+                budgets.variant_render_cap,
+                budgets.effective_child_char_cap(),
+            );
             FindingLinkCandidateEntry {
                 candidate_id: candidate.candidate_id,
                 canonical_semantic_id: candidate.canonical_semantic_id,
                 is_canonical: candidate.is_canonical,
                 category: candidate.category,
                 name: candidate.name,
-                token_count: count_tokens(model, &prompt_body),
+                token_count: model.config.count_tokens_lossy(&prompt_body),
                 prompt_body,
             }
         })
@@ -1701,7 +1990,7 @@ pub async fn retro_link_pending_semantics(
                 &pending.finding.patterns,
                 &pending.finding.exploits,
             );
-            let token_count = count_tokens(model, &prompt_body);
+            let token_count = model.config.count_tokens_lossy(&prompt_body);
             FindingLinkBatchEntry {
                 pending,
                 prompt_finding_id,
@@ -2033,6 +2322,34 @@ mod tests {
     }
 
     #[test]
+    fn partition_finding_link_candidate_groups_honours_count_cap() {
+        // Token budget is unlimited, but the count cap (2) forces a split.
+        let group = |id: i32| FindingLinkCandidateGroup {
+            canonical_semantic_id: id,
+            category: DeFiCategory::Dexes,
+            name: format!("Canonical {id}"),
+            token_count: 10,
+            entries: vec![FindingLinkCandidateEntry {
+                candidate_id: format!("sem-{id}"),
+                canonical_semantic_id: id,
+                is_canonical: true,
+                category: DeFiCategory::Dexes,
+                name: format!("Canonical {id}"),
+                prompt_body: format!("candidate-{id}"),
+                token_count: 10,
+            }],
+        };
+        let batches = partition_finding_link_candidate_groups(
+            vec![group(1), group(2), group(3)],
+            usize::MAX,
+            2,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    #[test]
     fn partition_finding_link_candidate_groups_keeps_aliases_with_canonical() {
         let batches = partition_finding_link_candidate_groups(
             vec![
@@ -2079,6 +2396,7 @@ mod tests {
                 },
             ],
             60,
+            usize::MAX,
         );
 
         assert_eq!(batches.len(), 2);

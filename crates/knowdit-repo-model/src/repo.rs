@@ -35,11 +35,12 @@ use crate::db::{
     finding_review as finding_review_model, function as function_model,
     function_call as function_call_model, function_state_variable as function_state_variable_model,
     harness_run as harness_run_model, historical_finding as historical_finding_model,
+    historical_finding_merge as historical_finding_merge_model,
     historical_semantic as historical_semantic_model,
     historical_semantic_finding_link as historical_semantic_finding_link_model,
-    interface as interface_model, interface_functions as interface_functions_model,
-    line_coverage as line_coverage_model, project_metadata as project_metadata_model,
-    project_semantic as project_semantic_model,
+    historical_semantic_merge as historical_semantic_merge_model, interface as interface_model,
+    interface_functions as interface_functions_model, line_coverage as line_coverage_model,
+    project_metadata as project_metadata_model, project_semantic as project_semantic_model,
     project_semantic_function as project_semantic_function_model, reflection as reflection_model,
     report_finding as report_finding_model, semantic_matched as semantic_matched_model,
     specification as specification_model, specification_regen as specification_regen_model,
@@ -64,6 +65,11 @@ pub struct RepoDatabase {
     db: DatabaseConnection,
     url: String,
     path: Option<PathBuf>,
+    /// Cap on merged-variant notes folded into each mirrored canonical's
+    /// `rendered_*` by [`Self::load_semantic_match_results`]. Defaults to
+    /// [`crate::DEFAULT_VARIANT_RENDER_CAP`]; override via
+    /// [`Self::with_variant_render_cap`].
+    variant_render_cap: usize,
 }
 
 impl RepoDatabase {
@@ -102,7 +108,15 @@ impl RepoDatabase {
             db,
             url,
             path: None,
+            variant_render_cap: crate::DEFAULT_VARIANT_RENDER_CAP,
         })
+    }
+
+    /// Set the merged-variant render cap used by
+    /// [`Self::load_semantic_match_results`] (builder style).
+    pub fn with_variant_render_cap(mut self, cap: usize) -> Self {
+        self.variant_render_cap = cap;
+        self
     }
 
     /// Open from a SQLite path (creates the file if missing). Equivalent to
@@ -114,6 +128,7 @@ impl RepoDatabase {
             db,
             url,
             path: Some(path),
+            variant_render_cap: crate::DEFAULT_VARIANT_RENDER_CAP,
         })
     }
 
@@ -175,6 +190,8 @@ impl RepoDatabase {
             schema.create_table_from_entity(function_state_variable_model::Entity),
             schema.create_table_from_entity(historical_semantic_model::Entity),
             schema.create_table_from_entity(historical_finding_model::Entity),
+            schema.create_table_from_entity(historical_semantic_merge_model::Entity),
+            schema.create_table_from_entity(historical_finding_merge_model::Entity),
             schema.create_table_from_entity(historical_semantic_finding_link_model::Entity),
             schema.create_table_from_entity(semantic_matched_model::Entity),
             schema.create_table_from_entity(project_metadata_model::Entity),
@@ -1253,11 +1270,37 @@ impl RepoDatabase {
 /// [`RepoDatabase::write_semantic_match_results`] can populate
 /// `historical_semantic_finding_link.strength` / `evidence` without a second
 /// pass against the KG.
+/// One raw finding folded into a canonical in the historical KG, mirrored into
+/// the project DB with the merge-edge `appended_*` notes (its concrete delta).
+#[derive(Debug, Clone)]
+pub struct HistoricalFindingChild {
+    pub finding: knowdit_kg_model::db::audit_finding::Model,
+    pub appended_description: String,
+    pub appended_patterns: String,
+    pub appended_exploits: String,
+}
+
+/// One raw semantic folded into a canonical, mirrored with its merge-edge note.
+#[derive(Debug, Clone)]
+pub struct HistoricalSemanticChild {
+    pub node: knowdit_kg_model::db::semantic_node::Model,
+    pub appended_description: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoricalLinkedFinding {
     pub finding: knowdit_kg_model::db::audit_finding::Model,
     pub strength: knowdit_kg_model::link_strength::LinkStrength,
     pub evidence: String,
+    /// Raw findings folded into `finding` (write path: mapper populates them so
+    /// the mirror carries children + edges). Empty on the read path.
+    pub raw_children: Vec<HistoricalFindingChild>,
+    /// `finding`'s fields rendered with their merged-variant deltas (read path:
+    /// `load_semantic_match_results` populates them). Empty on the write path;
+    /// fall back to the raw field when empty.
+    pub rendered_description: String,
+    pub rendered_patterns: String,
+    pub rendered_exploits: String,
 }
 
 /// One historical semantic identified by the Knowledge Mapper, together with
@@ -1269,6 +1312,13 @@ pub struct HistoricalLinkedFinding {
 pub struct HistoricalSemanticRecord {
     pub semantic: knowdit_kg_model::db::semantic_node::Model,
     pub findings: Vec<HistoricalLinkedFinding>,
+    /// Raw semantics folded into `semantic` (write path: mapper populates them).
+    /// Empty on the read path.
+    pub raw_children: Vec<HistoricalSemanticChild>,
+    /// `semantic.description` rendered with its merged-variant deltas (read
+    /// path: `load_semantic_match_results` populates it). Empty on the write
+    /// path; fall back to `semantic.description` when empty.
+    pub rendered_description: String,
 }
 
 /// One mapper-emitted match between a project extract and a historical
@@ -1405,8 +1455,17 @@ impl RepoDatabase {
             .exec(&txn)
             .await
             .wrap_err("failed to clear historical_semantic rows")?;
+        historical_semantic_merge_model::Entity::delete_many()
+            .exec(&txn)
+            .await
+            .wrap_err("failed to clear historical_semantic_merge rows")?;
+        historical_finding_merge_model::Entity::delete_many()
+            .exec(&txn)
+            .await
+            .wrap_err("failed to clear historical_finding_merge rows")?;
 
         let mut inserted_finding_ids = BTreeSet::new();
+        let mut inserted_semantic_ids = BTreeSet::new();
         for record in &set.historicals {
             let mirror: historical_semantic_model::Model = record.semantic.clone().into();
             historical_semantic_model::Entity::insert(historical_semantic_model::ActiveModel {
@@ -1424,6 +1483,7 @@ impl RepoDatabase {
                     record.semantic.id
                 )
             })?;
+            inserted_semantic_ids.insert(record.semantic.id);
 
             for linked in &record.findings {
                 let finding = &linked.finding;
@@ -1463,6 +1523,89 @@ impl RepoDatabase {
                         record.semantic.id, finding.id
                     )
                 })?;
+
+                // Mirror the raw findings folded into this canonical + their
+                // merge-edge notes (child rows deduped across the whole set).
+                for child in &linked.raw_children {
+                    if inserted_finding_ids.insert(child.finding.id) {
+                        let m: historical_finding_model::Model = child.finding.clone().into();
+                        historical_finding_model::Entity::insert(
+                            historical_finding_model::ActiveModel {
+                                id: Set(m.id),
+                                title: Set(m.title),
+                                severity: Set(m.severity),
+                                root_cause: Set(m.root_cause),
+                                description: Set(m.description),
+                                patterns: Set(m.patterns),
+                                exploits: Set(m.exploits),
+                            },
+                        )
+                        .exec(&txn)
+                        .await
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to insert historical_finding child {}",
+                                child.finding.id
+                            )
+                        })?;
+                    }
+                    historical_finding_merge_model::Entity::insert(
+                        historical_finding_merge_model::ActiveModel {
+                            from_finding_id: Set(child.finding.id),
+                            to_finding_id: Set(finding.id),
+                            appended_description: Set(child.appended_description.clone()),
+                            appended_patterns: Set(child.appended_patterns.clone()),
+                            appended_exploits: Set(child.appended_exploits.clone()),
+                        },
+                    )
+                    .exec(&txn)
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to insert historical_finding_merge {}→{}",
+                            child.finding.id, finding.id
+                        )
+                    })?;
+                }
+            }
+
+            // Mirror the raw semantics folded into this canonical + their edges.
+            for child in &record.raw_children {
+                if inserted_semantic_ids.insert(child.node.id) {
+                    let m: historical_semantic_model::Model = child.node.clone().into();
+                    historical_semantic_model::Entity::insert(
+                        historical_semantic_model::ActiveModel {
+                            id: Set(m.id),
+                            name: Set(m.name),
+                            definition: Set(m.definition),
+                            description: Set(m.description),
+                            category: Set(m.category),
+                        },
+                    )
+                    .exec(&txn)
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to insert historical_semantic child {}",
+                            child.node.id
+                        )
+                    })?;
+                }
+                historical_semantic_merge_model::Entity::insert(
+                    historical_semantic_merge_model::ActiveModel {
+                        from_semantic_id: Set(child.node.id),
+                        to_semantic_id: Set(record.semantic.id),
+                        appended_description: Set(child.appended_description.clone()),
+                    },
+                )
+                .exec(&txn)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to insert historical_semantic_merge {}→{}",
+                        child.node.id, record.semantic.id
+                    )
+                })?;
             }
         }
 
@@ -1490,11 +1633,95 @@ impl RepoDatabase {
         Ok(())
     }
 
+    /// Render a mirrored canonical semantic's `description` followed by up to
+    /// `cap` merged-variant notes (`historical_semantic_merge.appended_description`),
+    /// so a consumer sees the bounded representative plus each folded raw's
+    /// concrete delta. Returns `""` if the canonical is absent.
+    pub async fn render_semantic_description(
+        &self,
+        semantic_id: i32,
+        cap: usize,
+    ) -> Result<String> {
+        let Some(canonical) = historical_semantic_model::Entity::find_by_id(semantic_id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic for render")?
+        else {
+            return Ok(String::new());
+        };
+        let notes = self.semantic_merge_notes(semantic_id).await?;
+        Ok(knowdit_kg_model::render::render_with_variants(
+            &canonical.description,
+            &notes,
+            cap,
+        ))
+    }
+
+    /// Render a mirrored canonical finding's `(description, patterns, exploits)`,
+    /// each followed by up to `cap` merged-variant notes from
+    /// `historical_finding_merge`. Returns empty strings if the canonical is absent.
+    pub async fn render_finding_fields(
+        &self,
+        finding_id: i32,
+        cap: usize,
+    ) -> Result<(String, String, String)> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        let Some(canonical) = historical_finding_model::Entity::find_by_id(finding_id)
+            .one(&self.db)
+            .await
+            .wrap_err("failed to load historical_finding for render")?
+        else {
+            return Ok((String::new(), String::new(), String::new()));
+        };
+        let edges = historical_finding_merge_model::Entity::find()
+            .filter(historical_finding_merge_model::Column::ToFindingId.eq(finding_id))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_finding_merge for render")?;
+        let notes = |pick: fn(&historical_finding_merge_model::Model) -> &str| -> Vec<String> {
+            edges
+                .iter()
+                .map(|e| pick(e).trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        };
+        use knowdit_kg_model::render::render_with_variants;
+        Ok((
+            render_with_variants(
+                &canonical.description,
+                &notes(|e| &e.appended_description),
+                cap,
+            ),
+            render_with_variants(&canonical.patterns, &notes(|e| &e.appended_patterns), cap),
+            render_with_variants(&canonical.exploits, &notes(|e| &e.appended_exploits), cap),
+        ))
+    }
+
+    /// Non-empty `appended_description` notes of the raws folded into
+    /// `semantic_id` (via `historical_semantic_merge`).
+    async fn semantic_merge_notes(&self, semantic_id: i32) -> Result<Vec<String>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        Ok(historical_semantic_merge_model::Entity::find()
+            .filter(historical_semantic_merge_model::Column::ToSemanticId.eq(semantic_id))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic_merge for render")?
+            .into_iter()
+            .map(|e| e.appended_description.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect())
+    }
+
     /// Read the previously written mapper output back into memory. Returns
     /// historical semantics paired with their findings, plus the matched
-    /// `(extract_id, historical_id)` pairs.
+    /// `(extract_id, historical_id)` pairs. The merged-variant notes folded into
+    /// each record's `rendered_*` are capped at `self.variant_render_cap`
+    /// (configured via [`Self::with_variant_render_cap`]).
     pub async fn load_semantic_match_results(&self) -> Result<SemanticMatchSet> {
-        use std::collections::BTreeMap;
+        use knowdit_kg_model::render::render_with_variants;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let variant_render_cap = self.variant_render_cap;
 
         let semantic_rows = historical_semantic_model::Entity::find()
             .order_by_asc(historical_semantic_model::Column::Id)
@@ -1522,6 +1749,43 @@ impl RepoDatabase {
                 .map(|row| (row.id, row.into()))
                 .collect();
 
+        // Merge edges: which rows are folded-away children (excluded from the
+        // canonical record set) and the per-canonical variant notes to render.
+        let sem_merge_rows = historical_semantic_merge_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic_merge rows")?;
+        let mut sem_child_ids: BTreeSet<i32> = BTreeSet::new();
+        let mut sem_notes: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        for e in sem_merge_rows {
+            sem_child_ids.insert(e.from_semantic_id);
+            let note = e.appended_description.trim().to_string();
+            if !note.is_empty() {
+                sem_notes.entry(e.to_semantic_id).or_default().push(note);
+            }
+        }
+        let find_merge_rows = historical_finding_merge_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_finding_merge rows")?;
+        let mut find_notes: BTreeMap<i32, (Vec<String>, Vec<String>, Vec<String>)> =
+            BTreeMap::new();
+        for e in find_merge_rows {
+            let entry = find_notes.entry(e.to_finding_id).or_default();
+            let d = e.appended_description.trim();
+            if !d.is_empty() {
+                entry.0.push(d.to_string());
+            }
+            let p = e.appended_patterns.trim();
+            if !p.is_empty() {
+                entry.1.push(p.to_string());
+            }
+            let x = e.appended_exploits.trim();
+            if !x.is_empty() {
+                entry.2.push(x.to_string());
+            }
+        }
+
         // Index by semantic_id → Vec<(finding_id, strength, evidence)> so we
         // preserve the per-link strength/evidence columns when materialising
         // HistoricalLinkedFinding entries.
@@ -1536,29 +1800,63 @@ impl RepoDatabase {
                 .push((link.historical_finding_id, link.strength, link.evidence));
         }
 
-        let historicals = semantic_rows
-            .into_iter()
-            .map(|row| {
-                let semantic_id = row.id;
-                let semantic: knowdit_kg_model::db::semantic_node::Model = row.into();
-                let findings = links_for_semantic
-                    .remove(&semantic_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(fid, strength, evidence)| {
-                        findings_by_id
-                            .get(&fid)
-                            .cloned()
-                            .map(|finding| HistoricalLinkedFinding {
-                                finding,
-                                strength,
-                                evidence,
-                            })
+        let no_notes: (Vec<String>, Vec<String>, Vec<String>) = Default::default();
+        let mut historicals = Vec::new();
+        for row in semantic_rows {
+            let semantic_id = row.id;
+            // Skip folded-away children — they are mirrored for provenance but
+            // are not matched canonicals, so they must not become records (that
+            // would fan out spurious LinkInputs downstream).
+            if sem_child_ids.contains(&semantic_id) {
+                continue;
+            }
+            let semantic: knowdit_kg_model::db::semantic_node::Model = row.into();
+            let rendered_description = render_with_variants(
+                &semantic.description,
+                sem_notes
+                    .get(&semantic_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                variant_render_cap,
+            );
+            let findings = links_for_semantic
+                .remove(&semantic_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(fid, strength, evidence)| {
+                    findings_by_id.get(&fid).cloned().map(|finding| {
+                        let (dn, pn, xn) = find_notes.get(&fid).unwrap_or(&no_notes);
+                        HistoricalLinkedFinding {
+                            rendered_description: render_with_variants(
+                                &finding.description,
+                                dn,
+                                variant_render_cap,
+                            ),
+                            rendered_patterns: render_with_variants(
+                                &finding.patterns,
+                                pn,
+                                variant_render_cap,
+                            ),
+                            rendered_exploits: render_with_variants(
+                                &finding.exploits,
+                                xn,
+                                variant_render_cap,
+                            ),
+                            raw_children: Vec::new(),
+                            finding,
+                            strength,
+                            evidence,
+                        }
                     })
-                    .collect();
-                HistoricalSemanticRecord { semantic, findings }
-            })
-            .collect();
+                })
+                .collect();
+            historicals.push(HistoricalSemanticRecord {
+                semantic,
+                findings,
+                raw_children: Vec::new(),
+                rendered_description,
+            });
+        }
 
         let matches = match_rows
             .into_iter()

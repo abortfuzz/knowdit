@@ -73,6 +73,13 @@ pub enum WorkflowCommands {
     /// across all three phases.
     Learn(cmd::workflow::learn::WorkflowLearnArgs),
 
+    /// Merge another historical KG into this one with semantic dedup:
+    /// dedup canonical semantics/findings against this KG, flatten the
+    /// duplicates one level, carry the source's finding↔semantic links
+    /// verbatim, then cross-seam link the source's new nodes against this
+    /// KG's existing corpus.
+    MergeKg(cmd::workflow::merge_kg::MergeKgArgs),
+
 }
 
 /// `knowdit db ...` — non-LLM tools that operate on the historical
@@ -133,6 +140,9 @@ pub enum LearnCommands {
 
     /// Learn historical experience from Code4rena projects in an out_train directory
     C4(cmd::learn::learn::LearnC4Args),
+
+    /// Learn historical experience from Sherlock contests in a sherlock-scrape out/ directory
+    Sherlock(cmd::learn::learn::LearnSherlockArgs),
 
     /// Learn historical experience from Move projects in the moves dataset
     Moves(cmd::learn::learn::LearnMovesArgs),
@@ -303,6 +313,7 @@ impl WorkflowCommand {
             WorkflowCommands::Streamloop(args) => args.run(&llm).await?,
             WorkflowCommands::ReviewFindings(args) => args.run(&llm).await?,
             WorkflowCommands::Learn(args) => args.run(&llm).await?,
+            WorkflowCommands::MergeKg(args) => args.run(&llm).await?,
         }
         Ok(())
     }
@@ -333,6 +344,7 @@ impl LearnCommand {
         match command {
             LearnCommands::Projects(args) => args.run(&db).await?,
             LearnCommands::C4(args) => args.run(&db).await?,
+            LearnCommands::Sherlock(args) => args.run(&db).await?,
             LearnCommands::Moves(args) => args.run(&db).await?,
             LearnCommands::Link(args) => args.run(&db).await?,
             LearnCommands::RetroLink(args) => args.run(&db).await?,

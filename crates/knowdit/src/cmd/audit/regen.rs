@@ -116,7 +116,7 @@ impl RegenArgs {
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
             repo_root: spec.root.clone(),

@@ -61,6 +61,12 @@ pub struct AgentRunOptions {
     /// Optional per-call llmy settings. When `None`, llmy reads the
     /// process-level defaults (which the parent CLI populated from clap).
     pub llm_settings: Option<LLMSettings>,
+    /// Fraction of the model's context window a single prompt built under
+    /// these options may fill (categorize / extract chunking + the merge
+    /// agents' new-item batching). Defaults to
+    /// [`crate::learn::DEFAULT_CONTEXT_WINDOW_UTILIZATION`]; CLI callers
+    /// override via [`AgentRunOptions::with_context_window_utilization`].
+    pub context_window_utilization: f64,
 }
 
 impl Default for AgentRunOptions {
@@ -78,11 +84,19 @@ impl AgentRunOptions {
             max_agent_steps: max_agent_steps.max(1),
             debug_prefix: None,
             llm_settings: None,
+            context_window_utilization: crate::learn::DEFAULT_CONTEXT_WINDOW_UTILIZATION,
         }
     }
 
     pub fn with_debug_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.debug_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Override the context-window utilization (CLI-supplied). Clamping to a
+    /// sane band happens downstream in [`crate::learn::get_context_budget`].
+    pub fn with_context_window_utilization(mut self, utilization: f64) -> Self {
+        self.context_window_utilization = utilization;
         self
     }
 
@@ -103,6 +117,7 @@ impl AgentRunOptions {
             max_agent_steps: self.max_agent_steps,
             debug_prefix: Some(prefix),
             llm_settings: self.llm_settings.clone(),
+            context_window_utilization: self.context_window_utilization,
         }
     }
 }

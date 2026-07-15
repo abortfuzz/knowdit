@@ -241,7 +241,7 @@ impl SolidityCallGraphArgs {
 
         let crate::cli::LoadedRepoDatabase { spec, repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let extraction_config = build_solidity_extraction_config(&self.source, &self.scope)?;
 
@@ -304,7 +304,7 @@ impl SolidityStorageGraphArgs {
 
         let crate::cli::LoadedRepoDatabase { repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let extraction_config = build_solidity_extraction_config(&self.source, &self.scope)?;
 
@@ -423,7 +423,7 @@ impl SolidityCallGraphStaticArgs {
             repo,
         } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let (cg, sg) = Self::update_call_graph(&repo, &spec.root, &self.backend).await?;
         let url = database_path.display();
@@ -514,7 +514,7 @@ impl SolidityExportStateVariableDotArgs {
             ..
         } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let storage = repo.load_storage_graph().await?;
         let dot = repo
@@ -549,7 +549,7 @@ impl SolidityExportCallGraphDotArgs {
             ..
         } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let call_graph = repo.load_call_graph().await?;
         let dot = call_graph.export_dot_with_options(CallGraphDotOptions {

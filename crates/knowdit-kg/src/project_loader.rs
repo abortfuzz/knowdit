@@ -72,6 +72,17 @@ impl ProjectData {
         Ok(Self { paired })
     }
 
+    /// Load a Sherlock contest from a `sherlock-scrape/out` directory.
+    /// Returns `Ok(None)` when the contest is not ingestible (no scope
+    /// files, or a non-Solidity/Move language) so bulk callers can skip it.
+    pub async fn from_sherlock(out_dir: &Path, contest_id: u32) -> Result<Option<Self>> {
+        Ok(
+            knowdit_project::C4PairedProjectData::from_sherlock(out_dir, contest_id)
+                .await?
+                .map(|paired| Self { paired }),
+        )
+    }
+
     /// Load a Move snapshot, optionally paired with its
     /// vulnerability-snippet audit report.
     pub async fn from_move_snapshot(

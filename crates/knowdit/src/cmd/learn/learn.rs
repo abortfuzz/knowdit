@@ -1,10 +1,10 @@
 use crate::cmd::learn::finding_link_args::FindingLinkCliArgs;
 use crate::cmd::learn::merge_args::MergeCliArgs;
 use clap::{Args, ValueEnum};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg::error::KgError;
-use knowdit_kg::learn::{ExtractResult, FindingLinkOptions, link_pending_findings};
+use knowdit_kg::learn::{ExtractResult, FindingLinkOptions};
 use knowdit_kg::project_loader::{MovePlatform, ProjectData};
 use llmy::clap::OpenAISetup;
 use std::collections::HashMap;
@@ -278,6 +278,106 @@ impl LearnMovesArgs {
     }
 }
 
+#[derive(Args)]
+pub struct LearnSherlockArgs {
+    #[command(flatten)]
+    pub llm: OpenAISetup,
+
+    /// sherlock-scrape output directory (expects metadata/, source/, reports/)
+    #[arg(long)]
+    pub sherlock_dir: PathBuf,
+
+    /// Specific Sherlock contest IDs to process (default: all discovered)
+    #[arg(long, value_delimiter = ',')]
+    pub sherlock_ids: Vec<u32>,
+
+    /// Contest IDs to skip, applied after --sherlock-ids / discovery
+    #[arg(long, value_delimiter = ',')]
+    pub skip_ids: Vec<u32>,
+
+    /// Max contests to process (0 = no limit). Applied after skip.
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+
+    /// Projects to categorize+extract concurrently (merge is always serial)
+    #[arg(long, default_value_t = 1)]
+    pub concurrency: usize,
+
+    /// Run finding-to-semantic linking after all projects are written
+    #[arg(long)]
+    pub link: bool,
+
+    #[command(flatten)]
+    pub merge: MergeCliArgs,
+
+    #[command(flatten)]
+    pub finding_link: FindingLinkCliArgs,
+}
+
+impl LearnSherlockArgs {
+    pub async fn run(self, db: &HistoricalDatabase) -> Result<()> {
+        self.merge.validate()?;
+        self.finding_link.validate()?;
+
+        let llm = self.llm.clone().to_llm().await;
+
+        let mut ids: Vec<u32> = if !self.sherlock_ids.is_empty() {
+            self.sherlock_ids.clone()
+        } else {
+            // Discover contests by their `metadata/<id>.json` files.
+            let meta_dir = self.sherlock_dir.join("metadata");
+            let mut all = Vec::new();
+            for entry in std::fs::read_dir(&meta_dir)
+                .wrap_err_with(|| format!("failed to read {}", meta_dir.display()))?
+            {
+                let path = entry?.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    && let Some(id) = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| stem.parse::<u32>().ok())
+                {
+                    all.push(id);
+                }
+            }
+            all.sort_unstable();
+            all
+        };
+        let skip: std::collections::HashSet<u32> = self.skip_ids.iter().copied().collect();
+        ids.retain(|id| !skip.contains(id));
+        if self.limit > 0 && ids.len() > self.limit {
+            ids.truncate(self.limit);
+        }
+
+        let mut all_projects = Vec::new();
+        for id in &ids {
+            match ProjectData::from_sherlock(&self.sherlock_dir, *id).await {
+                Ok(Some(data)) => all_projects.push(data),
+                Ok(None) => {
+                    tracing::info!("Skipping sherlock contest {} (no scope / unsupported)", id)
+                }
+                Err(e) => tracing::error!("Failed to load sherlock contest {}: {}", id, e),
+            }
+        }
+        tracing::info!(
+            "Loaded {} ingestible sherlock contest(s)",
+            all_projects.len()
+        );
+
+        run_pipeline(
+            db,
+            &llm,
+            all_projects,
+            self.concurrency,
+            self.link,
+            self.merge.to_agent_options(),
+            self.merge.to_chunking_options(),
+            self.finding_link.to_options(self.concurrency),
+        )
+        .await
+    }
+}
+
 /// Shared pipeline: categorize+extract concurrently, then merge+write each
 /// project serially as soon as extraction finishes.
 async fn run_pipeline(
@@ -310,7 +410,7 @@ async fn run_pipeline(
     if pending.is_empty() {
         tracing::info!("All projects already completed.");
         if link {
-            link_pending_findings(db, llm, link_options).await?;
+            link_options.link_pending_findings(db, llm).await?;
         }
         return Ok(());
     }
@@ -390,7 +490,7 @@ async fn run_pipeline(
     }
 
     if link {
-        link_pending_findings(db, llm, link_options).await?;
+        link_options.link_pending_findings(db, llm).await?;
     }
 
     tracing::info!("Learning complete.");

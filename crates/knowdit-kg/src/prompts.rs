@@ -214,11 +214,24 @@ identity. If the new raw's behaviour cannot be naturally described under
 the existing canonical's name + definition, emit `merge_target_ids: []`
 (NEW) instead of trying to fit the raw under it.
 
-You MAY supply `appended_description` to record a specific implementation
-detail this raw contributes that is worth preserving on the canonical. It
-will be APPENDED to the canonical's description (not replacing it). Use it
-when the raw's behaviour fits cleanly under the existing identity but adds
-a non-trivial concrete variant worth noting.
+The canonical's `name` + `definition` already carry the abstract concept.
+`updated_description` exists ONLY to keep the description a CONCRETE,
+representative one — never to generalize. Supply it only when this raw's
+description is strictly more concrete / complete / precise than the
+canonical's current one (names more specific state variables, gates, or
+failure modes), as a full self-contained REPLACEMENT of comparable length.
+OMIT it when the existing description already covers the raw, merely
+restates it, or would only get broader. NEVER broaden the description
+toward a generic category label (e.g. "improper access control") — that
+erases the concrete signal that makes the canonical useful.
+
+Instead, every MERGE MUST carry `appended_description`: one or two
+sentences saying how THIS raw *extends* the canonical it folds into — the
+concrete delta it adds (a new state variable it also touches, a different
+gate, an extra failure mode). This note is stored on the merge edge, so the
+canonical description stays a tight representative while each folded
+variant's specifics are preserved per-edge. Do not restate the shared
+concept; name only what is NEW in this raw.
 
 ### Examples
 
@@ -245,7 +258,7 @@ a non-trivial concrete variant worth noting.
 ## Tool Usage
 
 Use these tools (do NOT emit free-form JSON):
-- `emit_semantic_merge_decision({{reason, new_semantic_name, merge_target_ids, appended_description?}})` — call exactly once for each `new_semantic_name` listed in the prompt above. Set `merge_target_ids: []` for NEW; set it to one or more existing canonical IDs (from this chunk's prompt) for MERGE. `appended_description` is optional and only applies on merge.
+- `emit_semantic_merge_decision({{reason, new_semantic_name, merge_target_ids, updated_description?, appended_description?}})` — call exactly once for each `new_semantic_name` listed in the prompt above. Set `merge_target_ids: []` for NEW; set it to one or more existing canonical IDs (from this chunk's prompt) for MERGE. `updated_description` (optional, merge-only) is a full replacement supplied ONLY to make the canonical's description more concrete/complete — never to generalize; omit it to keep the existing one. `appended_description` is REQUIRED on every MERGE: one or two sentences on how this raw extends the canonical (omit only for NEW).
 - `finalize_semantic_merge({{summary?}})` — call exactly once after every newly-extracted semantic has been decided. Stop afterwards.
 "#
     )
@@ -420,10 +433,25 @@ covers many.
 
 When you MERGE, the target canonical's `title`, `severity`, and
 `root_cause` are NEVER modified — they are the canonical's stable
-identity. You MAY supply `appended_description` / `appended_patterns` /
-`appended_exploits` to record specific extra detail the new raw
-contributes; these are APPENDED (not replaced) and should be incremental,
-not a rewrite.
+identity. The canonical's `title`/`severity`/`root_cause` already carry the abstract
+identity, so `updated_description` / `updated_patterns` / `updated_exploits`
+exist ONLY to keep those fields CONCRETE and representative — never to
+generalize. Supply a field only when this raw's value is strictly more
+concrete / complete / precise than the canonical's current one, as a full
+self-contained REPLACEMENT of comparable length. OMIT a field when the
+existing value already covers the raw, merely restates it, or would only
+get broader. NEVER broaden a field toward a generic category label — that
+erases the concrete signal.
+
+Instead, every MERGE MUST carry `appended_description`, `appended_patterns`,
+and `appended_exploits` (all in the same call): one or two sentences each on
+how THIS raw *extends* the canonical's description / patterns / exploits — the
+concrete delta it adds (a different state-variable drift, a distinct attacker
+entry or ordering, an extra failure mode). These notes are stored on the merge
+edge, so the canonical fields stay tight while each folded variant's specifics
+are preserved per-edge. Name only what is NEW in this raw; if this raw adds
+nothing new to one of the three, say so explicitly (e.g. "no new exploit
+vector beyond the canonical").
 
 If the new raw's bug shape cannot be expressed under the existing target's
 title/severity/root_cause, emit `merge_target_ids: []` (NEW) instead.
@@ -431,7 +459,7 @@ title/severity/root_cause, emit `merge_target_ids: []` (NEW) instead.
 ## Tool Usage
 
 Use these tools (do NOT emit free-form JSON):
-- `emit_finding_merge_decision({{reason, new_finding_title, merge_target_ids, appended_description?, appended_patterns?, appended_exploits?}})` — call exactly once for each `new_finding_title` listed in the prompt above. Empty `merge_target_ids` = NEW; one or more IDs = MERGE.
+- `emit_finding_merge_decision({{reason, new_finding_title, merge_target_ids, updated_description?, updated_patterns?, updated_exploits?, appended_description?, appended_patterns?, appended_exploits?}})` — call exactly once for each `new_finding_title` listed in the prompt above. Empty `merge_target_ids` = NEW; one or more IDs = MERGE. The `updated_*` fields (optional, merge-only) are full replacements supplied ONLY to make a canonical field more concrete/complete — never to generalize; omit any to keep the existing one. `appended_description` / `appended_patterns` / `appended_exploits` are ALL REQUIRED on every MERGE: one or two sentences each on how this raw extends the canonical's description / patterns / exploits (omit only for NEW).
 - `finalize_finding_merge({{summary?}})` — call exactly once after every newly-extracted finding has been decided. Stop afterwards.
 "#
     )
@@ -489,31 +517,29 @@ instantiate the semantic's described failure mode?
               of the semantic's specific failure mode
           Most "broad topic match" links land here.
 
-### Cross-domain replay calibration
+### The `additional context (from raw "<name>")` lines
 
-Replay and stale-authorization bugs often use different product nouns in
-different projects. Do not downgrade a link merely because one side talks
-about one business action and the other side talks about another business
-action. Judge the structural failure instead.
+A candidate semantic — or a finding — may carry a few
+`— additional context (from raw "<name>"): …` lines. These are SUBORDINATE
+detail about folded raws, NOT separate mechanisms to match against. Judge the
+link against the canonical `Name` / `Definition` / `Description`. Matching only a
+folded raw's incidental detail, or a theme that merely spans several of them, is
+Low — never High.
 
-If the finding's root cause is reusable signed authorization, missing or
-ineffective nonce/replay state, replay state rollback, a signature that
-does not bind the full intended action, or repeated consumption of a
-finite permission/resource, and the semantic centrally describes signed,
-delegated, forwarded, session-like, batched, or account-style execution
-with replay/nonce/authorization consumption as an invariant, the link is
-at least Medium. Promote it to High when violating that replay or
-authorization-consumption invariant is the finding's direct exploit path,
-even if the user-facing resource differs.
+### High-gate — anti-overclaim (apply before tagging any `High`)
 
-Likewise, finite budget exhaustion caused by replay is the same failure
-family as repeated use of an allowance, quota, voting weight, session
-permission, or call authorization. Treat the consumed resource as the
-payload of the replay bug; do not classify the edge as merely Low because
-the resource name differs. Still avoid over-promoting generic "uses
-signatures" or "has delegated calls" overlap when the finding does not
-actually violate a replay, nonce, stale-authorization, binding, or
-consumption invariant.
+  - High requires the finding's ACTUAL `root_cause` / `patterns` to instantiate
+    the semantic's CENTRAL failure mode — same state, same invariant, same code
+    path. Not merely the same protocol area, asset type, or topic.
+  - A bug in a SHARED PRIMITIVE the semantic merely uses (ECDSA signature
+    recovery, integer rounding, a reentrancy guard, an access-control modifier)
+    is NOT a High instantiation of that semantic — the finding's bug must BE the
+    semantic's own distinctive mechanism, not the shared primitive. Such ties are
+    Medium at most; same-domain-only is Low.
+  - If your `why_finding_can_fire` has to describe the SEMANTIC's mechanism to
+    justify the tie (rather than quoting the FINDING's own violated invariant),
+    you are on the wrong side → it is not High. When the instantiation is not
+    exact, DEMOTE. Unwarranted High is the costliest error here.
 
 ### Calibrate deliberately
 

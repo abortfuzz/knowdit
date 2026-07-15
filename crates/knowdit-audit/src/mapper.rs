@@ -35,8 +35,9 @@ use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg::learn::ExtractedSemantic;
 use knowdit_kg_model::db::semantic_node;
 use knowdit_repo_model::{
-    HistoricalLinkedFinding, HistoricalSemanticRecord, MatchStrength, ProjectProfile, RepoDatabase,
-    SemanticMatch, SemanticMatchSet,
+    HistoricalFindingChild, HistoricalLinkedFinding, HistoricalSemanticChild,
+    HistoricalSemanticRecord, MatchStrength, ProjectProfile, RepoDatabase, SemanticMatch,
+    SemanticMatchSet,
 };
 use llmy::client::client::LLM;
 use serde::Deserialize;
@@ -281,8 +282,38 @@ impl KnowledgeMapper {
                 .wrap_err("failed to load historical findings for matched semantics")?
         };
 
+        // Folded children + their merge-edge notes, so the mirror carries each
+        // canonical's merged variants (concrete deltas) for downstream rendering.
+        let mut sem_children = kg
+            .semantic_children_with_notes(&matched_historical_ids)
+            .await
+            .wrap_err("failed to load semantic children for matched canonicals")?;
+        let finding_ids: Vec<i32> = finding_pairs
+            .iter()
+            .map(|l| l.finding.id)
+            .unique()
+            .collect();
+        let mut finding_children = kg
+            .finding_children_with_notes(&finding_ids)
+            .await
+            .wrap_err("failed to load finding children for matched canonicals")?;
+
         let mut findings_by_semantic: BTreeMap<i32, Vec<HistoricalLinkedFinding>> = BTreeMap::new();
         for linked in finding_pairs {
+            // Attach children to the first link of each finding only — the write
+            // path dedups child rows, and one edge insert per (child, canonical)
+            // avoids a duplicate-key collision.
+            let raw_children = finding_children
+                .remove(&linked.finding.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(finding, d, p, x)| HistoricalFindingChild {
+                    finding,
+                    appended_description: d,
+                    appended_patterns: p,
+                    appended_exploits: x,
+                })
+                .collect();
             findings_by_semantic
                 .entry(linked.canonical_semantic_id)
                 .or_default()
@@ -290,6 +321,10 @@ impl KnowledgeMapper {
                     finding: linked.finding,
                     strength: linked.strength,
                     evidence: linked.evidence,
+                    raw_children,
+                    rendered_description: String::new(),
+                    rendered_patterns: String::new(),
+                    rendered_exploits: String::new(),
                 });
         }
 
@@ -298,7 +333,21 @@ impl KnowledgeMapper {
             .filter_map(|id| {
                 semantic_by_id.get(id).cloned().map(|semantic| {
                     let findings = findings_by_semantic.remove(id).unwrap_or_default();
-                    HistoricalSemanticRecord { semantic, findings }
+                    let raw_children = sem_children
+                        .remove(id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(node, appended_description)| HistoricalSemanticChild {
+                            node,
+                            appended_description,
+                        })
+                        .collect();
+                    HistoricalSemanticRecord {
+                        semantic,
+                        findings,
+                        raw_children,
+                        rendered_description: String::new(),
+                    }
                 })
             })
             .collect();

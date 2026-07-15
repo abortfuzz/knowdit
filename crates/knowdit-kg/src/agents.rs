@@ -25,7 +25,7 @@
 //! chunk; the orchestrator unions those id lists across chunks. If every
 //! chunk says "no merge", the new raw is admitted as a fresh canonical.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use llmy::agent::tool::ToolBox;
@@ -349,6 +349,38 @@ impl FindingChunkExtractor {
 // Merge — shared types
 // ---------------------------------------------------------------------------
 
+/// Thresholds for the merge-field concreteness guard enforced at the emit-tool
+/// boundary (see [`check_merge_field_update`]). CLI-tunable via `MergeCliArgs`.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeFieldGuard {
+    /// Upper bound (chars) on a proposed `updated_*` replacement — the
+    /// canonical field is a concise concrete representative, not a transcript.
+    pub max_chars: usize,
+    /// Below this current length the field is too thin to protect, so any
+    /// replacement is accepted (it can only add concrete signal).
+    pub concrete_floor: usize,
+    /// Reject a replacement shorter than this fraction of an already-substantial
+    /// current value — shrinking a concrete write-up on merge is the signature
+    /// of over-generalization (a rich description collapsing into "improper
+    /// access control").
+    pub min_shrink_ratio: f64,
+    /// Upper bound (chars) on a merge edge's required `appended_description`
+    /// note — it must stay a one-or-two-sentence concrete delta, not a
+    /// transcript.
+    pub appended_max_chars: usize,
+}
+
+impl Default for MergeFieldGuard {
+    fn default() -> Self {
+        Self {
+            max_chars: 2_000,
+            concrete_floor: 160,
+            min_shrink_ratio: 0.6,
+            appended_max_chars: 600,
+        }
+    }
+}
+
 /// CLI-tunable knobs for the merge orchestration. Exposed through
 /// `MergeCliArgs` and threaded down to both [`SemanticMerger`] and
 /// [`FindingMerger`].
@@ -359,9 +391,21 @@ pub struct MergeChunkingOptions {
     /// canonicals (with their merged-away children) greedily until adding
     /// the next candidate would exceed this budget.
     pub chunk_candidate_token_budget: usize,
-    /// Maximum number of merge agents (one per candidate chunk) running in
-    /// parallel. `1` falls back to sequential execution.
+    /// Maximum number of merge agents (one per work unit) running in
+    /// parallel. `1` falls back to sequential execution. A work unit is one
+    /// (new-item batch × candidate chunk) pair.
     pub concurrency: usize,
+    /// Hard **count cap** on how many new items (semantics / findings) any
+    /// single merge agent decides on. New items are batched by the model's
+    /// context window first (so the rendered block always fits), and this cap
+    /// closes a batch early when it's reached — each `emit` is one agent step,
+    /// so it also keeps an agent's per-item steps under its step budget.
+    /// Batches fan out across `concurrency`; batching never changes the merge
+    /// outcome (decisions aggregate by name across all work units).
+    pub new_item_batch_size: usize,
+    /// Thresholds for the concreteness guard applied to `updated_*` merge
+    /// fields at the emit-tool boundary.
+    pub field_guard: MergeFieldGuard,
 }
 
 impl Default for MergeChunkingOptions {
@@ -369,15 +413,24 @@ impl Default for MergeChunkingOptions {
         Self {
             chunk_candidate_token_budget: 50_000,
             concurrency: 1,
+            new_item_batch_size: 40,
+            field_guard: MergeFieldGuard::default(),
         }
     }
 }
 
 impl MergeChunkingOptions {
-    pub fn new(chunk_candidate_token_budget: usize, concurrency: usize) -> Self {
+    pub fn new(
+        chunk_candidate_token_budget: usize,
+        concurrency: usize,
+        new_item_batch_size: usize,
+        field_guard: MergeFieldGuard,
+    ) -> Self {
         Self {
             chunk_candidate_token_budget: chunk_candidate_token_budget.max(1024),
             concurrency: concurrency.max(1),
+            new_item_batch_size: new_item_batch_size.max(1),
+            field_guard,
         }
     }
 }
@@ -415,21 +468,97 @@ pub struct SemanticMergeDecision {
     /// the new raw should fold into. Empty list = "no match in this
     /// chunk; treat as a fresh canonical from this chunk's perspective".
     pub merge_target_ids: Vec<i32>,
-    /// Optional behavioural detail this raw contributes that is worth
-    /// recording on the canonical's description. Appended to the
-    /// canonical's existing description; never replaces. The canonical's
-    /// `name` and `definition` are stable identity and are never modified
-    /// by a merge decision. If the raw cannot be expressed under the
-    /// existing name + definition, emit an empty `merge_target_ids`
-    /// instead so a fresh canonical is created.
+    /// Optional (merge-only) full replacement for the canonical's description,
+    /// supplied ONLY to make it a more concrete / complete representative —
+    /// never to generalize. The emit tool rejects a value that is over-long or
+    /// that markedly shortens (i.e. abstracts) the canonical's current
+    /// description. `None` keeps it unchanged. `name` and `definition` are
+    /// stable identity and are never modified; if the raw cannot be expressed
+    /// under them, emit an empty `merge_target_ids` so a fresh canonical is
+    /// created instead.
+    pub updated_description: Option<String>,
+    /// REQUIRED when merging (`merge_target_ids` non-empty): a one-or-two
+    /// sentence note on how THIS raw *extends* the canonical(s) it folds into —
+    /// its concrete delta beyond the canonical's own description. Stored on the
+    /// `semantic_merge` edge and surfaced downstream, so bounding the canonical
+    /// description does not lose per-variant detail. Omit only for NEW (empty
+    /// `merge_target_ids`).
     pub appended_description: Option<String>,
+}
+
+/// Validate a proposed `updated_*` replacement at the tool boundary so the
+/// agent gets actionable feedback and can re-emit — rather than the write
+/// layer silently dropping or truncating it. Returns `Ok(())` to accept, or
+/// `Err(message)` (a tool-result string handed back to the agent) when the
+/// value is over-long or markedly shortens/abstracts a target's CURRENT value.
+/// Thresholds come from `guard` (CLI-tunable via `MergeCliArgs`).
+///
+/// `field`/`label` only phrase the message; `current_of` yields a target
+/// canonical's current text (the value rendered in this chunk's prompt).
+fn check_merge_field_update(
+    guard: MergeFieldGuard,
+    field: &str,
+    label: &str,
+    candidate: &str,
+    target_ids: &[i32],
+    current_of: impl Fn(i32) -> Option<String>,
+) -> std::result::Result<(), String> {
+    let candidate_len = candidate.chars().count();
+    if candidate_len > guard.max_chars {
+        return Err(format!(
+            "error: `{field}` for '{label}' is {candidate_len} chars — too long. Keep it a concise, self-contained concrete representative (≤ {} chars): the essential state variables, gates, and failure modes only. The full per-raw detail already lives on the raw nodes.",
+            guard.max_chars,
+        ));
+    }
+    for &id in target_ids {
+        let Some(current) = current_of(id) else {
+            continue;
+        };
+        let current_len = current.trim().chars().count();
+        if current_len >= guard.concrete_floor
+            && (candidate_len as f64) < (current_len as f64) * guard.min_shrink_ratio
+        {
+            return Err(format!(
+                "error: the `{field}` you proposed for canonical #{id} ({candidate_len} chars) is far shorter than its current value ({current_len} chars) — that reads as a generalization, and broadening a concrete write-up toward an abstract category label (e.g. \"improper access control\") erases the signal that makes the canonical useful. Either re-emit `{field}` as a replacement at least as concrete and complete as the current value, or omit `{field}` to keep the current one."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the required merge-edge `appended_description` note at the tool
+/// boundary. Every fold must carry a one-or-two-sentence summary of how the raw
+/// *extends* the canonical it folds into — that per-edge delta is what keeps the
+/// concrete variance downstream once the canonical description itself is bounded.
+/// Returns `Err(message)` (handed back to the agent) when the note is missing or
+/// over-long.
+fn check_appended_note(
+    guard: MergeFieldGuard,
+    field: &str,
+    label: &str,
+    note: Option<&str>,
+) -> std::result::Result<(), String> {
+    let note = note.map(str::trim).unwrap_or("");
+    if note.is_empty() {
+        return Err(format!(
+            "error: merging '{label}' requires `{field}` — one or two sentences on how this raw extends the canonical(s) it folds into (its concrete delta for this field). Re-emit with it filled."
+        ));
+    }
+    let len = note.chars().count();
+    if len > guard.appended_max_chars {
+        return Err(format!(
+            "error: `{field}` for '{label}' is {len} chars — keep it to one or two sentences (≤ {} chars) naming just the concrete delta this raw adds.",
+            guard.appended_max_chars,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 #[tool(
     arguments = SemanticMergeDecision,
     invoke = invoke,
-    description = "Emit one merge decision for a new raw semantic. Call once per `new_semantic_name` shown in the prompt. `merge_target_ids` may list multiple canonicals from THIS chunk; an empty list means NEW (no match in this chunk). The canonical's `name` and `definition` are stable identity and are NEVER modified by this decision — only `appended_description` (optional, when merging) is appended to the canonical's existing description. The tool validates `new_semantic_name` against the prompt's new-semantics list and `merge_target_ids` against this chunk's candidate IDs; invalid decisions are rejected with an error message so you can re-emit a corrected one.",
+    description = "Emit one merge decision for a new raw semantic. Call once per `new_semantic_name` shown in the prompt. `merge_target_ids` may list multiple canonicals from THIS chunk; an empty list means NEW (no match in this chunk). The canonical's `name` and `definition` are stable identity and are NEVER modified by this decision — only `updated_description` (optional, when merging) replaces the canonical's description, and you supply it ONLY to make that description a more concrete/complete representative, never to generalize; omit it to keep the existing one. When merging you MUST also give `appended_description`: one or two sentences on how THIS raw extends the canonical (its concrete delta) — it is stored on the merge edge, not in the canonical. The tool validates `new_semantic_name` against the prompt's new-semantics list, `merge_target_ids` against this chunk's candidate IDs, rejects an `updated_description` that is over-long or that abstracts (markedly shortens) the target's current description, and rejects a missing/over-long `appended_description` on a merge; rejected decisions come back with an error message so you can re-emit a corrected one.",
     name = "emit_semantic_merge_decision",
 )]
 struct EmitSemanticMergeDecisionTool {
@@ -443,6 +572,12 @@ struct EmitSemanticMergeDecisionTool {
     /// Canonical IDs visible in *this* chunk's prompt. The agent must
     /// only emit IDs from this set; foreign IDs are rejected.
     valid_target_ids: Arc<HashSet<i32>>,
+    /// Current description of each candidate canonical in this chunk, keyed by
+    /// id — used to reject an over-generalizing `updated_description` at the
+    /// tool boundary (see [`check_merge_field_update`]).
+    target_descriptions: Arc<HashMap<i32, String>>,
+    /// Concreteness-guard thresholds (CLI-tunable).
+    field_guard: MergeFieldGuard,
 }
 
 impl EmitSemanticMergeDecisionTool {
@@ -470,6 +605,37 @@ impl EmitSemanticMergeDecisionTool {
                 "error: `merge_target_ids` contains IDs not in this chunk's candidate list: {invalid:?}. Re-emit this decision using only canonical IDs that appear in the candidate list above. If '{}' has no match in this chunk, emit `merge_target_ids: []`.",
                 args.new_semantic_name,
             ));
+        }
+        if let Some(updated) = args.updated_description.as_deref() {
+            let updated = updated.trim();
+            if !updated.is_empty() {
+                if args.merge_target_ids.is_empty() {
+                    return Ok(format!(
+                        "error: `updated_description` only applies when merging, but `merge_target_ids` is empty for '{}'. Omit `updated_description` for a NEW semantic, or set `merge_target_ids` to the canonical(s) to fold into.",
+                        args.new_semantic_name,
+                    ));
+                }
+                if let Err(msg) = check_merge_field_update(
+                    self.field_guard,
+                    "updated_description",
+                    &args.new_semantic_name,
+                    updated,
+                    &args.merge_target_ids,
+                    |id| self.target_descriptions.get(&id).cloned(),
+                ) {
+                    return Ok(msg);
+                }
+            }
+        }
+        if !args.merge_target_ids.is_empty()
+            && let Err(msg) = check_appended_note(
+                self.field_guard,
+                "appended_description",
+                &args.new_semantic_name,
+                args.appended_description.as_deref(),
+            )
+        {
+            return Ok(msg);
         }
         Ok(self
             .buffer
@@ -513,6 +679,8 @@ pub struct SemanticMergeChunkRunner {
     pub label: String,
     pub valid_names: Arc<HashSet<String>>,
     pub valid_target_ids: Arc<HashSet<i32>>,
+    pub target_descriptions: Arc<HashMap<i32, String>>,
+    pub field_guard: MergeFieldGuard,
 }
 
 impl SemanticMergeChunkRunner {
@@ -524,6 +692,8 @@ impl SemanticMergeChunkRunner {
             buffer: buffer.clone(),
             valid_names: self.valid_names,
             valid_target_ids: self.valid_target_ids,
+            target_descriptions: self.target_descriptions,
+            field_guard: self.field_guard,
         });
         tools.add_tool(FinalizeSemanticMergeTool {
             buffer: buffer.clone(),
@@ -575,8 +745,11 @@ pub struct AggregatedSemanticMergeDecision {
     /// Union of `merge_target_ids` across every chunk's decision for this
     /// raw. Empty = no chunk matched, so admit the raw as a fresh canonical.
     pub merge_target_ids: Vec<i32>,
-    /// Detail to append to each merged-into canonical's description.
-    /// Never replaces — only appended with a separator at write time.
+    /// Full replacement description for each merged-into canonical (a concise
+    /// generalization). Replaces at write time; `None` keeps the existing.
+    pub updated_description: Option<String>,
+    /// The merge-edge `appended_description` note (how the raw extends the
+    /// canonical), first non-empty across chunks. Written to every folded edge.
     pub appended_description: Option<String>,
 }
 
@@ -591,6 +764,7 @@ impl SemanticMerger {
             .map(|s| AggregatedSemanticMergeDecision {
                 new_semantic_name: s.name.clone(),
                 merge_target_ids: Vec::new(),
+                updated_description: None,
                 appended_description: None,
             })
             .collect();
@@ -599,29 +773,42 @@ impl SemanticMerger {
             return Ok(aggregated);
         }
         let chunks = self.pack_into_chunks(candidates);
-        tracing::info!(
-            "{}: {} candidate chunks (concurrency={}, candidate_token_budget={})",
-            self.label_root,
-            chunks.len(),
-            self.chunking.concurrency,
-            self.chunking.chunk_candidate_token_budget,
-        );
-        // Precompute the project-wide valid-names set once and share it
-        // by `Arc` across every chunk's emit tool (so the tool can reject
-        // hallucinated names at the call site instead of in the post-hoc
-        // aggregator).
-        let valid_names: Arc<HashSet<String>> = Arc::new(
-            self.new_semantics
-                .iter()
-                .map(|s| s.name.to_lowercase())
-                .collect(),
-        );
         let by_name = SemanticMergeAggregator::name_index(&self.new_semantics);
         let known_targets = SemanticMergeAggregator::known_canonical_ids(&chunks);
-        let new_semantics_block = Self::render_new_block(&self.new_semantics);
-        let chunk_results = self
-            .dispatch_chunks(chunks, new_semantics_block, valid_names)
-            .await?;
+        // Batch the new semantics by the model's context window (so the
+        // rendered new-items block always fits alongside a candidate chunk)
+        // AND a hard count cap (so no agent emits more decisions than its
+        // step budget allows) — same token+count partitioning the link
+        // pipeline uses. Work units are (new-item batch × candidate chunk);
+        // they fan out under the shared `concurrency` bound.
+        let model = self.llm.model.clone();
+        let new_item_budget = new_item_token_budget(
+            &model,
+            self.chunking.chunk_candidate_token_budget,
+            self.agent_options.context_window_utilization,
+        );
+        let batches = pack_new_item_batches(
+            self.new_semantics.clone(),
+            new_item_budget,
+            self.chunking.new_item_batch_size,
+            |sem| {
+                model
+                    .config
+                    .count_tokens_lossy(&Self::render_new_block(std::slice::from_ref(sem)))
+            },
+        );
+        tracing::info!(
+            "{}: {} candidate chunk(s) × {} new-item batch(es) = {} work unit(s) (concurrency={}, candidate_token_budget={}, new_item_token_budget={}, count_cap={})",
+            self.label_root,
+            chunks.len(),
+            batches.len(),
+            chunks.len() * batches.len(),
+            self.chunking.concurrency,
+            self.chunking.chunk_candidate_token_budget,
+            new_item_budget,
+            self.chunking.new_item_batch_size,
+        );
+        let chunk_results = self.dispatch_batched(&chunks, &batches).await?;
         SemanticMergeAggregator::merge(&mut aggregated, chunk_results, &by_name, &known_targets);
         Ok(aggregated)
     }
@@ -655,6 +842,12 @@ impl SemanticMerger {
         let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
         let valid_target_ids: Arc<HashSet<i32>> =
             Arc::new(chunk.iter().map(|c| c.canonical.id).collect());
+        let target_descriptions: Arc<HashMap<i32, String>> = Arc::new(
+            chunk
+                .iter()
+                .map(|c| (c.canonical.id, c.canonical.description.clone()))
+                .collect(),
+        );
         SemanticMergeChunkRunner {
             llm: self.llm.clone(),
             options: self.agent_options.scoped(&debug_scope),
@@ -664,81 +857,126 @@ impl SemanticMerger {
             label,
             valid_names,
             valid_target_ids,
+            target_descriptions,
+            field_guard: self.chunking.field_guard,
         }
     }
 
-    async fn dispatch_chunks(
+    /// Dispatch (new-item batch × candidate chunk) work units through a
+    /// shared bounded-concurrency pool. Each unit's agent sees one batch of
+    /// new semantics plus one candidate chunk. Result order is irrelevant —
+    /// the aggregator folds every unit's decisions by name.
+    async fn dispatch_batched(
         &self,
-        chunks: Vec<Vec<CanonicalWithChildren<semantic_node::Model>>>,
-        new_semantics_block: String,
-        valid_names: Arc<HashSet<String>>,
+        chunks: &[Vec<CanonicalWithChildren<semantic_node::Model>>],
+        batches: &[Vec<ExtractedSemantic>],
     ) -> Result<Vec<Vec<SemanticMergeDecision>>> {
-        let total = chunks.len();
-        let concurrency = self.chunking.concurrency.max(1);
-        if concurrency <= 1 || total <= 1 {
-            self.dispatch_sequential(chunks, new_semantics_block, valid_names)
-                .await
-        } else {
-            self.dispatch_concurrent(chunks, new_semantics_block, valid_names, concurrency)
-                .await
+        let total_units = batches.len().saturating_mul(chunks.len());
+        let mut runners = Vec::with_capacity(total_units);
+        let mut unit_idx = 0usize;
+        for batch in batches {
+            let new_block = Self::render_new_block(batch);
+            let valid_names: Arc<HashSet<String>> =
+                Arc::new(batch.iter().map(|s| s.name.to_lowercase()).collect());
+            for chunk in chunks {
+                runners.push(self.build_chunk_runner(
+                    unit_idx,
+                    total_units,
+                    chunk,
+                    &new_block,
+                    valid_names.clone(),
+                ));
+                unit_idx += 1;
+            }
         }
+        run_semantic_merge_runners(runners, self.chunking.concurrency.max(1)).await
     }
+}
 
-    async fn dispatch_sequential(
-        &self,
-        chunks: Vec<Vec<CanonicalWithChildren<semantic_node::Model>>>,
-        new_semantics_block: String,
-        valid_names: Arc<HashSet<String>>,
-    ) -> Result<Vec<Vec<SemanticMergeDecision>>> {
-        let total = chunks.len();
-        let mut out = Vec::with_capacity(total);
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let runner = self.build_chunk_runner(
-                idx,
-                total,
-                &chunk,
-                &new_semantics_block,
-                valid_names.clone(),
-            );
+/// Token budget for a merge agent's "new items" block: `utilization` × the
+/// model's context window (via [`get_context_budget`]) minus the reserved
+/// candidate-chunk budget and the system prompt, so a single agent's prompt
+/// — system + one candidate chunk + one new-items batch — always fits the
+/// window. Floored so a tiny/misconfigured window still yields a usable batch.
+fn new_item_token_budget(
+    model: &OpenAIModel,
+    candidate_token_budget: usize,
+    utilization: f64,
+) -> usize {
+    let system_tokens = model
+        .config
+        .count_tokens_lossy(crate::prompts::GENERAL_ROLE_SYSTEM);
+    crate::learn::get_context_budget(model, utilization)
+        .saturating_sub(candidate_token_budget)
+        .saturating_sub(system_tokens)
+        .max(2048)
+}
+
+/// Greedy token+count packer for a merge agent's new items, mirroring the link
+/// pipeline's `partition_finding_link_entries`. A batch closes when adding the
+/// next item would exceed EITHER the token budget (so the rendered block fits
+/// the model window) OR the count cap (so the agent's per-item `emit` steps
+/// stay under its step budget). A single oversized item still gets its own
+/// batch rather than being dropped.
+fn pack_new_item_batches<T>(
+    items: Vec<T>,
+    token_budget: usize,
+    count_cap: usize,
+    token_cost: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let count_cap = count_cap.max(1);
+    let mut batches = Vec::new();
+    let mut current: Vec<T> = Vec::new();
+    let mut current_tokens = 0usize;
+    for item in items {
+        let cost = token_cost(&item);
+        let count_exceeded = current.len() >= count_cap;
+        let tokens_exceeded = current_tokens + cost > token_budget;
+        if !current.is_empty() && (count_exceeded || tokens_exceeded) {
+            batches.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(item);
+        current_tokens += cost;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Run pre-built merge-chunk runners with a bounded-concurrency pool. Results
+/// are returned in completion order (the caller aggregates by name, so order
+/// does not matter).
+async fn run_semantic_merge_runners(
+    runners: Vec<SemanticMergeChunkRunner>,
+    concurrency: usize,
+) -> Result<Vec<Vec<SemanticMergeDecision>>> {
+    let mut out = Vec::with_capacity(runners.len());
+    if runners.is_empty() {
+        return Ok(out);
+    }
+    if concurrency <= 1 {
+        for runner in runners {
             out.push(runner.run().await?);
         }
-        Ok(out)
+        return Ok(out);
     }
-
-    async fn dispatch_concurrent(
-        &self,
-        chunks: Vec<Vec<CanonicalWithChildren<semantic_node::Model>>>,
-        new_semantics_block: String,
-        valid_names: Arc<HashSet<String>>,
-        concurrency: usize,
-    ) -> Result<Vec<Vec<SemanticMergeDecision>>> {
-        let total = chunks.len();
-        let mut joins: JoinSet<(usize, Result<Vec<SemanticMergeDecision>>)> = JoinSet::new();
-        let mut pending = chunks.into_iter().enumerate().collect::<Vec<_>>();
-        let mut alive = 0usize;
-        let mut results: Vec<Option<Vec<SemanticMergeDecision>>> =
-            (0..total).map(|_| None).collect();
-        while !pending.is_empty() || alive > 0 {
-            while alive < concurrency && !pending.is_empty() {
-                let (idx, chunk) = pending.remove(0);
-                let runner = self.build_chunk_runner(
-                    idx,
-                    total,
-                    &chunk,
-                    &new_semantics_block,
-                    valid_names.clone(),
-                );
-                joins.spawn(async move { (idx, runner.run().await) });
-                alive += 1;
-            }
-            if let Some(joined) = joins.join_next().await {
-                alive -= 1;
-                let (idx, res) = joined.map_err(|e| KgError::other(format!("merge join: {e}")))?;
-                results[idx] = Some(res?);
-            }
+    let mut it = runners.into_iter();
+    let mut joins: JoinSet<Result<Vec<SemanticMergeDecision>>> = JoinSet::new();
+    for _ in 0..concurrency {
+        if let Some(runner) = it.next() {
+            joins.spawn(async move { runner.run().await });
         }
-        Ok(results.into_iter().map(|o| o.unwrap_or_default()).collect())
     }
+    while let Some(joined) = joins.join_next().await {
+        let res = joined.map_err(|e| KgError::other(format!("semantic merge join: {e}")))?;
+        out.push(res?);
+        if let Some(runner) = it.next() {
+            joins.spawn(async move { runner.run().await });
+        }
+    }
+    Ok(out)
 }
 
 /// Pure helper: combines per-chunk decisions into the project-level result.
@@ -791,20 +1029,21 @@ impl SemanticMergeAggregator {
                         agg.merge_target_ids.push(target);
                     }
                 }
-                Self::adopt_longer(&mut agg.appended_description, decision.appended_description);
+                Self::adopt_update(&mut agg.updated_description, decision.updated_description);
+                Self::adopt_update(&mut agg.appended_description, decision.appended_description);
             }
         }
     }
 
-    fn adopt_longer(slot: &mut Option<String>, candidate: Option<String>) {
-        if let Some(candidate) = candidate {
-            if candidate.trim().is_empty() {
-                return;
-            }
-            match slot {
-                Some(existing) if existing.len() >= candidate.len() => {}
-                _ => *slot = Some(candidate),
-            }
+    /// Keep the first non-empty updated value across chunks. Each chunk that
+    /// merged this raw proposes a full generalization; one suffices (they are
+    /// full replacements, not accumulating fragments), so the first wins.
+    fn adopt_update(slot: &mut Option<String>, candidate: Option<String>) {
+        if slot.is_none()
+            && let Some(candidate) = candidate
+            && !candidate.trim().is_empty()
+        {
+            *slot = Some(candidate);
         }
     }
 }
@@ -861,7 +1100,7 @@ impl SemanticMerger {
         let mut current_tokens: usize = 0;
         for entry in candidates {
             let single = Self::render_candidate_chunk(std::slice::from_ref(&entry));
-            let cost = crate::learn::count_tokens(model, &single);
+            let cost = model.config.count_tokens_lossy(&single);
             if !current.is_empty() && current_tokens + cost > chunk_token_budget {
                 chunks.push(std::mem::take(&mut current));
                 current_tokens = 0;
@@ -891,16 +1130,27 @@ pub struct FindingMergeDecision {
     /// Existing canonical finding IDs (drawn from this chunk) the new raw
     /// should fold into. Empty list = "no match in this chunk".
     pub merge_target_ids: Vec<i32>,
-    /// Optional behavioural detail this raw contributes — appended to the
-    /// canonical's description, never replaces. The canonical's `title`,
-    /// `severity`, and `root_cause` are stable identity and are never
-    /// modified by a merge decision.
+    /// Optional (merge-only) full replacement for the canonical's description,
+    /// supplied ONLY to make it a more concrete / complete representative —
+    /// never to generalize. The emit tool rejects a value that is over-long or
+    /// that markedly shortens (abstracts) the canonical's current description.
+    /// `None` keeps it unchanged. `title`, `severity`, and `root_cause` are
+    /// stable identity and are never modified by a merge decision.
+    pub updated_description: Option<String>,
+    /// Optional (merge-only) full replacement for `patterns`, under the same
+    /// concrete-representative rule and tool validation. `None` keeps existing.
+    pub updated_patterns: Option<String>,
+    /// Optional (merge-only) full replacement for `exploits`, under the same
+    /// concrete-representative rule and tool validation. `None` keeps existing.
+    pub updated_exploits: Option<String>,
+    /// REQUIRED when merging (`merge_target_ids` non-empty): one-or-two
+    /// sentence notes on how THIS raw *extends* the canonical(s) it folds into —
+    /// its concrete delta beyond the canonical's own fields, one per mutable
+    /// field. All three are emitted together in this call and stored on the
+    /// `finding_merge` edge, so bounding the canonical fields does not lose
+    /// per-variant detail. Omit only for NEW (empty `merge_target_ids`).
     pub appended_description: Option<String>,
-    /// Optional additional pattern detail this raw contributes — appended
-    /// to canonical's patterns, never replaces.
     pub appended_patterns: Option<String>,
-    /// Optional additional exploit-path detail this raw contributes —
-    /// appended to canonical's exploits, never replaces.
     pub appended_exploits: Option<String>,
 }
 
@@ -908,7 +1158,7 @@ pub struct FindingMergeDecision {
 #[tool(
     arguments = FindingMergeDecision,
     invoke = invoke,
-    description = "Emit one merge decision for a new raw finding. Call once per `new_finding_title` shown in the prompt. `merge_target_ids` may list multiple canonicals from THIS chunk; an empty list means NEW (no match in this chunk). The canonical's `title`, `severity`, and `root_cause` are stable identity and are NEVER modified by this decision — only `appended_description` / `appended_patterns` / `appended_exploits` (optional, when merging) are appended to the canonical's existing fields. The tool validates `new_finding_title` against the prompt's new-findings list and `merge_target_ids` against this chunk's candidate IDs; invalid decisions are rejected with an error message so you can re-emit a corrected one.",
+    description = "Emit one merge decision for a new raw finding. Call once per `new_finding_title` shown in the prompt. `merge_target_ids` may list multiple canonicals from THIS chunk; an empty list means NEW (no match in this chunk). The canonical's `title`, `severity`, and `root_cause` are stable identity and are NEVER modified by this decision — only `updated_description` / `updated_patterns` / `updated_exploits` (optional, when merging) replace the canonical's fields, and you supply each ONLY to make that field a more concrete/complete representative, never to generalize; omit any to keep the existing value. When merging you MUST also give `appended_description` / `appended_patterns` / `appended_exploits` (all in this call): one or two sentences each on how THIS raw extends the canonical's description / patterns / exploits (its concrete delta) — they are stored on the merge edge, not in the canonical. The tool validates `new_finding_title` against the prompt's new-findings list, `merge_target_ids` against this chunk's candidate IDs, rejects any `updated_*` that is over-long or that abstracts (markedly shortens) the target's current value, and rejects a missing/over-long `appended_*` on a merge; rejected decisions come back with an error message so you can re-emit a corrected one.",
     name = "emit_finding_merge_decision",
 )]
 struct EmitFindingMergeDecisionTool {
@@ -917,6 +1167,22 @@ struct EmitFindingMergeDecisionTool {
     valid_titles: Arc<HashSet<String>>,
     /// Canonical IDs visible in *this* chunk's prompt.
     valid_target_ids: Arc<HashSet<i32>>,
+    /// Current mutable text of each candidate canonical in this chunk, keyed by
+    /// id — used to reject an over-generalizing `updated_*` at the tool
+    /// boundary (see [`check_merge_field_update`]).
+    target_texts: Arc<HashMap<i32, FindingTargetText>>,
+    /// Concreteness-guard thresholds (CLI-tunable).
+    field_guard: MergeFieldGuard,
+}
+
+/// Snapshot of a candidate canonical finding's mutable fields, captured when a
+/// chunk runner is built so the emit tool can compare a proposed `updated_*`
+/// against the current value.
+#[derive(Debug, Clone, Default)]
+pub struct FindingTargetText {
+    description: String,
+    patterns: String,
+    exploits: String,
 }
 
 impl EmitFindingMergeDecisionTool {
@@ -944,6 +1210,77 @@ impl EmitFindingMergeDecisionTool {
                 "error: `merge_target_ids` contains IDs not in this chunk's candidate list: {invalid:?}. Re-emit this decision using only canonical IDs that appear in the candidate list above. If '{}' has no match in this chunk, emit `merge_target_ids: []`.",
                 args.new_finding_title,
             ));
+        }
+        let any_update = [
+            &args.updated_description,
+            &args.updated_patterns,
+            &args.updated_exploits,
+        ]
+        .into_iter()
+        .any(|v| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()));
+        if any_update && args.merge_target_ids.is_empty() {
+            return Ok(format!(
+                "error: the `updated_*` fields only apply when merging, but `merge_target_ids` is empty for '{}'. Omit them for a NEW finding, or set `merge_target_ids` to the canonical(s) to fold into.",
+                args.new_finding_title,
+            ));
+        }
+        if let Some(v) = args.updated_description.as_deref() {
+            let v = v.trim();
+            if !v.is_empty()
+                && let Err(msg) = check_merge_field_update(
+                    self.field_guard,
+                    "updated_description",
+                    &args.new_finding_title,
+                    v,
+                    &args.merge_target_ids,
+                    |id| self.target_texts.get(&id).map(|t| t.description.clone()),
+                )
+            {
+                return Ok(msg);
+            }
+        }
+        if let Some(v) = args.updated_patterns.as_deref() {
+            let v = v.trim();
+            if !v.is_empty()
+                && let Err(msg) = check_merge_field_update(
+                    self.field_guard,
+                    "updated_patterns",
+                    &args.new_finding_title,
+                    v,
+                    &args.merge_target_ids,
+                    |id| self.target_texts.get(&id).map(|t| t.patterns.clone()),
+                )
+            {
+                return Ok(msg);
+            }
+        }
+        if let Some(v) = args.updated_exploits.as_deref() {
+            let v = v.trim();
+            if !v.is_empty()
+                && let Err(msg) = check_merge_field_update(
+                    self.field_guard,
+                    "updated_exploits",
+                    &args.new_finding_title,
+                    v,
+                    &args.merge_target_ids,
+                    |id| self.target_texts.get(&id).map(|t| t.exploits.clone()),
+                )
+            {
+                return Ok(msg);
+            }
+        }
+        if !args.merge_target_ids.is_empty() {
+            for (field, note) in [
+                ("appended_description", args.appended_description.as_deref()),
+                ("appended_patterns", args.appended_patterns.as_deref()),
+                ("appended_exploits", args.appended_exploits.as_deref()),
+            ] {
+                if let Err(msg) =
+                    check_appended_note(self.field_guard, field, &args.new_finding_title, note)
+                {
+                    return Ok(msg);
+                }
+            }
         }
         Ok(self
             .buffer
@@ -981,6 +1318,8 @@ pub struct FindingMergeChunkRunner {
     pub label: String,
     pub valid_titles: Arc<HashSet<String>>,
     pub valid_target_ids: Arc<HashSet<i32>>,
+    pub target_texts: Arc<HashMap<i32, FindingTargetText>>,
+    pub field_guard: MergeFieldGuard,
 }
 
 impl FindingMergeChunkRunner {
@@ -992,6 +1331,8 @@ impl FindingMergeChunkRunner {
             buffer: buffer.clone(),
             valid_titles: self.valid_titles,
             valid_target_ids: self.valid_target_ids,
+            target_texts: self.target_texts,
+            field_guard: self.field_guard,
         });
         tools.add_tool(FinalizeFindingMergeTool {
             buffer: buffer.clone(),
@@ -1037,11 +1378,17 @@ pub struct FindingMerger {
 pub struct AggregatedFindingMergeDecision {
     pub new_finding_title: String,
     pub merge_target_ids: Vec<i32>,
-    /// Detail to append to each merged-into canonical's description.
+    /// Full replacement description for each merged-into canonical (a concise
+    /// generalization). Replaces at write time; `None` keeps the existing.
+    pub updated_description: Option<String>,
+    /// Full replacement patterns; `None` keeps the existing.
+    pub updated_patterns: Option<String>,
+    /// Full replacement exploit paths; `None` keeps the existing.
+    pub updated_exploits: Option<String>,
+    /// The merge-edge `appended_*` notes (how the raw extends the canonical),
+    /// first non-empty across chunks. Written to every folded edge.
     pub appended_description: Option<String>,
-    /// Detail to append to each merged-into canonical's patterns.
     pub appended_patterns: Option<String>,
-    /// Detail to append to each merged-into canonical's exploits.
     pub appended_exploits: Option<String>,
 }
 
@@ -1056,6 +1403,9 @@ impl FindingMerger {
             .map(|f| AggregatedFindingMergeDecision {
                 new_finding_title: f.title.clone(),
                 merge_target_ids: Vec::new(),
+                updated_description: None,
+                updated_patterns: None,
+                updated_exploits: None,
                 appended_description: None,
                 appended_patterns: None,
                 appended_exploits: None,
@@ -1083,14 +1433,36 @@ impl FindingMerger {
             .iter()
             .flat_map(|chunk| chunk.iter().map(|c| c.canonical.id))
             .collect();
-        // Same as SemanticMerger: precompute the per-project valid-title
-        // set once, share by Arc into every chunk's emit tool so
-        // hallucinated titles are rejected at the call site.
-        let valid_titles: Arc<HashSet<String>> = Arc::new(by_title.keys().cloned().collect());
-        let new_findings_block = Self::render_new_block(&self.new_findings);
-        let chunk_results = self
-            .dispatch_chunks(chunks, new_findings_block, valid_titles)
-            .await?;
+        // Batch the new findings by the model's context window AND a hard
+        // count cap — same token+count partitioning as the semantic path.
+        // Work units (batch × candidate chunk) fan out under `concurrency`.
+        let model = self.llm.model.clone();
+        let new_item_budget = new_item_token_budget(
+            &model,
+            self.chunking.chunk_candidate_token_budget,
+            self.agent_options.context_window_utilization,
+        );
+        let batches = pack_new_item_batches(
+            self.new_findings.clone(),
+            new_item_budget,
+            self.chunking.new_item_batch_size,
+            |finding| {
+                model
+                    .config
+                    .count_tokens_lossy(&Self::render_new_block(std::slice::from_ref(finding)))
+            },
+        );
+        tracing::info!(
+            "{}: {} candidate chunk(s) × {} new-item batch(es) = {} work unit(s) (concurrency={}, new_item_token_budget={}, count_cap={})",
+            self.label_root,
+            chunks.len(),
+            batches.len(),
+            chunks.len() * batches.len(),
+            self.chunking.concurrency,
+            new_item_budget,
+            self.chunking.new_item_batch_size,
+        );
+        let chunk_results = self.dispatch_batched(&chunks, &batches).await?;
         for decisions in chunk_results {
             for decision in decisions {
                 let Some(&idx) = by_title.get(&decision.new_finding_title.to_lowercase()) else {
@@ -1114,15 +1486,27 @@ impl FindingMerger {
                         agg.merge_target_ids.push(target);
                     }
                 }
-                SemanticMergeAggregator::adopt_longer(
+                SemanticMergeAggregator::adopt_update(
+                    &mut agg.updated_description,
+                    decision.updated_description,
+                );
+                SemanticMergeAggregator::adopt_update(
+                    &mut agg.updated_patterns,
+                    decision.updated_patterns,
+                );
+                SemanticMergeAggregator::adopt_update(
+                    &mut agg.updated_exploits,
+                    decision.updated_exploits,
+                );
+                SemanticMergeAggregator::adopt_update(
                     &mut agg.appended_description,
                     decision.appended_description,
                 );
-                SemanticMergeAggregator::adopt_longer(
+                SemanticMergeAggregator::adopt_update(
                     &mut agg.appended_patterns,
                     decision.appended_patterns,
                 );
-                SemanticMergeAggregator::adopt_longer(
+                SemanticMergeAggregator::adopt_update(
                     &mut agg.appended_exploits,
                     decision.appended_exploits,
                 );
@@ -1160,6 +1544,21 @@ impl FindingMerger {
         let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
         let valid_target_ids: Arc<HashSet<i32>> =
             Arc::new(chunk.iter().map(|c| c.canonical.id).collect());
+        let target_texts: Arc<HashMap<i32, FindingTargetText>> = Arc::new(
+            chunk
+                .iter()
+                .map(|c| {
+                    (
+                        c.canonical.id,
+                        FindingTargetText {
+                            description: c.canonical.description.clone(),
+                            patterns: c.canonical.patterns.clone(),
+                            exploits: c.canonical.exploits.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
         FindingMergeChunkRunner {
             llm: self.llm.clone(),
             options: self.agent_options.scoped(&debug_scope),
@@ -1169,81 +1568,70 @@ impl FindingMerger {
             label,
             valid_titles,
             valid_target_ids,
+            target_texts,
+            field_guard: self.chunking.field_guard,
         }
     }
 
-    async fn dispatch_chunks(
+    /// Mirror of [`SemanticMerger::dispatch_batched`] for findings.
+    async fn dispatch_batched(
         &self,
-        chunks: Vec<Vec<FindingCanonicalWithTaxonomy>>,
-        new_findings_block: String,
-        valid_titles: Arc<HashSet<String>>,
+        chunks: &[Vec<FindingCanonicalWithTaxonomy>],
+        batches: &[Vec<ExtractedFinding>],
     ) -> Result<Vec<Vec<FindingMergeDecision>>> {
-        let total = chunks.len();
-        let concurrency = self.chunking.concurrency.max(1);
-        if concurrency <= 1 || total <= 1 {
-            self.dispatch_sequential(chunks, new_findings_block, valid_titles)
-                .await
-        } else {
-            self.dispatch_concurrent(chunks, new_findings_block, valid_titles, concurrency)
-                .await
+        let total_units = batches.len().saturating_mul(chunks.len());
+        let mut runners = Vec::with_capacity(total_units);
+        let mut unit_idx = 0usize;
+        for batch in batches {
+            let new_block = Self::render_new_block(batch);
+            let valid_titles: Arc<HashSet<String>> =
+                Arc::new(batch.iter().map(|f| f.title.to_lowercase()).collect());
+            for chunk in chunks {
+                runners.push(self.build_chunk_runner(
+                    unit_idx,
+                    total_units,
+                    chunk,
+                    &new_block,
+                    valid_titles.clone(),
+                ));
+                unit_idx += 1;
+            }
         }
+        run_finding_merge_runners(runners, self.chunking.concurrency.max(1)).await
     }
+}
 
-    async fn dispatch_sequential(
-        &self,
-        chunks: Vec<Vec<FindingCanonicalWithTaxonomy>>,
-        new_findings_block: String,
-        valid_titles: Arc<HashSet<String>>,
-    ) -> Result<Vec<Vec<FindingMergeDecision>>> {
-        let total = chunks.len();
-        let mut out = Vec::with_capacity(total);
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let runner = self.build_chunk_runner(
-                idx,
-                total,
-                &chunk,
-                &new_findings_block,
-                valid_titles.clone(),
-            );
+/// Bounded-concurrency pool for pre-built finding-merge runners. Mirror of
+/// [`run_semantic_merge_runners`].
+async fn run_finding_merge_runners(
+    runners: Vec<FindingMergeChunkRunner>,
+    concurrency: usize,
+) -> Result<Vec<Vec<FindingMergeDecision>>> {
+    let mut out = Vec::with_capacity(runners.len());
+    if runners.is_empty() {
+        return Ok(out);
+    }
+    if concurrency <= 1 {
+        for runner in runners {
             out.push(runner.run().await?);
         }
-        Ok(out)
+        return Ok(out);
     }
-
-    async fn dispatch_concurrent(
-        &self,
-        chunks: Vec<Vec<FindingCanonicalWithTaxonomy>>,
-        new_findings_block: String,
-        valid_titles: Arc<HashSet<String>>,
-        concurrency: usize,
-    ) -> Result<Vec<Vec<FindingMergeDecision>>> {
-        let total = chunks.len();
-        let mut joins: JoinSet<(usize, Result<Vec<FindingMergeDecision>>)> = JoinSet::new();
-        let mut pending = chunks.into_iter().enumerate().collect::<Vec<_>>();
-        let mut alive = 0usize;
-        let mut results: Vec<Option<Vec<FindingMergeDecision>>> =
-            (0..total).map(|_| None).collect();
-        while !pending.is_empty() || alive > 0 {
-            while alive < concurrency && !pending.is_empty() {
-                let (idx, chunk) = pending.remove(0);
-                let runner = self.build_chunk_runner(
-                    idx,
-                    total,
-                    &chunk,
-                    &new_findings_block,
-                    valid_titles.clone(),
-                );
-                joins.spawn(async move { (idx, runner.run().await) });
-                alive += 1;
-            }
-            if let Some(joined) = joins.join_next().await {
-                alive -= 1;
-                let (idx, res) = joined.map_err(|e| KgError::other(format!("merge join: {e}")))?;
-                results[idx] = Some(res?);
-            }
+    let mut it = runners.into_iter();
+    let mut joins: JoinSet<Result<Vec<FindingMergeDecision>>> = JoinSet::new();
+    for _ in 0..concurrency {
+        if let Some(runner) = it.next() {
+            joins.spawn(async move { runner.run().await });
         }
-        Ok(results.into_iter().map(|o| o.unwrap_or_default()).collect())
     }
+    while let Some(joined) = joins.join_next().await {
+        let res = joined.map_err(|e| KgError::other(format!("finding merge join: {e}")))?;
+        out.push(res?);
+        if let Some(runner) = it.next() {
+            joins.spawn(async move { runner.run().await });
+        }
+    }
+    Ok(out)
 }
 
 // `FindingMerger`'s pure rendering / packing helpers, mirroring
@@ -1289,8 +1677,8 @@ impl FindingMerger {
                 );
                 for raw in &entry.raw_children {
                     buf.push_str(&format!(
-                        "  - Title: {}\n    Severity: {}\n    Root Cause: {}\n    Description: {}\n",
-                        raw.title, raw.severity, raw.root_cause, raw.description,
+                        "  - Title: {}\n    Severity: {}\n    Root Cause: {}\n    Description: {}\n    Patterns: {}\n    Exploits: {}\n",
+                        raw.title, raw.severity, raw.root_cause, raw.description, raw.patterns, raw.exploits,
                     ));
                 }
             }
@@ -1309,7 +1697,7 @@ impl FindingMerger {
         let mut current_tokens: usize = 0;
         for entry in candidates {
             let single = Self::render_candidate_chunk(std::slice::from_ref(&entry));
-            let cost = crate::learn::count_tokens(model, &single);
+            let cost = model.config.count_tokens_lossy(&single);
             if !current.is_empty() && current_tokens + cost > chunk_token_budget {
                 chunks.push(std::mem::take(&mut current));
                 current_tokens = 0;
@@ -1321,5 +1709,116 @@ impl FindingMerger {
             chunks.push(current);
         }
         chunks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch_sizes(batches: &[Vec<i32>]) -> Vec<usize> {
+        batches.iter().map(Vec::len).collect()
+    }
+
+    // A substantial, concrete current description used to exercise the
+    // anti-abstraction guard. Comfortably above MERGE_FIELD_CONCRETE_FLOOR.
+    const CURRENT: &str = "Vault.deposit increments s_depositedAssets additively \
+        prior to safeTransferFrom, gated by whenNotPaused; minted shares equal \
+        previewDeposit(assets); reverts when paused or on zero assets.";
+
+    #[test]
+    fn check_merge_field_accepts_comparable_concrete_replacement() {
+        // A replacement of similar length/concreteness is accepted.
+        let candidate = "Vault.deposit adds assets to s_depositedAssets before \
+            safeTransferFrom under whenNotPaused; shares = previewDeposit(assets); \
+            reverts on paused or zero-asset deposits and on transfer failure.";
+        assert!(
+            check_merge_field_update(
+                MergeFieldGuard::default(),
+                "updated_description",
+                "raw",
+                candidate,
+                &[7],
+                |_| Some(CURRENT.to_string())
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_merge_field_rejects_abstracting_shrink() {
+        // Collapsing a rich description into a generic label is rejected with
+        // feedback rather than silently written.
+        let err = check_merge_field_update(
+            MergeFieldGuard::default(),
+            "updated_description",
+            "raw",
+            "improper access control",
+            &[7],
+            |_| Some(CURRENT.to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("shorter"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn check_merge_field_accepts_any_replacement_when_current_is_thin() {
+        // A thin current value (below the floor) has nothing concrete to
+        // protect, so even a short replacement is accepted.
+        assert!(
+            check_merge_field_update(
+                MergeFieldGuard::default(),
+                "updated_description",
+                "raw",
+                "swap",
+                &[7],
+                |_| Some("amm".to_string())
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_merge_field_rejects_overlong_candidate() {
+        let guard = MergeFieldGuard::default();
+        let candidate = "x".repeat(guard.max_chars + 1);
+        let err =
+            check_merge_field_update(guard, "updated_patterns", "raw", &candidate, &[7], |_| {
+                Some(CURRENT.to_string())
+            })
+            .unwrap_err();
+        assert!(err.contains("too long"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn pack_new_item_batches_respects_count_cap() {
+        // cost 1 each, effectively-infinite token budget → only the count cap
+        // closes batches.
+        let batches = pack_new_item_batches((0..10).collect::<Vec<i32>>(), 1_000_000, 4, |_| 1);
+        assert_eq!(batch_sizes(&batches), vec![4, 4, 2]);
+    }
+
+    #[test]
+    fn pack_new_item_batches_respects_token_budget() {
+        // cost 30 each, budget 100, count cap effectively infinite → 3 per
+        // batch (90 <= 100, 120 > 100).
+        let batches = pack_new_item_batches((0..7).collect::<Vec<i32>>(), 100, 1000, |_| 30);
+        assert_eq!(batch_sizes(&batches), vec![3, 3, 1]);
+    }
+
+    #[test]
+    fn pack_new_item_batches_isolates_oversized_item() {
+        // A single item larger than the whole budget still gets its own batch
+        // (never dropped).
+        let costs = [10usize, 500, 10];
+        let batches = pack_new_item_batches(vec![0i32, 1, 2], 100, 1000, |&i| costs[i as usize]);
+        assert_eq!(batch_sizes(&batches), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn pack_new_item_batches_count_cap_floored_to_one() {
+        // A zero count cap must floor to 1, not wedge on empty batches.
+        let batches = pack_new_item_batches(vec![0i32, 1, 2], 1_000_000, 0, |_| 1);
+        assert_eq!(batch_sizes(&batches), vec![1, 1, 1]);
     }
 }

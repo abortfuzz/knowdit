@@ -1,6 +1,11 @@
 pub mod cg;
 pub mod db;
 pub mod inheritance;
+
+/// Default cap on merged-variant notes rendered under each mirrored canonical
+/// (semantic description / finding fields) in `load_semantic_match_results`.
+pub const DEFAULT_VARIANT_RENDER_CAP: usize = 50;
+
 pub mod lang;
 pub mod link;
 pub mod move_lang;
@@ -21,10 +26,11 @@ pub use move_lang::{
 pub use repo::{
     CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, FindingMergeDecision,
     FindingProvenance, FindingReviewRecord, FullSpecRegenIds, HarnessRunRecord,
-    HistoricalLinkedFinding, HistoricalSemanticRecord, LinkResumeState, LoadedCodeGen,
-    LoadedHarnessRun, LoadedReportFinding, LoadedSpecification, LoadedValidFinding,
-    METADATA_KEY_PROFILE, MatchStrength, PendingReflection, ProjectComponent, ProjectProfile,
-    ProjectSubsystem, RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats,
-    RegenEventRecord, RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding, RunKind,
-    SemanticMatch, SemanticMatchSet, ValidFindingRecord,
+    HistoricalFindingChild, HistoricalLinkedFinding, HistoricalSemanticChild,
+    HistoricalSemanticRecord, LinkResumeState, LoadedCodeGen, LoadedHarnessRun,
+    LoadedReportFinding, LoadedSpecification, LoadedValidFinding, METADATA_KEY_PROFILE,
+    MatchStrength, PendingReflection, ProjectComponent, ProjectProfile, ProjectSubsystem,
+    RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats, RegenEventRecord,
+    RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding, RunKind, SemanticMatch,
+    SemanticMatchSet, ValidFindingRecord,
 };

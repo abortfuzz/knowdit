@@ -113,7 +113,7 @@ impl ReviewFindingsArgs {
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
 
         // Standalone CLI is Solidity-only (mirrors `agentic reflect`); other

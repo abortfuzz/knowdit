@@ -7,9 +7,7 @@ use crate::agents::{
 use crate::category::DeFiCategory;
 use crate::db::HistoricalDatabase;
 use crate::error::{KgError, Result};
-pub use crate::link::{
-    FindingLinkOptions, PendingFindingForLinking, PersistedFindingLinkResult, link_pending_findings,
-};
+pub use crate::link::{FindingLinkOptions, PendingFindingForLinking, PersistedFindingLinkResult};
 use crate::project_loader::ProjectData;
 use crate::prompts;
 use crate::vulnerability::{VulnerabilityCategory, resolve_taxonomy_entry};
@@ -18,7 +16,6 @@ pub use knowdit_kg_model::{ExtractedFinding, ExtractedFunction, ExtractedSemanti
 use llmy::client::client::LLM;
 use llmy::client::context::TokenCursor;
 use llmy::client::model::OpenAIModel;
-use llmy::tokenizer;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -91,10 +88,14 @@ pub enum MergeAction {
     /// Fold the new raw into one *or more* existing canonicals. Each
     /// `target_id` becomes one row in `semantic_merge`. The canonical's
     /// `name` and `definition` are stable identity and are NEVER touched
-    /// by a merge. `appended_description`, when present, is appended to
-    /// each merged-into canonical's existing description.
+    /// by a merge. `updated_description`, when present, REPLACES each
+    /// merged-into canonical's description with a generalization; `None`
+    /// keeps the existing description.
     Merge {
         target_ids: Vec<i32>,
+        updated_description: Option<String>,
+        /// One-or-two-sentence note (how this raw extends the canonical)
+        /// written to every `semantic_merge` edge this fold creates.
         appended_description: Option<String>,
     },
 }
@@ -111,11 +112,17 @@ pub enum FindingMergeAction {
     New,
     /// Fold the new raw into one *or more* existing canonical findings.
     /// Canonical's `title`, `severity`, and `root_cause` are stable
-    /// identity and are NEVER touched. The `appended_*` fields are
-    /// concatenated to the canonical's existing description / patterns /
-    /// exploits at write time.
+    /// identity and are NEVER touched. The `updated_*` fields, when present,
+    /// REPLACE the canonical's description / patterns / exploits with
+    /// generalizations at write time; `None` keeps the existing value.
     Merge {
         target_ids: Vec<i32>,
+        updated_description: Option<String>,
+        updated_patterns: Option<String>,
+        updated_exploits: Option<String>,
+        /// One-or-two-sentence notes (how this raw extends the canonical's
+        /// description / patterns / exploits) written to every `finding_merge`
+        /// edge this fold creates.
         appended_description: Option<String>,
         appended_patterns: Option<String>,
         appended_exploits: Option<String>,
@@ -479,9 +486,12 @@ impl ProjectData {
         let model = &llm.model;
         let user_suffix = prompts::CATEGORIZE_USER_SUFFIX;
         let cache_key = sanitize_prompt_prefix(&self.display_id());
-        let sys_tokens = count_tokens(model, prompts::GENERAL_ROLE_SYSTEM);
-        let suffix_tokens = count_tokens(model, user_suffix);
-        let budget = get_context_budget(model).saturating_sub(sys_tokens + suffix_tokens);
+        let sys_tokens = model
+            .config
+            .count_tokens_lossy(prompts::GENERAL_ROLE_SYSTEM);
+        let suffix_tokens = model.config.count_tokens_lossy(user_suffix);
+        let budget = get_context_budget(model, agent_options.context_window_utilization)
+            .saturating_sub(sys_tokens + suffix_tokens);
         let content = self.build_project_prompt_body();
         tracing::info!(
             "categorize preparing {}: source_files={}, body_chars={}, budget={}",
@@ -499,7 +509,7 @@ impl ProjectData {
         let user_prompt = format!("{}{}", cursor.next_chunk(budget).unwrap_or(""), user_suffix,);
         tracing::info!(
             "Categorization prompt: ~{} tokens (budget: {})",
-            sys_tokens + count_tokens(model, &user_prompt),
+            sys_tokens + model.config.count_tokens_lossy(&user_prompt),
             sys_tokens + budget,
         );
 
@@ -539,10 +549,10 @@ impl ProjectData {
         let model = &llm.model;
         let debug_key = self.debug_key("extract");
         let cache_key_root = self.prompt_cache_key();
-        let sys_tokens = count_tokens(model, system_prompt);
-        let total_budget = get_context_budget(model);
+        let sys_tokens = model.config.count_tokens_lossy(system_prompt);
+        let total_budget = get_context_budget(model, agent_options.context_window_utilization);
         let user_suffix = prompts::extract_semantics_user_suffix(categories);
-        let suffix_tokens = count_tokens(model, &user_suffix);
+        let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
 
         // Caller-overridable per-chunk input budget; default = ~80% of
         // model max input minus the fixed system + suffix overhead.
@@ -565,7 +575,7 @@ impl ProjectData {
             tracing::info!(
                 "Extracting semantics from chunk {} (~{} tokens, done={})",
                 chunk_idx,
-                sys_tokens + count_tokens(model, &user_prompt),
+                sys_tokens + model.config.count_tokens_lossy(&user_prompt),
                 cursor.is_done(),
             );
             let chunk_label = format!("semantic-extract-{}-chunk{}", self.display_id(), chunk_idx);
@@ -686,10 +696,10 @@ impl ProjectData {
         let model = &llm.model;
         let debug_key = self.debug_key("finding-extract");
         let cache_key_root = self.finding_cache_key();
-        let sys_tokens = count_tokens(model, system_prompt);
-        let total_budget = get_context_budget(model);
+        let sys_tokens = model.config.count_tokens_lossy(system_prompt);
+        let total_budget = get_context_budget(model, agent_options.context_window_utilization);
         let user_suffix = prompts::extract_findings_user_suffix(categories);
-        let suffix_tokens = count_tokens(model, &user_suffix);
+        let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
         let chunk_budget = match chunk_input_budget {
             Some(cap) => cap.min(total_budget.saturating_sub(sys_tokens + suffix_tokens)),
             None => total_budget.saturating_sub(sys_tokens + suffix_tokens),
@@ -708,7 +718,7 @@ impl ProjectData {
             tracing::info!(
                 "Extracting findings from chunk {} (~{} tokens, done={})",
                 chunk_idx,
-                sys_tokens + count_tokens(model, &user_prompt),
+                sys_tokens + model.config.count_tokens_lossy(&user_prompt),
                 cursor.is_done(),
             );
             let chunk_label = format!("finding-extract-{}-chunk{}", self.display_id(), chunk_idx);
@@ -882,6 +892,7 @@ impl ProjectData {
                 let action = match by_name.get(&sem.name.to_lowercase()) {
                     Some(d) if !d.merge_target_ids.is_empty() => MergeAction::Merge {
                         target_ids: d.merge_target_ids.clone(),
+                        updated_description: d.updated_description.clone(),
                         appended_description: d.appended_description.clone(),
                     },
                     _ => MergeAction::New,
@@ -948,6 +959,9 @@ impl ProjectData {
                 let action = match by_title.get(&finding.title.to_lowercase()) {
                     Some(d) if !d.merge_target_ids.is_empty() => FindingMergeAction::Merge {
                         target_ids: d.merge_target_ids.clone(),
+                        updated_description: d.updated_description.clone(),
+                        updated_patterns: d.updated_patterns.clone(),
+                        updated_exploits: d.updated_exploits.clone(),
                         appended_description: d.appended_description.clone(),
                         appended_patterns: d.appended_patterns.clone(),
                         appended_exploits: d.appended_exploits.clone(),
@@ -963,14 +977,21 @@ impl ProjectData {
     }
 }
 
-// ── Token counting utilities ────────────────────────────────────────
+/// Default fraction of a model's max input a single prompt may fill, used
+/// where no CLI override is threaded in (categorize / extract). Kept well
+/// below 1.0 on purpose: over-long prompts dilute the model's attention, so
+/// we trade packing efficiency (more, smaller chunks/batches) for sharper
+/// per-prompt focus. Overridable per-command — e.g. `merge-kg`'s
+/// `--context-window-utilization` threads a value into the merge + link
+/// budgets.
+pub const DEFAULT_CONTEXT_WINDOW_UTILIZATION: f64 = 0.4;
 
-pub(crate) fn count_tokens(model: &OpenAIModel, text: &str) -> usize {
-    tokenizer::count_tokens_for_model(model.model_id_str(), text).unwrap_or(text.len() / 4)
-}
-
-pub(crate) fn get_context_budget(model: &OpenAIModel) -> usize {
-    (model.config.max_input() as f64 * 0.8) as _
+/// Token budget for a single prompt: `utilization` × the model's max input.
+/// `utilization` is clamped to a sane `(0, 1]` band so a mis-typed CLI value
+/// can't zero out (or overflow) the budget.
+pub(crate) fn get_context_budget(model: &OpenAIModel, utilization: f64) -> usize {
+    let utilization = utilization.clamp(0.05, 1.0);
+    (model.config.max_input() as f64 * utilization) as _
 }
 
 pub(crate) fn sanitize_prompt_prefix(value: &str) -> String {

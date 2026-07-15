@@ -24,6 +24,15 @@ pub struct ExtractSemanticsSharedArgs {
     /// agents. Each `emit_*` tool call counts as one step.
     #[arg(long = "extract-max-agent-steps", default_value_t = 60)]
     pub extract_max_agent_steps: usize,
+
+    /// Fraction (0,1] of the model's context window a single categorize /
+    /// extract prompt may fill. Lower = more, smaller prompts with sharper
+    /// attention. Prefixed to stay collision-free when co-flattened.
+    #[arg(
+        long = "extract-context-window-utilization",
+        default_value_t = knowdit_kg::learn::DEFAULT_CONTEXT_WINDOW_UTILIZATION
+    )]
+    pub extract_context_window_utilization: f64,
 }
 
 #[derive(Args)]
@@ -52,7 +61,7 @@ impl ExtractSemanticsArgs {
         let project = self.project.to_project_data().await?;
         let LoadedRepoDatabase { repo, .. } = self
             .project
-            .to_repo_database(self.db.database_path.clone())
+            .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
         let semantics = Self::extract_semantics(&repo, llm, &project, &self.shared).await?;
         if let Some(out) = self.out.as_ref() {
@@ -75,7 +84,8 @@ impl ExtractSemanticsArgs {
         project: &ProjectData,
         shared: &ExtractSemanticsSharedArgs,
     ) -> Result<Vec<ExtractedSemantic>> {
-        let agent_options = AgentRunOptions::new(shared.extract_max_agent_steps);
+        let agent_options = AgentRunOptions::new(shared.extract_max_agent_steps)
+            .with_context_window_utilization(shared.extract_context_window_utilization);
         load_or_extract_project_semantics(
             repo,
             llm,

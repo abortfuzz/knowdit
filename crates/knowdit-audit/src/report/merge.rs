@@ -268,12 +268,10 @@ impl MergeAgent {
     /// Greedily pack the candidates into chunks whose rendered token cost
     /// stays under `window_ratio × max_input` (minus a reserve for the system
     /// prompt + the finding framing). Token counts come from the model's
-    /// tokenizer, falling back to a chars/4 estimate.
+    /// tokenizer.
     fn pack_candidate_chunks(&self, input: &MergeInput) -> Vec<Vec<MergeCandidate>> {
         let model = &self.llm.model;
-        let tok = |s: &str| {
-            llmy::tokenizer::count_tokens_for_model(model.model_id_str(), s).unwrap_or(s.len() / 4)
-        };
+        let tok = |s: &str| model.config.count_tokens_lossy(s);
         let budget = (model.config.max_input() as f64 * self.window_ratio) as usize;
         let finding_only = input.with_candidates(Vec::new());
         let reserve = tok(super::prompt::MERGE_SYSTEM_TEMPLATE)

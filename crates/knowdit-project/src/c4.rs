@@ -9,7 +9,7 @@
 //! rest of the pipeline take "project + optional audit" without
 //! having to discriminate on dataset origin.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::Deserialize;
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::{
     data::{ProjectData, SourceLanguage},
     moves::MoveVulnerabilitySnippet,
-    scope::ProjectScope,
+    scope::{ProjectScope, ProjectScopeContent, ScopedSourceFile},
 };
 
 /// `audits/<id>.json` payload for a Code4rena contest. Only the
@@ -35,6 +35,34 @@ pub struct AuditMeta {
     #[serde(rename = "endTime")]
     pub end_time: Option<String>,
     pub details: Option<String>,
+}
+
+/// Minimal view of a Sherlock `metadata/<id>.json` — only the fields
+/// [`C4PairedProjectData::from_sherlock`] needs; serde ignores the rest.
+#[derive(Debug, Deserialize)]
+pub struct SherlockMeta {
+    #[serde(default)]
+    pub title: String,
+    /// Sherlock's packaged repo (`sherlock-audit/<contest>`); nests each
+    /// in-scope repo under `<repo_basename>/` and is the fallback source when
+    /// the upstream clone was private/missing.
+    #[serde(default)]
+    pub template_repo_name: Option<String>,
+    #[serde(default)]
+    pub scope: Vec<SherlockScopeRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SherlockScopeRepo {
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub files: Vec<SherlockScopeFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SherlockScopeFile {
+    pub name: String,
 }
 
 /// Renderable audit-report payload. Plain text for C4; structured
@@ -209,5 +237,110 @@ impl C4PairedProjectData {
             meta: Some(meta),
             audit: report,
         })
+    }
+
+    /// Load one Sherlock contest from a `sherlock-scrape/out` directory
+    /// (`metadata/<id>.json` + `source/<id>/…` + optional
+    /// `reports/<id>/report.md`). A contest can span several repos; their
+    /// exact in-scope files are aggregated into one [`ProjectData`], each
+    /// file's `relative_path` namespaced by `<repo_basename>/`.
+    ///
+    /// The scraper checks out each upstream in-scope repo under `<repo__>/`,
+    /// and Sherlock's packaged/template repo which nests each in-scope repo
+    /// under `<template__>/<repo_basename>/`. Upstream clones often fail
+    /// (private/deleted) — then only the template copy exists — so each file
+    /// is resolved against both layouts, first hit wins. Files not on disk
+    /// anywhere are dropped, never an error.
+    ///
+    /// Returns `Ok(None)` when the contest is not ingestible: no `scope`, no
+    /// in-scope files on disk, or a language other than Solidity/Move (the
+    /// only extractors we have). The report is optional.
+    pub async fn from_sherlock(out_dir: &Path, contest_id: u32) -> Result<Option<Self>> {
+        let meta_path = out_dir.join("metadata").join(format!("{contest_id}.json"));
+        let meta: SherlockMeta = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path)
+                .wrap_err_with(|| format!("failed to read {}", meta_path.display()))?,
+        )
+        .wrap_err_with(|| format!("failed to parse {}", meta_path.display()))?;
+
+        if meta.scope.is_empty() {
+            return Ok(None);
+        }
+
+        let source_root = out_dir.join("source").join(contest_id.to_string());
+        let template_root = meta
+            .template_repo_name
+            .as_deref()
+            .map(|template| source_root.join(template.replace('/', "__")));
+        let mut files: Vec<ScopedSourceFile> = Vec::new();
+        let mut has_sol = false;
+        let mut has_move = false;
+        for repo in &meta.scope {
+            let basename = repo.repo.rsplit('/').next().unwrap_or(repo.repo.as_str());
+            let mut roots = vec![source_root.join(repo.repo.replace('/', "__"))];
+            if let Some(template) = &template_root {
+                roots.push(template.join(basename));
+                roots.push(template.clone());
+            }
+            for file in &repo.files {
+                let Some((absolute_path, content)) = roots.iter().find_map(|root| {
+                    let path = root.join(&file.name);
+                    std::fs::read_to_string(&path).ok().map(|body| (path, body))
+                }) else {
+                    continue;
+                };
+                match Path::new(&file.name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                {
+                    Some("sol") => has_sol = true,
+                    Some("move") => has_move = true,
+                    _ => {}
+                }
+                files.push(ScopedSourceFile {
+                    absolute_path,
+                    relative_path: PathBuf::from(basename).join(&file.name),
+                    content,
+                });
+            }
+        }
+
+        // Solidity wins when both are present; keep only the chosen language's
+        // files so we never feed `.move` into the Solidity extractor.
+        let (language, keep_ext) = if has_sol {
+            (SourceLanguage::Solidity, "sol")
+        } else if has_move {
+            (SourceLanguage::Move, "move")
+        } else {
+            return Ok(None);
+        };
+        files.retain(|file| {
+            file.relative_path.extension().and_then(|ext| ext.to_str()) == Some(keep_ext)
+        });
+        if files.is_empty() {
+            return Ok(None);
+        }
+        files.sort_by(|lhs, rhs| lhs.relative_path.cmp(&rhs.relative_path));
+
+        let project = ProjectData::new(
+            if meta.title.is_empty() {
+                format!("sherlock-{contest_id}")
+            } else {
+                meta.title.clone()
+            },
+            Some(format!("sherlock-{contest_id}")),
+            language,
+            ProjectScopeContent::new(source_root, files),
+        );
+        let report = AuditReportMaterial::from_optional_text_file(
+            &out_dir
+                .join("reports")
+                .join(contest_id.to_string())
+                .join("report.md"),
+        );
+        Ok(Some(match report {
+            Some(report) => Self::audit_only(project, report),
+            None => Self::bare(project),
+        }))
     }
 }

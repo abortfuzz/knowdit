@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = [
     "Ziqiao Kong <mio@lazym.io>"
@@ -21,7 +21,7 @@ dotenvy = "0"
 color-eyre = "0"
 tracing = "0"
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
-llmy = { version = "0.16.2" }
+llmy = { version = "0.17" }
 thiserror = "2"
 async-channel = "2"
 url = "2"
@@ -44,12 +44,12 @@ toml = "0.8"
 shellexpand = "3"
 humantime = "2"
 
-knowdit-kg-model = { version = "1.0.0", path = "./crates/knowdit-kg-model" }
-knowdit-repo-model = { version = "1.0.0", path = "./crates/knowdit-repo-model" }
-knowdit-kg = { version = "1.0.0", path = "./crates/knowdit-kg" }
-knowdit-sol = { version = "1.0.0", path = "./crates/knowdit-sol" }
-knowdit = {version = "1.0.0", path = "./crates/knowdit"}
-knowdit-agents = { version = "1.0.0", path = "./crates/knowdit-agents" }
-knowdit-audit = { version = "1.0.0", path = "./crates/knowdit-audit" }
-knowdit-cg-static = { version = "1.0.0", path = "./crates/knowdit-cg-static" }
-knowdit-project = { version = "1.0.0", path = "./crates/knowdit-project" }
+knowdit-kg-model = { version = "1.0.1", path = "./crates/knowdit-kg-model" }
+knowdit-repo-model = { version = "1.0.1", path = "./crates/knowdit-repo-model" }
+knowdit-kg = { version = "1.0.1", path = "./crates/knowdit-kg" }
+knowdit-sol = { version = "1.0.1", path = "./crates/knowdit-sol" }
+knowdit = {version = "1.0.1", path = "./crates/knowdit"}
+knowdit-agents = { version = "1.0.1", path = "./crates/knowdit-agents" }
+knowdit-audit = { version = "1.0.1", path = "./crates/knowdit-audit" }
+knowdit-cg-static = { version = "1.0.1", path = "./crates/knowdit-cg-static" }
+knowdit-project = { version = "1.0.1", path = "./crates/knowdit-project" }
