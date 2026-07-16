@@ -2,8 +2,10 @@ use crate::cmd::learn::finding_link_args::FindingLinkCliArgs;
 use clap::Args;
 use color_eyre::eyre::Result;
 use knowdit_kg::db::HistoricalDatabase;
+use knowdit_kg_model::db::operation_history::OperationType;
 use llmy::clap::OpenAISetup;
 use llmy::client::client::LLM;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Knobs for the intra-project finding-to-semantic link phase. Long
@@ -11,7 +13,7 @@ use std::collections::HashSet;
 /// [`crate::cmd::learn::retro_link::RetroLinkSharedArgs`] in the
 /// `workflow learn` orchestrator does not collide on the
 /// `concurrency` / `include_unlinked` field names.
-#[derive(Args, Clone, Debug)]
+#[derive(Args, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LinkSharedArgs {
     /// Number of findings to link concurrently.
     #[arg(long = "link-concurrency", default_value_t = 1)]
@@ -63,6 +65,16 @@ pub struct LinkArgs {
     pub shared: LinkSharedArgs,
 }
 
+/// Non-sensitive argument payload persisted to `operation_history` for a
+/// `link` run: the finding-link tuning knobs plus the link-phase shared flags,
+/// combined into one JSON object. Deliberately excludes [`OpenAISetup`] (LLM
+/// credentials) — the audit log never stores secrets.
+#[derive(Serialize, Deserialize)]
+struct LinkOperationArgs {
+    finding_link: FindingLinkCliArgs,
+    shared: LinkSharedArgs,
+}
+
 impl LinkArgs {
     /// CLI entry: build the LLM from clap, delegate to
     /// [`Self::link`].
@@ -76,7 +88,15 @@ impl LinkArgs {
             &self.shared,
             self.finding_link.link_context_window_utilization,
         )
-        .await
+        .await?;
+        // Recorded only after linking committed, so an interrupted run leaves
+        // no operation_history row; deduped on (type, args) by `record_operation`.
+        let args = serde_json::to_value(LinkOperationArgs {
+            finding_link: self.finding_link,
+            shared: self.shared,
+        })?;
+        db.record_operation(OperationType::Link, args).await?;
+        Ok(())
     }
 
     /// In-process entry: run intra-project finding-to-semantic

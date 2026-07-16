@@ -79,7 +79,6 @@ pub enum WorkflowCommands {
     /// verbatim, then cross-seam link the source's new nodes against this
     /// KG's existing corpus.
     MergeKg(cmd::workflow::merge_kg::MergeKgArgs),
-
 }
 
 /// `knowdit db ...` — non-LLM tools that operate on the historical

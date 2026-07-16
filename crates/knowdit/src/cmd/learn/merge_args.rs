@@ -8,22 +8,26 @@ use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::agent_runner::AgentRunOptions;
 use knowdit_kg::agents::{MergeChunkingOptions, MergeFieldGuard};
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeCliArgs {
     /// Hard cap on agent steps for a single per-chunk learn-pipeline
     /// agent (categorize, extract semantics, extract findings, semantic
     /// merge, finding merge). Each `emit_*` tool call counts as one step.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 160)]
     pub max_agent_steps: usize,
 
-    /// Soft cap on the rendered token cost of the existing-canonical
-    /// candidates section in a single merge prompt. The chunker packs
-    /// canonicals (with their merged-away children) greedily until adding
-    /// the next candidate would exceed this budget. Larger budgets fewer
-    /// chunks (cheaper but bigger prompts); smaller budgets more chunks
-    /// (more LLM calls, smaller prompts).
-    #[arg(long, default_value_t = 50_000)]
-    pub merge_chunk_candidate_token_budget: usize,
+    /// Share (0, 1) of a merge prompt's usable window — model window ×
+    /// `--context-window-utilization`, minus the system prompt — reserved for
+    /// the NEW-items block (newly-extracted semantics / findings). The existing
+    /// canonical-candidate block takes the remainder and is chunked to fit it.
+    /// Higher ⇒ bigger new-item batches but smaller candidate chunks (so more
+    /// candidate chunks / LLM calls); lower ⇒ the reverse. Mirrors the link
+    /// pipeline's `--finding-token-ratio`. Replaces the old absolute candidate
+    /// budget so the split scales with the model window instead of overflowing
+    /// small ones. On a 1M-window model at the default utilization this leaves
+    /// the candidate block ~80k tokens.
+    #[arg(long, default_value_t = 0.85)]
+    pub merge_new_item_token_ratio: f64,
 
     /// Maximum number of merge agents (one per work unit) running in
     /// parallel during a single project's merge phase. `1` falls back
@@ -82,8 +86,8 @@ impl MergeCliArgs {
             "max_agent_steps must be greater than zero",
         );
         ensure!(
-            self.merge_chunk_candidate_token_budget >= 1024,
-            "merge_chunk_candidate_token_budget must be at least 1024 tokens",
+            self.merge_new_item_token_ratio > 0.0 && self.merge_new_item_token_ratio < 1.0,
+            "merge_new_item_token_ratio must be in (0, 1) — the candidate block takes the remainder",
         );
         ensure!(
             self.merge_concurrency > 0,
@@ -119,7 +123,7 @@ impl MergeCliArgs {
 
     pub fn to_chunking_options(&self) -> MergeChunkingOptions {
         MergeChunkingOptions::new(
-            self.merge_chunk_candidate_token_budget,
+            self.merge_new_item_token_ratio,
             self.merge_concurrency,
             self.merge_new_item_batch_size,
             MergeFieldGuard {

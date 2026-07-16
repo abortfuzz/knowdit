@@ -4,6 +4,7 @@ use crate::knowledge_graph::KnowledgeGraph;
 use crate::vulnerability::{FINDING_TAXONOMY, VulnerabilityCategory};
 use itertools::Itertools;
 use knowdit_kg_model::db::merge_status::MergePhase;
+use knowdit_kg_model::db::operation_history::{self, OperationType};
 use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_link_status,
     finding_merge, merge_status, pending_semantic, project, project_category, project_finding,
@@ -311,6 +312,46 @@ impl HistoricalDatabase {
         Ok(())
     }
 
+    /// Append one row to `operation_history` recording that a top-level learn
+    /// operation (`c4learn` / `link`) ran to completion, tagged with the
+    /// non-sensitive arguments it used.
+    ///
+    /// Idempotent on `(type, args)`: if a row with the same operation type and
+    /// byte-identical arguments already exists, this is a no-op. Callers invoke
+    /// it ONLY after the operation's real work has committed, so an interrupted
+    /// run leaves no `operation_history` row (no dirty data) and re-running the
+    /// same command appends no duplicate. The existence check and the insert
+    /// share one transaction so a concurrent racer can't slip a duplicate in
+    /// between.
+    pub async fn record_operation(
+        &self,
+        operation_type: OperationType,
+        args: serde_json::Value,
+    ) -> Result<()> {
+        let txn = self.db.begin().await?;
+        let duplicate = operation_history::Entity::find()
+            .filter(operation_history::Column::OperationType.eq(operation_type))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .any(|row| row.args == args);
+        if duplicate {
+            txn.commit().await?;
+            return Ok(());
+        }
+        let recorded_at: sea_orm::prelude::DateTimeUtc = std::time::SystemTime::now().into();
+        operation_history::ActiveModel {
+            datetime: Set(recorded_at),
+            operation_type: Set(operation_type),
+            args: Set(args),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// Read-only probe for whether this database already holds the
     /// historical-KG schema. Consumers (`workflow streamloop` /
     /// `autoloop`, `agentic map-semantics`) call this so they can skip
@@ -445,6 +486,9 @@ impl HistoricalDatabase {
             schema.create_table_from_entity(project_finding::Entity),
             schema.create_table_from_entity(knowdit_kg_model::db::pending_semantic::Entity),
             schema.create_table_from_entity(merge_status::Entity),
+            // Append-only audit log of top-level learn operations. No FKs —
+            // it references nothing and nothing references it.
+            schema.create_table_from_entity(operation_history::Entity),
         ];
 
         for mut table in tables {
@@ -5984,6 +6028,59 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             .expect("processed merged findings should load");
 
         assert!(findings_without_links.is_empty());
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `record_operation` is an idempotent audit log keyed on `(type, args)`:
+    /// re-recording identical arguments is a no-op, while a different arg set
+    /// or a different operation type yields a distinct row. Also confirms the
+    /// stored `args` JSON round-trips back to the exact `Value` inserted (the
+    /// basis for the in-Rust dedup comparison).
+    #[tokio::test]
+    async fn record_operation_dedups_on_type_and_args() {
+        let (db, path) = create_test_db().await;
+
+        let args_a = serde_json::json!({"max_agent_steps": 60, "merge_concurrency": 1});
+        let args_b = serde_json::json!({"max_agent_steps": 80, "merge_concurrency": 2});
+
+        db.record_operation(OperationType::C4Learn, args_a.clone())
+            .await
+            .expect("first record should insert");
+        // Re-running the same operation with identical args must not duplicate.
+        db.record_operation(OperationType::C4Learn, args_a.clone())
+            .await
+            .expect("duplicate record should be a no-op");
+        // Different args under the same type is a distinct operation.
+        db.record_operation(OperationType::C4Learn, args_b.clone())
+            .await
+            .expect("distinct args should insert");
+        // Identical args under a different type is also distinct.
+        db.record_operation(OperationType::Link, args_a.clone())
+            .await
+            .expect("distinct type should insert");
+
+        let rows = operation_history::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("operation_history should load");
+        assert_eq!(rows.len(), 3, "expected exactly three distinct rows");
+
+        let c4_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.operation_type == OperationType::C4Learn)
+            .collect();
+        assert_eq!(c4_rows.len(), 2);
+        assert!(c4_rows.iter().any(|r| r.args == args_a));
+        assert!(c4_rows.iter().any(|r| r.args == args_b));
+
+        let link_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.operation_type == OperationType::Link)
+            .collect();
+        assert_eq!(link_rows.len(), 1);
+        assert_eq!(link_rows[0].args, args_a);
 
         drop(db);
         cleanup_test_db(&path);

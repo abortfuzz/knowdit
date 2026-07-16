@@ -6,6 +6,7 @@ use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg::error::KgError;
 use knowdit_kg::learn::{ExtractResult, FindingLinkOptions};
 use knowdit_kg::project_loader::{MovePlatform, ProjectData};
+use knowdit_kg_model::db::operation_history::OperationType;
 use llmy::clap::OpenAISetup;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -188,6 +189,10 @@ impl LearnC4Args {
             }
         }
 
+        // Captured before the pipeline runs, recorded only after it succeeds:
+        // a killed run leaves no operation_history row (see `record_operation`).
+        let merge_args = serde_json::to_value(&self.merge)
+            .wrap_err("failed to serialize c4learn merge args for operation_history")?;
         run_pipeline(
             db,
             &llm,
@@ -198,7 +203,10 @@ impl LearnC4Args {
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
         )
-        .await
+        .await?;
+        db.record_operation(OperationType::C4Learn, merge_args)
+            .await?;
+        Ok(())
     }
 }
 

@@ -44,8 +44,10 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 
 const DEFAULT_BATCH_SIZE: usize = 16;
-/// Cap on raw children rendered per canonical in the matcher prompt.
-const MAX_RENDERED_RAW_CHILDREN: usize = 5;
+/// Default cap on raw children rendered per canonical in the matcher
+/// prompt. Overridable per-run via [`MapperOptions::max_rendered_raw_children`]
+/// (CLI `--map-max-raw-children`).
+const DEFAULT_MAX_RENDERED_RAW_CHILDREN: usize = 5;
 
 /// Minimum length of the LLM-emitted `evidence` string per strength
 /// tier. Plan §6.4 forced-per-candidate-emit + §6.1 evidence rules:
@@ -79,6 +81,11 @@ pub struct MapperOptions {
     /// narrowly — e.g. a P2P-escrow project tagged only `Others` can add
     /// `Services` to surface signature/authorization historical knowledge.
     pub extra_categories: Vec<DeFiCategory>,
+    /// Cap on merged raw children rendered per canonical in the matcher
+    /// prompt. `0` suppresses the `merged_raw_examples` block entirely.
+    /// Larger values give the LLM more concrete examples per cluster at
+    /// the cost of prompt tokens. See [`DEFAULT_MAX_RENDERED_RAW_CHILDREN`].
+    pub max_rendered_raw_children: usize,
 }
 
 impl Default for MapperOptions {
@@ -89,6 +96,7 @@ impl Default for MapperOptions {
             cache_key: Some("knowdit-mapper".to_string()),
             language_prompt_prefix: String::new(),
             extra_categories: Vec::new(),
+            max_rendered_raw_children: DEFAULT_MAX_RENDERED_RAW_CHILDREN,
         }
     }
 }
@@ -407,6 +415,7 @@ async fn batch_match(
 
     let batch_size = options.batch_size.max(1);
     let concurrency = options.concurrency.max(1);
+    let max_rendered_raw_children = options.max_rendered_raw_children;
     let total_batches = historicals.len().div_ceil(batch_size);
 
     // Shared, read-only inputs every worker needs. Wrapped in `Arc`
@@ -456,6 +465,7 @@ async fn batch_match(
                     &extracted_block,
                     &valid_extract_ids,
                     &batch,
+                    max_rendered_raw_children,
                     &label,
                 )
                 .await;
@@ -520,9 +530,10 @@ async fn run_one_batch(
     extracted_block: &str,
     valid_extract_ids: &BTreeSet<i32>,
     batch: &[CanonicalWithChildren<semantic_node::Model>],
+    max_rendered_raw_children: usize,
     label: &str,
 ) -> Result<Vec<SemanticMatch>> {
-    let user_prompt = build_user_prompt(extracted_block, batch);
+    let user_prompt = build_user_prompt(extracted_block, batch, max_rendered_raw_children);
 
     let response: MatchResponse = llm
         .prompt_json_with_retry(system_prompt, &user_prompt, None, cache_key, None)
@@ -683,7 +694,10 @@ fn render_extracted_block(extracted: &[(i32, &ExtractedSemantic)]) -> String {
     out
 }
 
-fn render_historical_block(batch: &[CanonicalWithChildren<semantic_node::Model>]) -> String {
+fn render_historical_block(
+    batch: &[CanonicalWithChildren<semantic_node::Model>],
+    max_rendered_raw_children: usize,
+) -> String {
     let mut out = String::new();
     for entry in batch {
         let canonical = &entry.canonical;
@@ -695,9 +709,9 @@ fn render_historical_block(batch: &[CanonicalWithChildren<semantic_node::Model>]
             canonical.definition.trim(),
             canonical.description.trim()
         ));
-        if !entry.raw_children.is_empty() {
+        if !entry.raw_children.is_empty() && max_rendered_raw_children > 0 {
             let total = entry.raw_children.len();
-            let shown = total.min(MAX_RENDERED_RAW_CHILDREN);
+            let shown = total.min(max_rendered_raw_children);
             out.push_str(&format!(
                 "  merged_raw_examples ({} of {}; canonical may match if any align):\n",
                 shown, total
@@ -723,6 +737,7 @@ fn render_historical_block(batch: &[CanonicalWithChildren<semantic_node::Model>]
 fn build_user_prompt(
     extracted_block: &str,
     batch: &[CanonicalWithChildren<semantic_node::Model>],
+    max_rendered_raw_children: usize,
 ) -> String {
     format!(
         "## Extracted project semantics\n{extracted}\n\
@@ -741,7 +756,7 @@ fn build_user_prompt(
          ```\nNever invent ids that were not listed in the inputs. Coverage is mandatory: missing \
          pairs are treated as the agent shirking the contract and a warning is logged.",
         extracted = extracted_block,
-        historical = render_historical_block(batch),
+        historical = render_historical_block(batch, max_rendered_raw_children),
     )
 }
 

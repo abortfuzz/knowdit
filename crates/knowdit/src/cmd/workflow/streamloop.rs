@@ -444,8 +444,6 @@ impl StreamloopArgs {
         Ok(usage)
     }
 
-
-
     /// Fill in every per-phase concurrency knob that the user did
     /// NOT pass explicitly with `--default-concurrency`. Per-phase
     /// values that ARE present win — `-d 4 --fuzz-concurrency 1`
@@ -1115,7 +1113,6 @@ impl LinkScopes {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Scheduler

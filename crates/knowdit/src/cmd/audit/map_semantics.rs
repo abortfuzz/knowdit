@@ -35,6 +35,13 @@ pub struct MapSemanticsSharedArgs {
     #[arg(long = "map-batch-size", default_value_t = 16)]
     pub map_batch_size: usize,
 
+    /// Cap on merged raw children ("`merged_raw_examples`") rendered per
+    /// canonical historical semantic in the matcher prompt. Higher values
+    /// give the LLM more concrete examples per cluster at the cost of prompt
+    /// tokens; `0` suppresses the examples block entirely.
+    #[arg(long = "map-max-raw-children", default_value_t = 5)]
+    pub map_max_raw_children: usize,
+
     /// `llmy` cache key prefix. Defaults to
     /// `{project_name}-knowdit-mapper` when omitted so different
     /// projects don't share a cache namespace.
@@ -175,6 +182,7 @@ impl MapSemanticsArgs {
             cache_key: Some(cache_key),
             language_prompt_prefix: language_prompt_prefix.clone(),
             extra_categories: shared.extra_categories()?,
+            max_rendered_raw_children: shared.map_max_raw_children,
         };
         KnowledgeMapper::new(profile, language_prompt_prefix)
             .run(repo, kg, llm, &options)

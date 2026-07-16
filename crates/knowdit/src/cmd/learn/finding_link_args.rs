@@ -2,7 +2,7 @@ use clap::Args;
 use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::learn::FindingLinkOptions;
 
-#[derive(Args, Debug, Clone, Copy)]
+#[derive(Args, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct FindingLinkCliArgs {
     /// Absolute ceiling on total input tokens per linking prompt. Unset ⇒
     /// derived from the model window × `--link-context-window-utilization`; can
@@ -104,7 +104,7 @@ pub struct FindingLinkCliArgs {
 /// and `validate-db` (measures the DB's rendered field lengths) so both speak
 /// the same caliber: pass the same values to see exactly the per-candidate /
 /// per-finding mass a link run would put in its prompts.
-#[derive(Args, Debug, Clone, Copy)]
+#[derive(Args, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct VariantRenderArgs {
     /// Max merged variants (count) rendered under each candidate AND each
     /// finding. Kept SMALL for linking: many rendered variants bloat each

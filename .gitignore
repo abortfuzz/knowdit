@@ -20,3 +20,5 @@ kg*
 moves
 *.sql
 test-results
+eval_*
+*.sqlite3*

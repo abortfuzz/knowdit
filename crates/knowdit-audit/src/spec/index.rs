@@ -201,7 +201,6 @@ impl ProjectIndex {
             .unwrap_or_default()
     }
 
-
     /// True when `name` resolves to a project contract or interface.
     /// Used by the spec-builder tools to reject hallucinated contract
     /// references before they enter the draft.

@@ -16,5 +16,9 @@
 - No `unwrap` in any case, always prefer `Result<...>` or `Option<T>` 
 - Avoid lifetime parameter if possible and accept cheap copies using types like `String` and `PathBuf`.
 - Always prefer BTreeMap.
+- Avoid global constants, always make parameters configuration via clap derive structs.
 
+## Semantic Requirements
 
+- For all processes/workflows, always ensure no dirty data is produced anytime it stops. Note we accept losing a little progress but never tolerate dirty data.
+- When building complex workflows, consider making it capable of resuming.
