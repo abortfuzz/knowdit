@@ -20,6 +20,9 @@ pub enum OperationType {
     /// `knowdit learn c4` — bulk-admit Code4rena projects into the KG.
     #[sea_orm(string_value = "c4learn")]
     C4Learn,
+    /// `knowdit learn sherlock` — bulk-admit Sherlock contests into the KG.
+    #[sea_orm(string_value = "sherlocklearn")]
+    SherlockLearn,
     /// `knowdit learn link` — global finding-to-semantic linking pass.
     #[sea_orm(string_value = "link")]
     Link,
@@ -29,6 +32,7 @@ impl OperationType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::C4Learn => "c4learn",
+            Self::SherlockLearn => "sherlocklearn",
             Self::Link => "link",
         }
     }

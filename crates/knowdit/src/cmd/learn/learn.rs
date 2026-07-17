@@ -372,6 +372,10 @@ impl LearnSherlockArgs {
             all_projects.len()
         );
 
+        // Captured before the pipeline runs, recorded only after it succeeds:
+        // a killed run leaves no operation_history row (see `record_operation`).
+        let merge_args = serde_json::to_value(&self.merge)
+            .wrap_err("failed to serialize sherlock learn merge args for operation_history")?;
         run_pipeline(
             db,
             &llm,
@@ -382,7 +386,10 @@ impl LearnSherlockArgs {
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
         )
-        .await
+        .await?;
+        db.record_operation(OperationType::SherlockLearn, merge_args)
+            .await?;
+        Ok(())
     }
 }
 
