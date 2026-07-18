@@ -486,8 +486,29 @@ strength-tagged entry per such candidate. Candidates with NO meaningful
 relation can be omitted entirely — silent omission is treated as "no
 link" for that pair. The candidate set per prompt is large, so be
 selective; you do NOT need to enumerate Low entries for clearly unrelated
-candidates. When in doubt about whether a candidate qualifies for at
-least Low, emit it with `Low` rather than guessing it away.
+candidates.
+
+### Link budget — selectivity is the deliverable
+
+  - Emit AT MOST the 2 strongest entries per finding. The single best
+    entry is usually the right answer; add a second only when it is
+    equally direct. Never enumerate every candidate a finding brushes
+    against.
+  - NO-LINK IS THE EXPECTED OUTCOME for most findings: an empty
+    `semantic_evidence` list is a correct, common answer — not a
+    failure. Do NOT pad entries because few findings are in this batch
+    or because a candidate merely shares a topic.
+  - Emit a `Low` only when the tangential tie is SPECIFIC — a named
+    precondition, setUp step, or shared sub-step you can point to.
+    "Same broad area / same category" alone deserves SILENCE, not a
+    Low. (Low remains the correct demotion target for a tie you can
+    name but that isn't a direct instantiation.)
+  - The budget does NOT change the strength bar. Strength is graded by
+    the rubric alone, independent of how many entries you emit: a
+    finding's single best match is still `Low` or `Medium` when that
+    is what the rubric says. Being the best available candidate is NOT
+    evidence of `High` — most findings' best links are Medium or Low,
+    and many batches contain only a handful of true Highs.
 
 ### Strength rubric — single axis: DIRECTNESS OF INSTANTIATION
 
