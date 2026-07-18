@@ -94,7 +94,7 @@ pub struct FindingLinkOptions {
     /// semantic-candidate block is NOT separately configured — it takes ALL
     /// remaining input after findings + system + prefix, so it fills the window
     /// automatically (lower this ⇒ more room for semantics ⇒ fewer / zero
-    /// candidate chunks). Must be in (0, 1); the CLI defaults it to 1/3.
+    /// candidate chunks). Must be in (0, 1); the CLI defaults it to 0.35.
     pub finding_token_ratio: f64,
     /// Hard ceiling on canonical semantics (candidates) per chunk — the count
     /// analogue of the token budget. Raw-children candidates vary wildly in size,
@@ -108,8 +108,10 @@ pub struct FindingLinkOptions {
     /// in one 72K budget), but agents in practice can only stably
     /// emit decisions for a few dozen findings per attempt before
     /// finalizing prematurely. Cap both ways: token budget AND
-    /// finding count. The CLI defaults this to an inert 600 ceiling
-    /// (the token budget drives the batch shape); 0 is clamped to 1.
+    /// finding count. The CLI defaults this to 135, which also bounds
+    /// the agent conversation's terminal size (each finding adds
+    /// ~230-310 tokens of emit output) so runs stay inside 256K-window
+    /// models; 0 is clamped to 1.
     pub max_findings_per_batch: usize,
     /// Max attempts per (finding-batch × semantic-chunk) — if the agent
     /// finalizes without covering every finding in the batch, the runner
@@ -120,6 +122,21 @@ pub struct FindingLinkOptions {
     /// Per-attempt cap on agent steps (inner step loop, not the
     /// missing-coverage retry counter).
     pub max_agent_steps: usize,
+    /// Minimum byte length of `why_finding_can_fire` for High/Medium entries.
+    /// Low rationales are short by design (audit trail, not downstream
+    /// consumption); High and Medium must be substantive enough to justify
+    /// the claim.
+    pub evidence_min_high_medium: usize,
+    /// Minimum byte length of `why_finding_can_fire` for Low entries.
+    pub evidence_min_low: usize,
+    /// Minimum normalized length of a quoted span for the High verbatim-quote
+    /// check (~6 words at the CLI default). Blind evals caught agents attaching
+    /// well-written evidence to the WRONG finding_id in large batches (the
+    /// quoted "finding text" existed verbatim in a DIFFERENT finding);
+    /// requiring a quote that mechanically appears in the referenced finding's
+    /// own body turns that silent mis-attribution into a correctable tool
+    /// error.
+    pub high_quote_min_chars: usize,
     pub include_unlinked: bool,
     /// Cross-seam scope for the merge-kg ③b pass: when `Some(max)`, only
     /// canonical semantics with `id <= max` are offered as link candidates.
@@ -577,7 +594,46 @@ struct AggregatedFindingLinkResult {
 }
 
 impl FindingLinkOptions {
+    /// Startup sanity warnings for the coupled shape knobs — changing one of
+    /// (window utilization, max_findings_per_batch, finding_token_ratio)
+    /// without re-tuning the others silently drifts the batch shape, so an
+    /// out-of-tune combination warns at launch instead of surfacing as a bad
+    /// KG hours and dollars later.
+    fn warn_param_drift(&self, model: &OpenAIModel) {
+        let per_mille_per_finding =
+            self.context_window_utilization * 1000.0 / self.max_findings_per_batch.max(1) as f64;
+        if !(1.2..=1.5).contains(&per_mille_per_finding) {
+            let lo = (self.context_window_utilization * 1000.0 / 1.5).round() as usize;
+            let hi = (self.context_window_utilization * 1000.0 / 1.2).round() as usize;
+            tracing::warn!(
+                "link shape knobs look out of tune: utilization×1000/max_findings_per_batch = {:.2}, expected 1.2–1.5. At utilization {} a matched batch cap is ~{}–{} findings; scaling one knob without the other drifts batch density and the agent's terminal context size.",
+                per_mille_per_finding,
+                self.context_window_utilization,
+                lo,
+                hi,
+            );
+        }
+        if !(0.3..=0.5).contains(&self.finding_token_ratio) {
+            tracing::warn!(
+                "finding_token_ratio {} is outside the tuned 0.3–0.5 band: below it the finding block starves (tiny chatty batches), above it the semantic block starves (dense candidate chunks).",
+                self.finding_token_ratio,
+            );
+        }
+        if let Some(explicit) = self.input_token_budget {
+            let derived = get_context_budget(model, self.context_window_utilization).max(1);
+            if explicit > derived {
+                tracing::warn!(
+                    "--input-token-budget {} exceeds window×utilization = {} and will be CLAMPED to {}; raise --link-context-window-utilization if the explicit budget is intended.",
+                    explicit,
+                    derived,
+                    derived,
+                );
+            }
+        }
+    }
+
     pub async fn link_pending_findings(self, db: &HistoricalDatabase, llm: &LLM) -> Result<()> {
+        self.warn_param_drift(&llm.model);
         use std::sync::Arc;
         use tokio::sync::mpsc;
         use tokio::task::JoinSet;
@@ -591,6 +647,9 @@ impl FindingLinkOptions {
         let total_pending_findings = pending_findings.len();
         let concurrency = self.concurrency.max(1);
         let max_response_attempts = self.max_response_attempts.max(1);
+        let evidence_min_high_medium = self.evidence_min_high_medium;
+        let evidence_min_low = self.evidence_min_low;
+        let high_quote_min_chars = self.high_quote_min_chars;
         let agent_options = AgentRunOptions::new(self.max_agent_steps);
         let budgets = FindingLinkBudgets::from_options(&llm.model, self);
         tracing::info!(
@@ -648,6 +707,9 @@ impl FindingLinkOptions {
                     context: context.as_ref(),
                     agent_options: agent_options.clone(),
                     max_response_attempts,
+                    evidence_min_high_medium,
+                    evidence_min_low,
+                    high_quote_min_chars,
                 };
                 match runner.run().await {
                     Ok(results) => {
@@ -717,6 +779,9 @@ impl FindingLinkOptions {
                                     context: context.as_ref(),
                                     agent_options: worker_agent_options.clone(),
                                     max_response_attempts,
+                                    evidence_min_high_medium,
+                                    evidence_min_low,
+                                    high_quote_min_chars,
                                 };
                                 runner.run().await
                             }
@@ -889,10 +954,10 @@ fn partition_finding_link_entries(
         batches.push(current);
     }
 
-    warn_count_cap_waste(
+    log_count_cap_slack(
         "finding",
         "--max-findings-per-batch",
-        "raise --finding-token-ratio",
+        "lower --finding-token-ratio so the slack goes to semantic candidates",
         max_count,
         token_budget,
         &count_capped_slack,
@@ -938,7 +1003,7 @@ fn partition_finding_link_candidate_groups(
         batches.push(current);
     }
 
-    warn_count_cap_waste(
+    log_count_cap_slack(
         "semantic",
         "--max-semantics-per-batch",
         "lower --link-context-window-utilization or raise --finding-token-ratio",
@@ -950,13 +1015,18 @@ fn partition_finding_link_candidate_groups(
     batches
 }
 
-/// Warn when a COUNT cap closed one or more chunks/batches *before* the token
-/// budget filled — i.e. the window was left partly empty because of the cap,
-/// not because it ran out of room. Reports how much budget went unused so the
-/// operator can raise the cap (to pack more) or shrink the token budget (to fill
-/// the window without a cap). Silent when no cap bound (`count_capped_slack`
-/// empty), which is the case for the default unbounded caps.
-fn warn_count_cap_waste(
+/// Info-level fill report for when a COUNT cap closed one or more batches
+/// *before* the token budget filled. This is EXPECTED behaviour, not an
+/// anomaly: the finding cap default (135) is a deliberate terminal-context
+/// bound that binds on small-finding corpora, and an explicit semantic cap is
+/// a deliberate sparse-chunk choice — hence info, not warn (mistuned knob
+/// COMBINATIONS are what `warn_param_drift` warns about). The idle slack is
+/// NOT handed to the semantic block: semantic chunks are partitioned once per
+/// context and shared by every finding batch (per-chunk prompt caching), so
+/// the semantic budget subtracts the finding token TARGET, not per-batch
+/// actual usage; rebalancing is an offline `--finding-token-ratio` decision.
+/// Silent when no cap bound (`count_capped_slack` empty).
+fn log_count_cap_slack(
     kind: &str,
     cap_flag: &str,
     shrink_budget_hint: &str,
@@ -971,14 +1041,13 @@ fn warn_count_cap_waste(
     let total: usize = count_capped_slack.iter().sum();
     let avg = total / n;
     let pct = avg as f64 / token_budget as f64 * 100.0;
-    tracing::warn!(
-        "{} count cap {}={} closed {} chunk(s) before filling the {}-token budget: ~{} tokens unused total (~{}/chunk, ~{:.0}% of the budget wasted per capped chunk). The count cap bit before the token budget — raise it to pack more per prompt, or shrink the token budget ({}) so the window fills without a cap.",
+    tracing::info!(
+        "{} count cap {}={} closed {} batch(es) before filling the {}-token budget: each capped batch leaves ~{} tokens (~{:.0}%) of that budget idle. To reclaim it, shrink this block's token budget ({}); raising the cap also works but keep it inside the tuned utilization×1000/cap = 1.2–1.5 band (see the shape-drift warning).",
         kind,
         cap_flag,
         max_count,
         n,
         token_budget,
-        total,
         avg,
         pct,
         shrink_budget_hint
@@ -1485,6 +1554,16 @@ struct EmitFindingLinkDecisionTool {
     valid_finding_ids: Arc<HashSet<String>>,
     /// Set of `Candidate ID` values the prompt actually listed.
     valid_semantic_ids: Arc<HashSet<String>>,
+    /// `prompt_finding_id` → normalized rendered finding body, used to verify
+    /// that a High entry's quoted fragment really comes from THE finding it is
+    /// attached to (catches cross-finding evidence mis-attribution in large
+    /// batches — see `FindingLinkOptions::high_quote_min_chars`).
+    finding_bodies: Arc<HashMap<String, String>>,
+    /// Evidence-length floors and the High quote-span floor, from
+    /// [`FindingLinkOptions`].
+    evidence_min_high_medium: usize,
+    evidence_min_low: usize,
+    high_quote_min_chars: usize,
     /// Per-attempt heartbeat label so progress logs can identify which
     /// batch+attempt is making forward progress. Set by the batch
     /// runner before installing the tool.
@@ -1497,12 +1576,42 @@ struct EmitFindingLinkDecisionTool {
     emit_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Minimum byte length of `why_finding_can_fire` per strength tier. Low
-/// rationales are short by design (they exist for audit, not downstream
-/// consumption); High and Medium must be substantive enough to justify
-/// the claim. See plan_link.md §6.1.
-const LINK_EVIDENCE_MIN_HIGH_MEDIUM: usize = 40;
-const LINK_EVIDENCE_MIN_LOW: usize = 15;
+/// Every run of non-quote characters that immediately FOLLOWS a `"` in the
+/// (normalized) evidence text. Deliberately not a balanced `"..."` pair match:
+/// a stray or nested quote inverts open/close parity and a pair-matcher would
+/// hide the real quote inside an "even" segment, falsely rejecting a
+/// well-grounded High. An off-parity segment is the model's own prose and only
+/// passes the guard if it verbatim-overlaps the finding's body at span length
+/// — which is grounding either way.
+static QUOTED_SPAN_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#""([^"]+)"#).expect("literal regex"));
+
+/// Lowercase, straighten curly quotes, and collapse whitespace so verbatim-
+/// quote membership survives line wrapping and case drift between the prompt
+/// rendering and the model's copy of it.
+fn normalize_for_quote_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = false;
+    for c in s.chars() {
+        let c = match c {
+            '\u{201C}' | '\u{201D}' => '"',
+            '\u{2018}' | '\u{2019}' => '\'',
+            c => c,
+        };
+        if c.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            last_space = false;
+        }
+    }
+    out
+}
 
 impl EmitFindingLinkDecisionTool {
     async fn invoke(&self, args: FindingLinkDecision) -> std::result::Result<String, LLMYError> {
@@ -1548,15 +1657,15 @@ impl EmitFindingLinkDecisionTool {
             if trimmed.is_empty() {
                 return Ok(format!(
                     "error: evidence for semantic_id '{}' under finding '{}' has empty `why_finding_can_fire`. Even Low strength needs a brief reason (>= {} chars) explaining why the link is tangential.",
-                    evidence.semantic_id, args.finding_id, LINK_EVIDENCE_MIN_LOW,
+                    evidence.semantic_id, args.finding_id, self.evidence_min_low,
                 ));
             }
             let floor = match strength {
                 knowdit_kg_model::link_strength::LinkStrength::High
                 | knowdit_kg_model::link_strength::LinkStrength::Medium => {
-                    LINK_EVIDENCE_MIN_HIGH_MEDIUM
+                    self.evidence_min_high_medium
                 }
-                knowdit_kg_model::link_strength::LinkStrength::Low => LINK_EVIDENCE_MIN_LOW,
+                knowdit_kg_model::link_strength::LinkStrength::Low => self.evidence_min_low,
             };
             if trimmed.len() < floor {
                 return Ok(format!(
@@ -1568,6 +1677,31 @@ impl EmitFindingLinkDecisionTool {
                     strength,
                     floor,
                 ));
+            }
+            if matches!(
+                strength,
+                knowdit_kg_model::link_strength::LinkStrength::High
+            ) && let Some(body) = self.finding_bodies.get(&args.finding_id)
+            {
+                let norm_ev = normalize_for_quote_match(trimmed);
+                let spans: Vec<&str> = QUOTED_SPAN_RE
+                    .captures_iter(&norm_ev)
+                    .filter_map(|c| c.get(1))
+                    .map(|m| m.as_str().trim())
+                    .filter(|s| s.len() >= self.high_quote_min_chars)
+                    .collect();
+                if spans.is_empty() {
+                    return Ok(format!(
+                        "error: High evidence for semantic_id '{}' under finding '{}' must include a VERBATIM fragment (>= 6 consecutive words, wrapped in double quotes) copied from that finding's own root_cause/description text. Re-emit with a real quote, or demote the entry.",
+                        evidence.semantic_id, args.finding_id,
+                    ));
+                }
+                if !spans.iter().any(|s| body.contains(s)) {
+                    return Ok(format!(
+                        "error: none of the quoted fragments in your High evidence for finding '{}' appear in that finding's own text. You may have MIXED UP finding ids — this evidence may describe a different finding in the prompt. Re-check which finding this evidence is really about and re-emit it under that finding_id (or demote/drop this entry).",
+                        args.finding_id,
+                    ));
+                }
             }
         }
         let response = self
@@ -1629,6 +1763,9 @@ struct FindingLinkBatchAgentRunner<'a> {
     context: &'a FindingLinkContext,
     agent_options: AgentRunOptions,
     max_response_attempts: usize,
+    evidence_min_high_medium: usize,
+    evidence_min_low: usize,
+    high_quote_min_chars: usize,
 }
 
 impl<'a> FindingLinkBatchAgentRunner<'a> {
@@ -1705,6 +1842,17 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
                     .map(|entry| entry.prompt_finding_id.clone())
                     .collect(),
             );
+            let finding_bodies: Arc<HashMap<String, String>> = Arc::new(
+                still_missing
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.prompt_finding_id.clone(),
+                            normalize_for_quote_match(&entry.prompt_body),
+                        )
+                    })
+                    .collect(),
+            );
             let mut user_prompt = self.context.prompt_prefix.clone();
             for entry in &still_missing {
                 user_prompt.push_str(&entry.prompt_body);
@@ -1719,6 +1867,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
                     label.clone(),
                     valid_finding_ids,
                     valid_semantic_ids.clone(),
+                    finding_bodies,
                     attempt,
                     target_finding_count,
                 )
@@ -1809,6 +1958,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_one_attempt(
         &self,
         user_prompt: String,
@@ -1816,6 +1966,7 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
         label: String,
         valid_finding_ids: Arc<HashSet<String>>,
         valid_semantic_ids: Arc<HashSet<String>>,
+        finding_bodies: Arc<HashMap<String, String>>,
         attempt: usize,
         target_finding_count: usize,
     ) -> Result<Vec<FindingLinkDecision>> {
@@ -1825,6 +1976,10 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             buffer: buffer.clone(),
             valid_finding_ids,
             valid_semantic_ids,
+            finding_bodies,
+            evidence_min_high_medium: self.evidence_min_high_medium,
+            evidence_min_low: self.evidence_min_low,
+            high_quote_min_chars: self.high_quote_min_chars,
             label: label.clone(),
             target_finding_count,
             emit_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1930,6 +2085,7 @@ pub async fn retro_link_pending_semantics(
     let model = &llm.model;
     let max_response_attempts = options.max_response_attempts.max(1);
     let agent_options = AgentRunOptions::new(options.max_agent_steps);
+    options.warn_param_drift(model);
     let budgets = FindingLinkBudgets::from_options(model, options);
 
     // Render the (small, bounded) pending semantics as a single candidate
@@ -2034,6 +2190,9 @@ pub async fn retro_link_pending_semantics(
             context: context.as_ref(),
             agent_options: agent_options.clone(),
             max_response_attempts,
+            evidence_min_high_medium: options.evidence_min_high_medium,
+            evidence_min_low: options.evidence_min_low,
+            high_quote_min_chars: options.high_quote_min_chars,
         };
         let results = runner.run().await?;
 

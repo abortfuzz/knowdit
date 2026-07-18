@@ -2944,6 +2944,7 @@ dependencies = [
  "knowdit-kg-model",
  "knowdit-project",
  "llmy",
+ "regex",
  "schemars",
  "sea-orm",
  "serde",

@@ -561,6 +561,17 @@ Low — never High.
     justify the tie (rather than quoting the FINDING's own violated invariant),
     you are on the wrong side → it is not High. When the instantiation is not
     exact, DEMOTE. Unwarranted High is the costliest error here.
+  - GROUND EVERY High IN THE FINDING'S OWN TEXT. Re-read the finding's
+    `root_cause` / `description` AS WRITTEN before tagging High: if the failure
+    you are about to describe is not stated there — you inferred it from the
+    semantic — you are PROJECTING the semantic onto the finding. That is the
+    classic bad-High. When the finding's text and your evidence disagree about
+    what the bug is, the finding's text wins.
+  - "The semantic's protocol does X correctly; this finding omits X" is NOT
+    High. The finding must exhibit the semantic's failure mode inside the same
+    KIND of mechanism the semantic describes — a missing safeguard in an
+    unrelated contract that merely should have had it is Medium at most,
+    usually Low or silence.
 
 ### Calibrate deliberately
 
@@ -589,7 +600,15 @@ The `why_finding_can_fire` field is required per entry:
     (cite the semantic's definition/description verbatim or paraphrase)
     AND name the finding's root_cause text describing that invariant
     being violated. The pairing should be tight enough that a reader
-    could verify it from just the two text blocks.
+    could verify it from just the two text blocks. Include a short
+    VERBATIM fragment (>= 6 consecutive words, wrapped in double quotes)
+    copied from the finding's `root_cause` or `description` that states
+    this failure — if no six consecutive words in the finding's text
+    state it, it is not a High. The runner MECHANICALLY CHECKS that your
+    quoted fragment appears in the text of the exact finding_id you are
+    emitting for; a rejection usually means you attached this evidence
+    to the WRONG finding_id (mixed up two findings in the batch) —
+    re-check which finding the evidence really describes.
   - For **Medium** (>= 40 chars): name the specific sub-mechanism of
     the semantic the finding hits, and explain what differs from the
     semantic's central failure mode. If you can only say "both involve

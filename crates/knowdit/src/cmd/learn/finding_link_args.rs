@@ -16,7 +16,7 @@ pub struct FindingLinkCliArgs {
     /// automatically. LOWER this (e.g. 0.25) to leave more room for semantics →
     /// all canonicals fit ONE prompt → no candidate chunking → global
     /// competition (fewer, more selective links). Must be in (0, 1).
-    #[arg(long, default_value_t = 1.0 / 3.0)]
+    #[arg(long, default_value_t = 0.35)]
     pub finding_token_ratio: f64,
 
     /// Hard ceiling on canonical semantics per chunk — the count analogue of the
@@ -27,34 +27,25 @@ pub struct FindingLinkCliArgs {
     #[arg(long, default_value_t = usize::MAX)]
     pub max_semantics_per_batch: usize,
 
-    /// Hard ceiling on findings per batch — independent of token
-    /// budget. Leave unset to use the built-in default (600), which is
-    /// deliberately an INERT ceiling: the finding token budget drives the
-    /// batch shape (binding at ~350 findings median on the c4 KG) and the
-    /// cap only stops the small-finding tail from ballooning (short
-    /// findings pack absurdly dense — ~150 tok/finding on the Move KG fits
-    /// ~480 in a 72K budget).
+    /// Hard ceiling on findings per batch — independent of token budget.
+    /// The default (135) does two jobs at once: it bounds the agent
+    /// conversation's terminal size (each finding adds ~230-310 tokens of
+    /// emit output on top of the first-step prompt — at a ~200K prompt,
+    /// 135 findings keeps the terminal comfortably inside a 256K window),
+    /// and it stops the small-finding tail from ballooning (short findings
+    /// pack absurdly dense — ~150 tok/finding fits ~480 in a 72K budget).
     ///
-    /// This is ALSO the dominant knob for link density / precision —
-    /// more so than the context-window ratio, which barely moves it
-    /// (re-linking one KG at two different ratios changed density by
-    /// <2%). Mechanism: with fewer findings per request the agent
-    /// elaborates on each finding and links liberally; with more
-    /// findings per request it stays terse and emits only the strongest
-    /// link (or none). Holding everything else equal (same model,
-    /// prompt, and candidate set), requests carrying <60 findings
-    /// averaged ~0.85 links per finding while requests carrying >=150
-    /// averaged ~0.05 — a ~15x swing driven by batch size alone. End to
-    /// end that is the difference between ~6 cross-links per finding
-    /// (token-bound batches of 200+: fewer, better-calibrated links) and
-    /// ~16 (batches of ~50: more links, looser calibration). Lower it
-    /// toward ~50 for higher recall; do NOT push far beyond ~600 — huge
-    /// batches (700-finding agents, ~900 steps) finalize prematurely,
-    /// retry heavily, hit per-request timeouts, and blind-eval WORSE on
-    /// High calibration. `--link-max-agent-steps` auto-scales with this
-    /// (1.2×) unless set explicitly, so the agent always has a step per
-    /// finding.
-    #[arg(long, default_value_t = 600)]
+    /// Batch size is ALSO a strong knob for link density: with few
+    /// findings per request the agent elaborates on each and links
+    /// liberally (<60 findings averaged ~0.85 links/finding); with many it
+    /// stays terse (>=150 averaged ~0.05) — a ~15x swing. The Link-budget
+    /// prompt block now carries most of the density control, but don't
+    /// drop this far below ~100 without re-checking link counts, and don't
+    /// push past ~600 — huge batches (700-finding agents, ~900 steps)
+    /// finalize prematurely, retry heavily, hit per-request timeouts, and
+    /// blind-eval WORSE on High calibration. `--link-max-agent-steps`
+    /// auto-scales with this (1.2×) unless set explicitly.
+    #[arg(long, default_value_t = 135)]
     pub max_findings_per_batch: usize,
 
     /// Maximum attempts per (finding-batch × semantic-chunk): if the agent
@@ -77,14 +68,15 @@ pub struct FindingLinkCliArgs {
 
     /// Fraction (0,1] of the model's context window a single
     /// finding-linking prompt may fill — governs how many findings +
-    /// semantic candidates are packed per prompt. Lower = more,
-    /// smaller prompts with sharper attention. (The blind-eval-validated
-    /// `v4_density` relink corresponds to 0.73 in REAL tokens — its
-    /// nominal 0.95 predates the `count_tokens` fix that removed the
-    /// ~1.3x chars/4 overcount.) Carries the `--link-` prefix so it can
-    /// be flattened next to the merge / extract
-    /// `--context-window-utilization` without colliding.
-    #[arg(long, default_value_t = 0.8)]
+    /// semantic candidates are packed per prompt. Lower = more, smaller
+    /// prompts with sharper attention: blind evals consistently scored
+    /// ~200K-token prompts ABOVE 375K+ fills of the same corpus, so the
+    /// default stays low (0.2 ≈ 200K on a ~1M-window model) and also
+    /// leaves multi-step growth headroom for 256K-window models. Set
+    /// `--input-token-budget` instead when you need an exact prompt size.
+    /// Carries the `--link-` prefix so it can be flattened next to the
+    /// merge / extract `--context-window-utilization` without colliding.
+    #[arg(long, default_value_t = 0.2)]
     pub link_context_window_utilization: f64,
 
     /// Turn OFF full raw-children rendering and fall back to the compact
@@ -95,6 +87,27 @@ pub struct FindingLinkCliArgs {
     /// disables it for smaller prompts with less context.
     #[arg(long)]
     pub link_no_render_raw_children: bool,
+
+    /// Minimum byte length of a High/Medium entry's `why_finding_can_fire` —
+    /// enforced at the emit tool boundary so thin justifications bounce back
+    /// to the agent instead of landing in the KG.
+    #[arg(long, default_value_t = 40)]
+    pub link_evidence_min_high_medium: usize,
+
+    /// Minimum byte length of a Low entry's `why_finding_can_fire`. Low
+    /// rationales are short by design (audit trail, not downstream
+    /// consumption).
+    #[arg(long, default_value_t = 15)]
+    pub link_evidence_min_low: usize,
+
+    /// Minimum normalized length (chars, ~6 words at the default) of the
+    /// verbatim quote a High entry must copy from ITS OWN finding's text.
+    /// The emit tool verifies the quote is a substring of the attached
+    /// finding's rendered body and rejects mismatches — this catches
+    /// cross-finding evidence mis-attribution in large batches (evidence
+    /// written for finding A emitted under finding B's id).
+    #[arg(long, default_value_t = 25)]
+    pub link_high_quote_min_chars: usize,
 
     #[command(flatten)]
     pub render: VariantRenderArgs,
@@ -154,6 +167,14 @@ impl FindingLinkCliArgs {
                 && self.link_context_window_utilization <= 1.0,
             "link_context_window_utilization must be in (0, 1]",
         );
+        ensure!(
+            self.link_evidence_min_low > 0 && self.link_evidence_min_high_medium > 0,
+            "link evidence length floors must be greater than zero"
+        );
+        ensure!(
+            self.link_high_quote_min_chars > 0,
+            "link_high_quote_min_chars must be greater than zero"
+        );
 
         Ok(())
     }
@@ -175,6 +196,9 @@ impl FindingLinkCliArgs {
             variant_render_cap: self.render.link_variant_render_cap,
             render_raw_children: !self.link_no_render_raw_children,
             raw_child_char_cap: self.render.link_raw_child_char_cap,
+            evidence_min_high_medium: self.link_evidence_min_high_medium,
+            evidence_min_low: self.link_evidence_min_low,
+            high_quote_min_chars: self.link_high_quote_min_chars,
         }
     }
 }

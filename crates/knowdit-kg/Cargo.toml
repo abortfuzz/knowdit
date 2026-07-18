@@ -9,6 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 [dependencies]
+regex = "1"
 sea-orm.workspace = true
 knowdit-kg-model.workspace = true
 knowdit-project.workspace = true
