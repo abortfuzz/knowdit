@@ -107,17 +107,17 @@ mod tests {
             "adds C".to_string(),
         ];
         let out = render_with_variants("canonical", &notes, 2);
-        assert!(out.contains("- adds A"));
-        assert!(out.contains("- adds B"));
+        assert!(out.contains("— adds A"));
+        assert!(out.contains("— adds B"));
         assert!(!out.contains("adds C"));
-        assert!(out.contains("+1 more variants not shown"));
+        assert!(out.contains("+1 more folded raws not shown"));
     }
 
     #[test]
     fn per_entry_char_cap_truncates_shown_entries() {
         let notes = vec!["abcdefghij".to_string()];
         let out = render_with_variants_capped("c", &notes, 50, 4);
-        assert!(out.contains("- abcd …[truncated]"));
+        assert!(out.contains("— abcd …[truncated]"));
         assert!(!out.contains("abcde"));
     }
 
@@ -125,7 +125,7 @@ mod tests {
     fn zero_char_cap_means_no_truncation() {
         let notes = vec!["abcdefghij".to_string()];
         let out = render_with_variants_capped("c", &notes, 50, 0);
-        assert!(out.contains("- abcdefghij"));
+        assert!(out.contains("— abcdefghij"));
         assert!(!out.contains("truncated"));
     }
 }
