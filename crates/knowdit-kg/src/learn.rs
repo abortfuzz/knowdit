@@ -981,10 +981,13 @@ impl ProjectData {
 /// where no CLI override is threaded in (categorize / extract). Kept well
 /// below 1.0 on purpose: over-long prompts dilute the model's attention, so
 /// we trade packing efficiency (more, smaller chunks/batches) for sharper
-/// per-prompt focus. Overridable per-command — e.g. `merge-kg`'s
+/// per-prompt focus — and 0.2 (~200K on a ~1M-token window registration) also
+/// keeps every prompt, plus multi-step agent growth, inside 256K-window
+/// deployments (0.4 on a 922K-window registration produced real 290K+
+/// requests). Overridable per-command — e.g. `merge-kg`'s
 /// `--context-window-utilization` threads a value into the merge + link
 /// budgets.
-pub const DEFAULT_CONTEXT_WINDOW_UTILIZATION: f64 = 0.4;
+pub const DEFAULT_CONTEXT_WINDOW_UTILIZATION: f64 = 0.2;
 
 /// Token budget for a single prompt: `utilization` × the model's max input.
 /// `utilization` is clamped to a sane `(0, 1]` band so a mis-typed CLI value

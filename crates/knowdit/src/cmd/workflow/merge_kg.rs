@@ -4,7 +4,7 @@
 //! finding-link knobs, and runs the merge.
 
 use clap::{Args, ValueEnum};
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, ensure};
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg::merge_kg::{LinkMode, MergeKgOptions, merge_kg};
 use llmy::client::client::LLM;
@@ -67,6 +67,13 @@ pub struct MergeKgArgs {
     #[arg(long, default_value_t = 1)]
     pub link_concurrency: usize,
 
+    /// One value that OVERRIDES every concurrency knob in this run —
+    /// `--merge-concurrency` AND `--link-concurrency` — regardless of what
+    /// they are set to. The whole-run throttle: `--concurrency 48` makes
+    /// every phase fan out 48-wide without repeating per-phase flags.
+    #[arg(long)]
+    pub concurrency: Option<usize>,
+
     /// Skip the ③a retro-link pass (destination findings × source's new
     /// canonical semantics).
     #[arg(long, default_value_t = false)]
@@ -82,6 +89,17 @@ impl MergeKgArgs {
     pub async fn run(self, llm: &LLM) -> Result<()> {
         self.merge.validate()?;
         self.finding_link.validate()?;
+        if let Some(n) = self.concurrency {
+            ensure!(n > 0, "--concurrency must be greater than zero");
+        }
+
+        // `--concurrency` overrides every per-phase concurrency knob.
+        let mut merge = self.merge;
+        let mut link_concurrency = self.link_concurrency;
+        if let Some(n) = self.concurrency {
+            merge.merge_concurrency = n;
+            link_concurrency = n;
+        }
 
         let dst = self.kg.connect_init().await?;
         let src = HistoricalDatabase::connect(&self.from)
@@ -90,12 +108,12 @@ impl MergeKgArgs {
 
         // The merge agents pick up `--context-window-utilization` via
         // `to_agent_options`; thread the same knob into the ③a/③b link passes.
-        let mut link = self.finding_link.to_options(self.link_concurrency);
-        link.context_window_utilization = self.merge.context_window_utilization;
+        let mut link = self.finding_link.to_options(link_concurrency);
+        link.context_window_utilization = merge.context_window_utilization;
 
         let options = MergeKgOptions {
-            merge_agent: self.merge.to_agent_options(),
-            merge_chunking: self.merge.to_chunking_options(),
+            merge_agent: merge.to_agent_options(),
+            merge_chunking: merge.to_chunking_options(),
             link,
             run_retro_link: !self.no_retro_link,
             link_mode: self.link_mode.into(),
