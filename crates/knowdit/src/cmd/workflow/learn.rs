@@ -115,7 +115,7 @@ impl WorkflowLearnArgs {
             let agent_options = self.merge.to_agent_options();
             let chunking = self.merge.to_chunking_options();
             let extract = project
-                .categorize_and_extract(primary_llm, &agent_options, None)
+                .categorize_and_extract(primary_llm, &agent_options, None, Some(&kg))
                 .await?;
 
             // Compose Phase 1c admission + pending_semantic enqueue

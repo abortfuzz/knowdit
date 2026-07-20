@@ -165,13 +165,43 @@ pub struct ExtractResult {
 }
 
 impl ProjectData {
+    // ── Content hashing for extraction chunk invalidation ──
+    //
+    // FNV-1a — not cryptographic; only needs to detect source/prompt changes.
+
+    fn content_hash(&self) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &byte in self.build_project_prompt_body().as_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    }
+
+    fn findings_content_hash(&self) -> String {
+        let body = self
+            .build_report_prompt_body()
+            .unwrap_or_default();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &byte in body.as_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    }
+
     /// Phase 1: Categorize the project and extract semantics.
     /// Safe to run concurrently across multiple projects.
+    ///
+    /// When `db` is `Some`, per-chunk extraction progress is checkpointed
+    /// to the `extraction_chunk` table. On resume, completed chunks are
+    /// skipped. Pass `None` for stateless use (e.g. agentic pipelines).
     pub async fn categorize_and_extract(
         &self,
         llm: &LLM,
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
+        db: Option<&HistoricalDatabase>,
     ) -> Result<ExtractResult> {
         let pid = self.display_id();
 
@@ -192,12 +222,12 @@ impl ProjectData {
             });
         }
 
-        let categories = self.categorize(llm, agent_options).await?;
+        let categories = self.categorize(llm, agent_options, db).await?;
         tracing::info!("Project {} categorized as: {:?}", pid, categories);
 
         let (all_semantics, all_findings) = tokio::try_join!(
-            self.extract_semantics(llm, &categories, agent_options, chunk_input_budget),
-            self.extract_findings(llm, &categories, agent_options, chunk_input_budget)
+            self.extract_semantics(llm, &categories, agent_options, chunk_input_budget, db),
+            self.extract_findings(llm, &categories, agent_options, chunk_input_budget, db)
         )?;
 
         tracing::info!(
@@ -258,6 +288,7 @@ impl ProjectData {
         llm: &LLM,
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
+        db: Option<&HistoricalDatabase>,
     ) -> Result<ExtractResult> {
         let pid = self.display_id();
 
@@ -278,11 +309,11 @@ impl ProjectData {
             });
         }
 
-        let categories = self.categorize(llm, agent_options).await?;
+        let categories = self.categorize(llm, agent_options, db).await?;
         tracing::info!("Project {} categorized as: {:?}", pid, categories);
 
         let all_semantics = self
-            .extract_semantics(llm, &categories, agent_options, chunk_input_budget)
+            .extract_semantics(llm, &categories, agent_options, chunk_input_budget, db)
             .await?;
         tracing::info!(
             "Extracted {} raw semantics from project {}",
@@ -481,6 +512,7 @@ impl ProjectData {
         &self,
         llm: &LLM,
         agent_options: &AgentRunOptions,
+        db: Option<&HistoricalDatabase>,
     ) -> Result<Vec<DeFiCategory>> {
         let started_at = Instant::now();
         let model = &llm.model;
@@ -493,6 +525,41 @@ impl ProjectData {
         let budget = get_context_budget(model, agent_options.context_window_utilization)
             .saturating_sub(sys_tokens + suffix_tokens);
         let content = self.build_project_prompt_body();
+        let content_hash = self.content_hash();
+
+        // ── DB checkpoint: skip categorize if already saved ──
+        if let Some(db) = db {
+            let chunks = db
+                .load_extraction_chunks(&self.display_id(), "categorize")
+                .await?;
+            if !chunks.is_empty()
+                && db
+                    .extraction_chunks_match(
+                        &self.display_id(),
+                        "categorize",
+                        model.model_id_str(),
+                        &content_hash,
+                    )
+                    .await?
+            {
+                let cats: Vec<DeFiCategory> = serde_json::from_str(&chunks[0].chunk_json)?;
+                tracing::info!(
+                    "categorize checkpoint hit for {} — skipped LLM call ({} categories)",
+                    self.display_id(),
+                    cats.len(),
+                );
+                return Ok(cats);
+            }
+            if !chunks.is_empty() {
+                tracing::info!(
+                    "categorize checkpoint stale for {} — invalidating",
+                    self.display_id()
+                );
+                db.clear_extraction_chunks(&self.display_id(), "categorize")
+                    .await?;
+            }
+        }
+
         tracing::info!(
             "categorize preparing {}: source_files={}, body_chars={}, budget={}",
             self.display_id(),
@@ -524,6 +591,21 @@ impl ProjectData {
             label,
         };
         let record = runner.run().await?;
+
+        // ── Save categorize checkpoint ──
+        if let Some(db) = db {
+            let json = serde_json::to_string(&record.categories)?;
+            db.save_extraction_chunk(
+                &self.display_id(),
+                "categorize",
+                0,
+                model.model_id_str(),
+                &content_hash,
+                &json,
+            )
+            .await?;
+        }
+
         tracing::info!(
             "categorize finished for {} in {:?}: categories={:?} ({})",
             self.display_id(),
@@ -544,6 +626,7 @@ impl ProjectData {
         categories: &[DeFiCategory],
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
+        db: Option<&HistoricalDatabase>,
     ) -> Result<Vec<ExtractedSemantic>> {
         let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
         let model = &llm.model;
@@ -562,14 +645,56 @@ impl ProjectData {
         };
 
         let all_files = self.build_project_prompt_body();
-        let Some(mut cursor) = TokenCursor::new(all_files, model.clone()) else {
+        let content_hash = self.content_hash();
+        let Some(mut cursor) = TokenCursor::new(all_files.clone(), model.clone()) else {
             return Err(KgError::other(
                 "Failed to initialize TokenCursor for extraction",
             ));
         };
 
-        let mut all_semantics = Vec::new();
-        let mut chunk_idx = 0usize;
+        // ── DB checkpoint: resume from completed chunks ──
+        let (mut all_semantics, mut chunk_idx) = if let Some(db) = db {
+            if !db
+                .extraction_chunks_match(
+                    &self.display_id(),
+                    "semantics",
+                    model.model_id_str(),
+                    &content_hash,
+                )
+                .await?
+            {
+                tracing::info!(
+                    "semantics extraction checkpoint stale for {} — invalidating",
+                    self.display_id()
+                );
+                db.clear_extraction_chunks(&self.display_id(), "semantics")
+                    .await?;
+                (Vec::new(), 0usize)
+            } else {
+                let completed = db
+                    .load_extraction_chunks(&self.display_id(), "semantics")
+                    .await?;
+                let mut loaded = Vec::new();
+                for row in &completed {
+                    let items: Vec<ExtractedSemantic> =
+                        serde_json::from_str(&row.chunk_json)?;
+                    loaded.extend(items);
+                }
+                let skip = completed.len();
+                tracing::info!(
+                    "semantics extraction checkpoint hit: {} chunk(s), {} semantic(s) — resuming",
+                    skip, loaded.len(),
+                );
+                // Advance cursor past completed chunks
+                for _ in 0..skip {
+                    let _ = cursor.next_chunk(chunk_budget);
+                }
+                (loaded, skip)
+            }
+        } else {
+            (Vec::new(), 0usize)
+        };
+
         while let Some(chunk) = cursor.next_chunk(chunk_budget) {
             let user_prompt = format!("{}{}", chunk, user_suffix);
             tracing::info!(
@@ -590,6 +715,21 @@ impl ProjectData {
                 label: chunk_label,
             };
             let chunk_semantics = extractor.run().await?;
+
+            // ── Save chunk checkpoint ──
+            if let Some(db) = db {
+                let json = serde_json::to_string(&chunk_semantics)?;
+                db.save_extraction_chunk(
+                    &self.display_id(),
+                    "semantics",
+                    chunk_idx as i32,
+                    model.model_id_str(),
+                    &content_hash,
+                    &json,
+                )
+                .await?;
+            }
+
             tracing::info!(
                 "Chunk {} produced {} semantic(s)",
                 chunk_idx,
@@ -686,6 +826,7 @@ impl ProjectData {
         categories: &[DeFiCategory],
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
+        db: Option<&HistoricalDatabase>,
     ) -> Result<Vec<ExtractedFinding>> {
         let Some(report_body) = self.build_report_prompt_body() else {
             tracing::warn!("No audit report found for project {}", self.display_id());
@@ -705,14 +846,57 @@ impl ProjectData {
             None => total_budget.saturating_sub(sys_tokens + suffix_tokens),
         };
 
-        let Some(mut cursor) = TokenCursor::new(report_body, model.clone()) else {
+        let Some(mut cursor) = TokenCursor::new(report_body.clone(), model.clone()) else {
             return Err(KgError::other(
                 "Failed to initialize TokenCursor for finding extraction",
             ));
         };
 
-        let mut all_findings = Vec::new();
-        let mut chunk_idx = 0usize;
+        // ── DB checkpoint: resume from completed chunks ──
+        let content_hash = self.findings_content_hash();
+        let (mut all_findings, mut chunk_idx) = if let Some(db) = db {
+            if !db
+                .extraction_chunks_match(
+                    &self.display_id(),
+                    "findings",
+                    model.model_id_str(),
+                    &content_hash,
+                )
+                .await?
+            {
+                tracing::info!(
+                    "findings extraction checkpoint stale for {} — invalidating",
+                    self.display_id()
+                );
+                db.clear_extraction_chunks(&self.display_id(), "findings")
+                    .await?;
+                (Vec::new(), 0usize)
+            } else {
+                let completed = db
+                    .load_extraction_chunks(&self.display_id(), "findings")
+                    .await?;
+                let mut loaded = Vec::new();
+                for row in &completed {
+                    let items: Vec<ExtractedFinding> =
+                        serde_json::from_str(&row.chunk_json)?;
+                    for f in items {
+                        loaded.push(Self::canonicalize_finding(f)?);
+                    }
+                }
+                let skip = completed.len();
+                tracing::info!(
+                    "findings extraction checkpoint hit: {} chunk(s), {} finding(s) — resuming",
+                    skip, loaded.len(),
+                );
+                for _ in 0..skip {
+                    let _ = cursor.next_chunk(chunk_budget);
+                }
+                (loaded, skip)
+            }
+        } else {
+            (Vec::new(), 0usize)
+        };
+
         while let Some(chunk) = cursor.next_chunk(chunk_budget) {
             let user_prompt = format!("{}{}", chunk, user_suffix);
             tracing::info!(
@@ -733,6 +917,21 @@ impl ProjectData {
                 label: chunk_label,
             };
             let raw_findings = extractor.run().await?;
+
+            // ── Save chunk checkpoint ──
+            if let Some(db) = db {
+                let json = serde_json::to_string(&raw_findings)?;
+                db.save_extraction_chunk(
+                    &self.display_id(),
+                    "findings",
+                    chunk_idx as i32,
+                    model.model_id_str(),
+                    &content_hash,
+                    &json,
+                )
+                .await?;
+            }
+
             tracing::info!(
                 "Chunk {} produced {} finding(s)",
                 chunk_idx,

@@ -6,10 +6,10 @@ use itertools::Itertools;
 use knowdit_kg_model::db::merge_status::MergePhase;
 use knowdit_kg_model::db::operation_history::{self, OperationType};
 use knowdit_kg_model::db::{
-    audit_finding, audit_finding_category, category, finding_category, finding_link_status,
-    finding_merge, merge_status, pending_semantic, project, project_category, project_finding,
-    project_platform, project_semantic, semantic_finding_link, semantic_function, semantic_merge,
-    semantic_node,
+    audit_finding, audit_finding_category, category, extraction_chunk, finding_category,
+    finding_link_status, finding_merge, merge_status, pending_semantic, project, project_category,
+    project_finding, project_platform, project_semantic, semantic_finding_link, semantic_function,
+    semantic_merge, semantic_node,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
@@ -489,6 +489,9 @@ impl HistoricalDatabase {
             // Append-only audit log of top-level learn operations. No FKs —
             // it references nothing and nothing references it.
             schema.create_table_from_entity(operation_history::Entity),
+            // Per-chunk extraction progress markers — INSERTed immediately
+            // after each chunk's LLM call, outside the merge transaction.
+            schema.create_table_from_entity(extraction_chunk::Entity),
         ];
 
         for mut table in tables {
@@ -1393,6 +1396,116 @@ impl HistoricalDatabase {
             .map(|p| p.status == "completed")
             .unwrap_or(false))
     }
+
+    // ── Extraction Chunk Checkpointing ──────────────────────────────────
+
+    /// Count completed extraction chunks for a (project_key, stage) pair.
+    pub async fn count_extraction_chunks(
+        &self,
+        project_key: &str,
+        stage: &str,
+    ) -> Result<usize> {
+        let count = extraction_chunk::Entity::find()
+            .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
+            .filter(extraction_chunk::Column::Stage.eq(stage))
+            .count(&self.db)
+            .await?;
+        Ok(count as usize)
+    }
+
+    /// Check whether a (project_key, stage) pair's first chunk was saved
+    /// with the given model+hash. Returns true if the stage is empty (no
+    /// rows yet — fresh start), or if the first chunk's stored values match.
+    /// Returns false if there's a mismatch, meaning the caller should
+    /// invalidate and restart.
+    pub async fn extraction_chunks_match(
+        &self,
+        project_key: &str,
+        stage: &str,
+        model: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        let Some(first) = extraction_chunk::Entity::find()
+            .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
+            .filter(extraction_chunk::Column::Stage.eq(stage))
+            .order_by_asc(extraction_chunk::Column::ChunkIdx)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(true); // empty -> fresh start
+        };
+        Ok(first.model == model && first.content_hash == content_hash)
+    }
+
+    /// Delete all extraction chunk rows for (project_key, stage) —
+    /// invalidates stale state after model or source change.
+    pub async fn clear_extraction_chunks(
+        &self,
+        project_key: &str,
+        stage: &str,
+    ) -> Result<()> {
+        extraction_chunk::Entity::delete_many()
+            .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
+            .filter(extraction_chunk::Column::Stage.eq(stage))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist one completed extraction chunk. Committed independently of
+    /// the merge transaction so a crash between chunks preserves progress.
+    pub async fn save_extraction_chunk(
+        &self,
+        project_key: &str,
+        stage: &str,
+        chunk_idx: i32,
+        model: &str,
+        content_hash: &str,
+        chunk_json: &str,
+    ) -> Result<()> {
+        extraction_chunk::Entity::insert(extraction_chunk::ActiveModel {
+            project_key: Set(project_key.to_string()),
+            stage: Set(stage.to_string()),
+            chunk_idx: Set(chunk_idx),
+            model: Set(model.to_string()),
+            content_hash: Set(content_hash.to_string()),
+            chunk_json: Set(chunk_json.to_string()),
+            ..Default::default()
+        })
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete all extraction chunk rows for a project — call after a
+    /// successful merge+write so stale chunks don't persist.
+    pub async fn clear_extraction_chunks_for_project(
+        &self,
+        project_key: &str,
+    ) -> Result<()> {
+        extraction_chunk::Entity::delete_many()
+            .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Load all completed extraction chunks for (project_key, stage),
+    /// ordered by chunk_idx. Returns empty vec if none exist.
+    pub async fn load_extraction_chunks(
+        &self,
+        project_key: &str,
+        stage: &str,
+    ) -> Result<Vec<extraction_chunk::Model>> {
+        Ok(extraction_chunk::Entity::find()
+            .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
+            .filter(extraction_chunk::Column::Stage.eq(stage))
+            .order_by_asc(extraction_chunk::Column::ChunkIdx)
+            .all(&self.db)
+            .await?)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
 
     /// Get the platform info for a project.
     pub async fn get_project_platform(
