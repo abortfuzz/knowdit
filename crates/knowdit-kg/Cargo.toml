@@ -22,5 +22,6 @@ thiserror.workspace = true
 itertools.workspace = true
 color-eyre.workspace = true
 async-channel.workspace = true
+async-trait.workspace = true
 url.workspace = true
 schemars.workspace = true

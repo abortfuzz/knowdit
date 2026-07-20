@@ -2939,6 +2939,7 @@ name = "knowdit-kg"
 version = "1.0.1"
 dependencies = [
  "async-channel",
+ "async-trait",
  "color-eyre",
  "itertools 0.10.5",
  "knowdit-kg-model",

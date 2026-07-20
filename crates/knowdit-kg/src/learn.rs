@@ -11,6 +11,7 @@ pub use crate::link::{FindingLinkOptions, PendingFindingForLinking, PersistedFin
 use crate::project_loader::ProjectData;
 use crate::prompts;
 use crate::vulnerability::{VulnerabilityCategory, resolve_taxonomy_entry};
+use async_trait::async_trait;
 use itertools::Itertools;
 pub use knowdit_kg_model::{ExtractedFinding, ExtractedFunction, ExtractedSemantic};
 use llmy::client::client::LLM;
@@ -164,6 +165,50 @@ pub struct ExtractResult {
     pub in_project_links: InProjectLinks,
 }
 
+#[derive(Debug, Clone)]
+pub struct KnownExtractedChunk<T> {
+    pub chunk_idx: usize,
+    pub results: Vec<T>,
+}
+
+#[async_trait]
+pub trait ExtractionCheckpointSink: Send + Sync {
+    async fn save_extraction_chunk(
+        &self,
+        project_key: &str,
+        stage: &str,
+        chunk_idx: usize,
+        model: &str,
+        content_hash: &str,
+        chunk_json: String,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+impl ExtractionCheckpointSink for HistoricalDatabase {
+    async fn save_extraction_chunk(
+        &self,
+        project_key: &str,
+        stage: &str,
+        chunk_idx: usize,
+        model: &str,
+        content_hash: &str,
+        chunk_json: String,
+    ) -> Result<()> {
+        HistoricalDatabase::save_extraction_chunk(
+            self,
+            project_key,
+            stage,
+            i32::try_from(chunk_idx)
+                .map_err(|_| KgError::other("extraction chunk index exceeds i32"))?,
+            model,
+            content_hash,
+            &chunk_json,
+        )
+        .await
+    }
+}
+
 impl ProjectData {
     // ── Content hashing for extraction chunk invalidation ──
     //
@@ -179,9 +224,7 @@ impl ProjectData {
     }
 
     fn findings_content_hash(&self) -> String {
-        let body = self
-            .build_report_prompt_body()
-            .unwrap_or_default();
+        let body = self.build_report_prompt_body().unwrap_or_default();
         let mut h: u64 = 0xcbf29ce484222325;
         for &byte in body.as_bytes() {
             h ^= byte as u64;
@@ -202,6 +245,7 @@ impl ProjectData {
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
         db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
     ) -> Result<ExtractResult> {
         let pid = self.display_id();
 
@@ -222,12 +266,35 @@ impl ProjectData {
             });
         }
 
-        let categories = self.categorize(llm, agent_options, db).await?;
+        let categories = self
+            .categorize(llm, agent_options, db, force_remove_pending_chunks)
+            .await?;
         tracing::info!("Project {} categorized as: {:?}", pid, categories);
 
+        let known_semantics = self
+            .load_known_semantic_chunks(llm, db, force_remove_pending_chunks)
+            .await?;
+        let known_findings = self
+            .load_known_finding_chunks(llm, db, force_remove_pending_chunks)
+            .await?;
+        let checkpoint_sink = db.map(|db| db as &dyn ExtractionCheckpointSink);
         let (all_semantics, all_findings) = tokio::try_join!(
-            self.extract_semantics(llm, &categories, agent_options, chunk_input_budget, db),
-            self.extract_findings(llm, &categories, agent_options, chunk_input_budget, db)
+            self.extract_semantics(
+                llm,
+                &categories,
+                agent_options,
+                chunk_input_budget,
+                &known_semantics,
+                checkpoint_sink,
+            ),
+            self.extract_findings(
+                llm,
+                &categories,
+                agent_options,
+                chunk_input_budget,
+                &known_findings,
+                checkpoint_sink,
+            )
         )?;
 
         tracing::info!(
@@ -289,6 +356,7 @@ impl ProjectData {
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
         db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
     ) -> Result<ExtractResult> {
         let pid = self.display_id();
 
@@ -309,11 +377,24 @@ impl ProjectData {
             });
         }
 
-        let categories = self.categorize(llm, agent_options, db).await?;
+        let categories = self
+            .categorize(llm, agent_options, db, force_remove_pending_chunks)
+            .await?;
         tracing::info!("Project {} categorized as: {:?}", pid, categories);
 
+        let known_semantics = self
+            .load_known_semantic_chunks(llm, db, force_remove_pending_chunks)
+            .await?;
+        let checkpoint_sink = db.map(|db| db as &dyn ExtractionCheckpointSink);
         let all_semantics = self
-            .extract_semantics(llm, &categories, agent_options, chunk_input_budget, db)
+            .extract_semantics(
+                llm,
+                &categories,
+                agent_options,
+                chunk_input_budget,
+                &known_semantics,
+                checkpoint_sink,
+            )
             .await?;
         tracing::info!(
             "Extracted {} raw semantics from project {}",
@@ -360,6 +441,8 @@ impl ProjectData {
         self.merge_and_write_txn(&txn, db, llm, extract, agent_options, merge_chunking)
             .await?;
         txn.commit().await?;
+        db.clear_extraction_chunks_for_project(&self.display_id())
+            .await?;
         Ok(())
     }
 
@@ -513,6 +596,7 @@ impl ProjectData {
         llm: &LLM,
         agent_options: &AgentRunOptions,
         db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
     ) -> Result<Vec<DeFiCategory>> {
         let started_at = Instant::now();
         let model = &llm.model;
@@ -551,8 +635,14 @@ impl ProjectData {
                 return Ok(cats);
             }
             if !chunks.is_empty() {
+                if !force_remove_pending_chunks {
+                    return Err(KgError::other(format!(
+                        "categorize checkpoint for {} does not match this run; rerun with --force-remove-pending-chunks to discard it",
+                        self.display_id()
+                    )));
+                }
                 tracing::info!(
-                    "categorize checkpoint stale for {} — invalidating",
+                    "removing stale categorize checkpoint for {}",
                     self.display_id()
                 );
                 db.clear_extraction_chunks(&self.display_id(), "categorize")
@@ -620,13 +710,52 @@ impl ProjectData {
     /// text into chunks that fit the context window and runs one Agent per
     /// chunk; each chunk's semantics are emitted via `emit_semantic` tool
     /// calls and the chunk is closed with `finalize_semantic_extraction`.
+    async fn load_known_semantic_chunks(
+        &self,
+        llm: &LLM,
+        db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
+    ) -> Result<Vec<KnownExtractedChunk<ExtractedSemantic>>> {
+        let Some(db) = db else {
+            return Ok(Vec::new());
+        };
+        let hash = self.content_hash();
+        let model = &llm.model;
+        if !db
+            .extraction_chunks_match(&self.display_id(), "semantics", model.model_id_str(), &hash)
+            .await?
+        {
+            if !force_remove_pending_chunks {
+                return Err(KgError::other(format!(
+                    "semantic extraction checkpoints for {} do not match this run; rerun with --force-remove-pending-chunks to discard them",
+                    self.display_id()
+                )));
+            }
+            db.clear_extraction_chunks(&self.display_id(), "semantics")
+                .await?;
+            return Ok(Vec::new());
+        }
+        db.load_extraction_chunks(&self.display_id(), "semantics")
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(KnownExtractedChunk {
+                    chunk_idx: usize::try_from(row.chunk_idx)
+                        .map_err(|_| KgError::other("negative extraction chunk index"))?,
+                    results: serde_json::from_str(&row.chunk_json)?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn extract_semantics(
         &self,
         llm: &LLM,
         categories: &[DeFiCategory],
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
-        db: Option<&HistoricalDatabase>,
+        known_chunks: &[KnownExtractedChunk<ExtractedSemantic>],
+        checkpoint_sink: Option<&dyn ExtractionCheckpointSink>,
     ) -> Result<Vec<ExtractedSemantic>> {
         let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
         let model = &llm.model;
@@ -652,48 +781,14 @@ impl ProjectData {
             ));
         };
 
-        // ── DB checkpoint: resume from completed chunks ──
-        let (mut all_semantics, mut chunk_idx) = if let Some(db) = db {
-            if !db
-                .extraction_chunks_match(
-                    &self.display_id(),
-                    "semantics",
-                    model.model_id_str(),
-                    &content_hash,
-                )
-                .await?
-            {
-                tracing::info!(
-                    "semantics extraction checkpoint stale for {} — invalidating",
-                    self.display_id()
-                );
-                db.clear_extraction_chunks(&self.display_id(), "semantics")
-                    .await?;
-                (Vec::new(), 0usize)
-            } else {
-                let completed = db
-                    .load_extraction_chunks(&self.display_id(), "semantics")
-                    .await?;
-                let mut loaded = Vec::new();
-                for row in &completed {
-                    let items: Vec<ExtractedSemantic> =
-                        serde_json::from_str(&row.chunk_json)?;
-                    loaded.extend(items);
-                }
-                let skip = completed.len();
-                tracing::info!(
-                    "semantics extraction checkpoint hit: {} chunk(s), {} semantic(s) — resuming",
-                    skip, loaded.len(),
-                );
-                // Advance cursor past completed chunks
-                for _ in 0..skip {
-                    let _ = cursor.next_chunk(chunk_budget);
-                }
-                (loaded, skip)
-            }
-        } else {
-            (Vec::new(), 0usize)
-        };
+        let mut all_semantics = known_chunks
+            .iter()
+            .flat_map(|chunk| chunk.results.clone())
+            .collect::<Vec<_>>();
+        let mut chunk_idx = known_chunks.len();
+        for _ in known_chunks {
+            let _ = cursor.next_chunk(chunk_budget);
+        }
 
         while let Some(chunk) = cursor.next_chunk(chunk_budget) {
             let user_prompt = format!("{}{}", chunk, user_suffix);
@@ -717,17 +812,18 @@ impl ProjectData {
             let chunk_semantics = extractor.run().await?;
 
             // ── Save chunk checkpoint ──
-            if let Some(db) = db {
+            if let Some(checkpoint_sink) = checkpoint_sink {
                 let json = serde_json::to_string(&chunk_semantics)?;
-                db.save_extraction_chunk(
-                    &self.display_id(),
-                    "semantics",
-                    chunk_idx as i32,
-                    model.model_id_str(),
-                    &content_hash,
-                    &json,
-                )
-                .await?;
+                checkpoint_sink
+                    .save_extraction_chunk(
+                        &self.display_id(),
+                        "semantics",
+                        chunk_idx,
+                        model.model_id_str(),
+                        &content_hash,
+                        json,
+                    )
+                    .await?;
             }
 
             tracing::info!(
@@ -820,13 +916,57 @@ impl ProjectData {
     /// agent pattern as [`Self::extract_semantics`]: one Agent per chunk,
     /// `emit_finding` tool per finding, terminated by
     /// `finalize_finding_extraction`.
+    async fn load_known_finding_chunks(
+        &self,
+        llm: &LLM,
+        db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
+    ) -> Result<Vec<KnownExtractedChunk<ExtractedFinding>>> {
+        let (Some(db), Some(_)) = (db, self.build_report_prompt_body()) else {
+            return Ok(Vec::new());
+        };
+        let hash = self.findings_content_hash();
+        if !db
+            .extraction_chunks_match(
+                &self.display_id(),
+                "findings",
+                llm.model.model_id_str(),
+                &hash,
+            )
+            .await?
+        {
+            if !force_remove_pending_chunks {
+                return Err(KgError::other(format!(
+                    "finding extraction checkpoints for {} do not match this run; rerun with --force-remove-pending-chunks to discard them",
+                    self.display_id()
+                )));
+            }
+            db.clear_extraction_chunks(&self.display_id(), "findings")
+                .await?;
+            return Ok(Vec::new());
+        }
+        db.load_extraction_chunks(&self.display_id(), "findings")
+            .await?
+            .into_iter()
+            .map(|row| {
+                let results = serde_json::from_str::<Vec<ExtractedFinding>>(&row.chunk_json)?;
+                Ok(KnownExtractedChunk {
+                    chunk_idx: usize::try_from(row.chunk_idx)
+                        .map_err(|_| KgError::other("negative extraction chunk index"))?,
+                    results,
+                })
+            })
+            .collect()
+    }
+
     async fn extract_findings(
         &self,
         llm: &LLM,
         categories: &[DeFiCategory],
         agent_options: &AgentRunOptions,
         chunk_input_budget: Option<usize>,
-        db: Option<&HistoricalDatabase>,
+        known_chunks: &[KnownExtractedChunk<ExtractedFinding>],
+        checkpoint_sink: Option<&dyn ExtractionCheckpointSink>,
     ) -> Result<Vec<ExtractedFinding>> {
         let Some(report_body) = self.build_report_prompt_body() else {
             tracing::warn!("No audit report found for project {}", self.display_id());
@@ -852,50 +992,15 @@ impl ProjectData {
             ));
         };
 
-        // ── DB checkpoint: resume from completed chunks ──
         let content_hash = self.findings_content_hash();
-        let (mut all_findings, mut chunk_idx) = if let Some(db) = db {
-            if !db
-                .extraction_chunks_match(
-                    &self.display_id(),
-                    "findings",
-                    model.model_id_str(),
-                    &content_hash,
-                )
-                .await?
-            {
-                tracing::info!(
-                    "findings extraction checkpoint stale for {} — invalidating",
-                    self.display_id()
-                );
-                db.clear_extraction_chunks(&self.display_id(), "findings")
-                    .await?;
-                (Vec::new(), 0usize)
-            } else {
-                let completed = db
-                    .load_extraction_chunks(&self.display_id(), "findings")
-                    .await?;
-                let mut loaded = Vec::new();
-                for row in &completed {
-                    let items: Vec<ExtractedFinding> =
-                        serde_json::from_str(&row.chunk_json)?;
-                    for f in items {
-                        loaded.push(Self::canonicalize_finding(f)?);
-                    }
-                }
-                let skip = completed.len();
-                tracing::info!(
-                    "findings extraction checkpoint hit: {} chunk(s), {} finding(s) — resuming",
-                    skip, loaded.len(),
-                );
-                for _ in 0..skip {
-                    let _ = cursor.next_chunk(chunk_budget);
-                }
-                (loaded, skip)
+        let mut all_findings = Vec::new();
+        for chunk in known_chunks {
+            for finding in &chunk.results {
+                all_findings.push(Self::canonicalize_finding(finding.clone())?);
             }
-        } else {
-            (Vec::new(), 0usize)
-        };
+            let _ = cursor.next_chunk(chunk_budget);
+        }
+        let mut chunk_idx = known_chunks.len();
 
         while let Some(chunk) = cursor.next_chunk(chunk_budget) {
             let user_prompt = format!("{}{}", chunk, user_suffix);
@@ -919,17 +1024,18 @@ impl ProjectData {
             let raw_findings = extractor.run().await?;
 
             // ── Save chunk checkpoint ──
-            if let Some(db) = db {
+            if let Some(checkpoint_sink) = checkpoint_sink {
                 let json = serde_json::to_string(&raw_findings)?;
-                db.save_extraction_chunk(
-                    &self.display_id(),
-                    "findings",
-                    chunk_idx as i32,
-                    model.model_id_str(),
-                    &content_hash,
-                    &json,
-                )
-                .await?;
+                checkpoint_sink
+                    .save_extraction_chunk(
+                        &self.display_id(),
+                        "findings",
+                        chunk_idx,
+                        model.model_id_str(),
+                        &content_hash,
+                        json,
+                    )
+                    .await?;
             }
 
             tracing::info!(

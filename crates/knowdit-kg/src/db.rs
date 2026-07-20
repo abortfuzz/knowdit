@@ -1400,11 +1400,7 @@ impl HistoricalDatabase {
     // ── Extraction Chunk Checkpointing ──────────────────────────────────
 
     /// Count completed extraction chunks for a (project_key, stage) pair.
-    pub async fn count_extraction_chunks(
-        &self,
-        project_key: &str,
-        stage: &str,
-    ) -> Result<usize> {
+    pub async fn count_extraction_chunks(&self, project_key: &str, stage: &str) -> Result<usize> {
         let count = extraction_chunk::Entity::find()
             .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
             .filter(extraction_chunk::Column::Stage.eq(stage))
@@ -1432,18 +1428,14 @@ impl HistoricalDatabase {
             .one(&self.db)
             .await?
         else {
-            return Ok(true); // empty -> fresh start
+            return Ok(true);
         };
         Ok(first.model == model && first.content_hash == content_hash)
     }
 
     /// Delete all extraction chunk rows for (project_key, stage) —
     /// invalidates stale state after model or source change.
-    pub async fn clear_extraction_chunks(
-        &self,
-        project_key: &str,
-        stage: &str,
-    ) -> Result<()> {
+    pub async fn clear_extraction_chunks(&self, project_key: &str, stage: &str) -> Result<()> {
         extraction_chunk::Entity::delete_many()
             .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
             .filter(extraction_chunk::Column::Stage.eq(stage))
@@ -1479,10 +1471,7 @@ impl HistoricalDatabase {
 
     /// Delete all extraction chunk rows for a project — call after a
     /// successful merge+write so stale chunks don't persist.
-    pub async fn clear_extraction_chunks_for_project(
-        &self,
-        project_key: &str,
-    ) -> Result<()> {
+    pub async fn clear_extraction_chunks_for_project(&self, project_key: &str) -> Result<()> {
         extraction_chunk::Entity::delete_many()
             .filter(extraction_chunk::Column::ProjectKey.eq(project_key))
             .exec(&self.db)

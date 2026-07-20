@@ -128,7 +128,13 @@ pub(crate) async fn load_or_extract_project_semantics(
     );
     let legacy = knowdit_kg::project_loader::ProjectData::from_project_view(project);
     let extract = legacy
-        .categorize_and_extract_semantics(llm, agent_options, extract_chunk_input_budget, None)
+        .categorize_and_extract_semantics(
+            llm,
+            agent_options,
+            extract_chunk_input_budget,
+            None,
+            false,
+        )
         .await?;
     repo.replace_project_semantics(&extract.semantics).await?;
     tracing::info!(
