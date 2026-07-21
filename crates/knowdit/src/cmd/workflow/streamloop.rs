@@ -31,7 +31,7 @@
 //! old ordinal-named layout) are harmless and can be deleted at any
 //! time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -242,6 +242,14 @@ pub struct StreamloopArgs {
     )]
     pub inject_ruled_out: bool,
 
+    /// Stop each link after specification generation. Specifications are
+    /// still committed to the project database and mirrored as JSON under
+    /// `<output_folder>/specifications`, but forge preflight, harness
+    /// generation, fuzzing, reflection, regeneration, and report review are
+    /// skipped.
+    #[arg(long, default_value_t = false)]
+    pub only_spec: bool,
+
     #[command(flatten)]
     pub status: StatusInjectionArgs,
 
@@ -286,6 +294,11 @@ impl StatusInjectionArgs {
 
 impl StreamloopArgs {
     pub async fn run(mut self, primary_llm: &LLM) -> Result<()> {
+        if self.only_spec && self.review_findings {
+            return Err(eyre!(
+                "--only-spec cannot be combined with --review-findings"
+            ));
+        }
         self.apply_default_concurrency();
         // Validate --mapper-extra-categories up front so a typo aborts before
         // any LLM work instead of mid-pipeline at the map phase.
@@ -380,12 +393,18 @@ impl StreamloopArgs {
                     regenerate: self.fuzz.fuzz_regenerate,
                     via_ir: self.harness.harness_via_ir,
                 })?;
-                tracing::info!("[streamloop preflight] verifying forge environment");
-                harness_backend.preflight(&repo_root).await.wrap_err(
-                    "forge environment preflight failed — fix the project's foundry config / \
-                     forge-std install and re-run",
-                )?;
-                tracing::info!("[streamloop preflight] forge environment OK");
+                if self.only_spec {
+                    tracing::info!(
+                        "[streamloop preflight] --only-spec: skipping forge environment verification"
+                    );
+                } else {
+                    tracing::info!("[streamloop preflight] verifying forge environment");
+                    harness_backend.preflight(&repo_root).await.wrap_err(
+                        "forge environment preflight failed — fix the project's foundry config / \
+                         forge-std install and re-run",
+                    )?;
+                    tracing::info!("[streamloop preflight] forge environment OK");
+                }
 
                 tracing::info!("[streamloop stage 3/8] loading call graph (Solidity)");
                 let cg = repo.load_call_graph().await?;
@@ -596,6 +615,7 @@ impl StreamloopArgs {
             output_folder: self.output_folder.clone(),
             max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
+            only_spec: self.only_spec,
             report_cfg,
             novelty,
             novelty_batch: self.stream_novelty_batch,
@@ -712,6 +732,7 @@ struct LinkContext<B: HarnessBackend + Clone + 'static> {
     reflect: ReflectSharedArgs,
     regen: RegenSharedArgs,
     output_folder: PathBuf,
+    only_spec: bool,
     max_inner_cycles: usize,
     /// Frozen prompt prefix sourced once from
     /// `harness_backend.prompt_prefix()` at link-pipeline start.
@@ -759,6 +780,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             outcome.steps,
             humantime::format_duration(gen_specs_started.elapsed()),
         );
+        self.dump_specifications(&outcome.specification_ids).await?;
 
         let mut drain = LinkDrainCounts::default();
         let mut code_gen_ids: Vec<i32> = Vec::new();
@@ -767,7 +789,11 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         // Gate on `specification_ids` rather than `specifications`:
         // resumed Partial links arrive with empty parsed specs but
         // non-empty ids — those ids drive the cycle.
-        if !outcome.specification_ids.is_empty() {
+        if self.only_spec {
+            tracing::info!(
+                "[streamloop link {ordinal:04}/{total}] --only-spec: skipping fuzz/reflect/regen"
+            );
+        } else if !outcome.specification_ids.is_empty() {
             let mut active: Vec<i32> = outcome.specification_ids.clone();
             for cycle in 1..=self.max_inner_cycles {
                 if active.is_empty() {
@@ -801,7 +827,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             &code_gen_ids,
             &usage,
         )?;
-        self.dump_valid_findings().await?;
+        if !self.only_spec {
+            self.dump_valid_findings().await?;
+        }
         tracing::info!(
             "[streamloop link {ordinal:04}/{total}] DONE — {} cycle(s), {} codegen(s), \
              fuzz[completed/violated]={}/{}, reflect_graded={}, \
@@ -826,6 +854,56 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
                 usage,
             },
         })
+    }
+
+    /// Persist every spec committed for one link under
+    /// `<output_folder>/specifications/specification_<id>.json`. Loading the
+    /// payload back from the database also covers DB-resumed `Partial` links,
+    /// whose outcome intentionally carries ids but no parsed specifications.
+    async fn dump_specifications(&self, specification_ids: &[i32]) -> Result<()> {
+        if specification_ids.is_empty() {
+            return Ok(());
+        }
+
+        let dir = self.output_folder.join("specifications");
+        std::fs::create_dir_all(&dir)
+            .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+
+        let mut wanted: BTreeSet<i32> = specification_ids.iter().copied().collect();
+        for loaded in self
+            .repo
+            .load_specifications()
+            .await
+            .wrap_err("failed to reload specifications for streamloop dump")?
+        {
+            if !wanted.remove(&loaded.id) {
+                continue;
+            }
+            let specification =
+                serde_json::from_str::<AuditSpecification>(&loaded.specification_json)
+                    .wrap_err_with(|| {
+                        format!("failed to parse specification {} from DB", loaded.id)
+                    })?;
+            let provenance = self.repo.load_provenance_for_spec(loaded.id).await?;
+            let on_disk = OnDiskSpecification {
+                specification_id: loaded.id,
+                extract_id: loaded.semantic_id,
+                historical_id: loaded.historical_id,
+                finding_id: loaded.finding_id,
+                specification,
+                provenance,
+            };
+            let final_path = dir.join(format!("specification_{}.json", loaded.id));
+            write_json_atomic(&final_path, &on_disk)?;
+        }
+
+        if !wanted.is_empty() {
+            return Err(eyre!(
+                "specification ids committed by gen-specs were not found in DB: {:?}",
+                wanted
+            ));
+        }
+        Ok(())
     }
 
     /// Mirror every `valid_finding` row in the DB to disk under
@@ -1564,6 +1642,8 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     pub(crate) output_folder: PathBuf,
     pub(crate) max_inner_cycles: usize,
     pub(crate) concurrency: usize,
+    /// Generate and persist specs only; skip every validation phase.
+    pub(crate) only_spec: bool,
     /// When set, the pipeline drains review + merge after each completed link
     /// and finalizes (writer + export) at the end. `None` for plain runs and
     /// for `external-validate` (which has its own reporting).
@@ -1606,6 +1686,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             output_folder,
             max_inner_cycles,
             concurrency,
+            only_spec,
             report_cfg,
             novelty,
             novelty_batch,
@@ -1669,6 +1750,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             reflect,
             regen,
             output_folder,
+            only_spec,
             max_inner_cycles: max_inner_cycles.max(1),
             language_prompt_prefix,
         });
@@ -1779,6 +1861,18 @@ struct LinkSnapshot {
     drain: LinkDrainCounts,
     /// Per-phase token + USD spend for this link (llmy 0.16 scopes).
     usage: LinkUsageReport,
+}
+
+/// Self-contained on-disk representation of one committed specification and
+/// the semantic/finding link that caused it to be generated.
+#[derive(Debug, Serialize)]
+struct OnDiskSpecification {
+    specification_id: i32,
+    extract_id: i32,
+    historical_id: i32,
+    finding_id: i32,
+    specification: AuditSpecification,
+    provenance: Option<FindingProvenance>,
 }
 
 /// On-disk shape of a `valid_finding` row written to
