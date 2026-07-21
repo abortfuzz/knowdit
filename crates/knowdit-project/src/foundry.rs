@@ -274,6 +274,7 @@ impl FoundryProject {
 
             let aggregated = output.into_output();
             let mut inputs: Vec<SourceUnitInput> = Vec::new();
+            let mut skipped_external_inputs = 0usize;
             for (path, source_file) in aggregated.sources.into_sources() {
                 let Some(ast) = source_file.ast else {
                     tracing::warn!("solc emitted no AST for {} (skipping)", path.display());
@@ -302,8 +303,38 @@ impl FoundryProject {
                 } else {
                     repo_root.join(&path)
                 };
-                let source = fs::read_to_string(&abs_path).wrap_err_with(|| {
-                    format!("failed to read source content from {}", abs_path.display())
+                let canonical_path = fs::canonicalize(&abs_path).wrap_err_with(|| {
+                    format!("failed to canonicalize compiled source {}", abs_path.display())
+                })?;
+
+                // Solc must compile remapped dependencies to resolve imports,
+                // but they are not part of the audited repository. Keeping
+                // their ASTs in the project call graph floods semantic/spec
+                // context with OpenZeppelin, Solmate, forge-std, etc. Filter
+                // by canonical location after compilation so project-owned
+                // directories named `lib/` remain in scope while remappings
+                // whose targets live outside `repo_root` do not.
+                if !canonical_path.starts_with(&repo_root) {
+                    skipped_external_inputs += 1;
+                    continue;
+                }
+                let relative_path = canonical_path.strip_prefix(&repo_root).wrap_err_with(|| {
+                    format!(
+                        "compiled source {} escaped repository {}",
+                        canonical_path.display(),
+                        repo_root.display()
+                    )
+                })?;
+                if Self::is_non_audit_source(relative_path) {
+                    skipped_external_inputs += 1;
+                    continue;
+                }
+
+                let source = fs::read_to_string(&canonical_path).wrap_err_with(|| {
+                    format!(
+                        "failed to read source content from {}",
+                        canonical_path.display()
+                    )
                 })?;
 
                 inputs.push(SourceUnitInput {
@@ -311,6 +342,12 @@ impl FoundryProject {
                     source,
                     source_unit,
                 });
+            }
+            if skipped_external_inputs > 0 {
+                tracing::info!(
+                    "excluded {skipped_external_inputs} external or non-audit compiled source unit(s) from static analysis under {}",
+                    repo_root.display(),
+                );
             }
 
             ensure!(
@@ -641,6 +678,30 @@ impl FoundryProject {
         builder
             .build()
             .map_err(|err| eyre!("failed to build foundry-compilers project paths: {err}"))
+    }
+
+    fn is_non_audit_source(relative_path: &Path) -> bool {
+        relative_path.components().any(|component| {
+            let name = component.as_os_str();
+            matches!(
+                name.to_str(),
+                Some(
+                    "test"
+                        | "tests"
+                        | "mock"
+                        | "mocks"
+                        | "script"
+                        | "scripts"
+                        | "deploy"
+                        | "out"
+                        | "artifacts"
+                        | "cache"
+                        | "broadcast"
+                        | "node_modules"
+                        | "target"
+                )
+            )
+        })
     }
 }
 

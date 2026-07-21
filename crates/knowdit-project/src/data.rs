@@ -89,6 +89,17 @@ impl ProjectData {
         Self::from_source_dir(&parsed.name, &parsed.root, parsed.platform_id.as_deref()).await
     }
 
+    /// Like [`Self::from_source_dir_spec`], but treats directories named
+    /// `lib/` as project-owned source. This is intentionally opt-in: most
+    /// Foundry repositories use `lib/` for vendored dependencies, while a
+    /// small number of audited snapshots keep their actual implementation
+    /// there.
+    pub async fn from_source_dir_spec_including_lib(spec: &str) -> Result<Self> {
+        let parsed = ProjectSpec::parse(spec)?;
+        Self::from_source_dir_with_lib(&parsed.name, &parsed.root, parsed.platform_id.as_deref())
+            .await
+    }
+
     /// Parse a `name:path` / `name:path:platform_id` spec and load
     /// the project, forcing Solidity (no auto-detect). Faster than
     /// [`Self::from_source_dir_spec`] when you already know the
@@ -137,35 +148,48 @@ impl ProjectData {
         root_dir: &Path,
         platform_id: Option<&str>,
     ) -> Result<Self> {
-        let solidity_scope = ProjectScope::build_from_patterns(
-            root_dir.to_path_buf(),
-            &["**/*.sol"],
-            &DEFAULT_VENDORED_EXCLUDES,
-        )
-        .ok();
-        let move_scope = ProjectScope::build_from_patterns(
-            root_dir.to_path_buf(),
-            &["**/*.move"],
-            &DEFAULT_VENDORED_EXCLUDES,
-        )
-        .ok();
+        Self::from_source_dir_with_excludes(name, root_dir, platform_id, &DEFAULT_VENDORED_EXCLUDES)
+            .await
+    }
 
-        let (language, scope) = match (
-            solidity_scope
-                .as_ref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false),
-            move_scope.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
-        ) {
-            (true, false) => (SourceLanguage::Solidity, solidity_scope.unwrap()),
-            (false, true) => (SourceLanguage::Move, move_scope.unwrap()),
-            (true, true) => {
+    async fn from_source_dir_with_lib(
+        name: &str,
+        root_dir: &Path,
+        platform_id: Option<&str>,
+    ) -> Result<Self> {
+        let excludes: Vec<&str> = DEFAULT_VENDORED_EXCLUDES
+            .iter()
+            .copied()
+            .filter(|pattern| !matches!(*pattern, "lib" | "lib/**" | "**/lib" | "**/lib/**"))
+            .collect();
+        Self::from_source_dir_with_excludes(name, root_dir, platform_id, &excludes).await
+    }
+
+    async fn from_source_dir_with_excludes(
+        name: &str,
+        root_dir: &Path,
+        platform_id: Option<&str>,
+        excludes: &[&str],
+    ) -> Result<Self> {
+        let solidity_scope =
+            ProjectScope::build_from_patterns(root_dir.to_path_buf(), &["**/*.sol"], excludes)
+                .ok()
+                .filter(|scope| !scope.is_empty());
+        let move_scope =
+            ProjectScope::build_from_patterns(root_dir.to_path_buf(), &["**/*.move"], excludes)
+                .ok()
+                .filter(|scope| !scope.is_empty());
+
+        let (language, scope) = match (solidity_scope, move_scope) {
+            (Some(scope), None) => (SourceLanguage::Solidity, scope),
+            (None, Some(scope)) => (SourceLanguage::Move, scope),
+            (Some(_), Some(_)) => {
                 return Err(eyre!(
                     "project directory contains both Solidity and Move sources: {}",
                     root_dir.display()
                 ));
             }
-            (false, false) => {
+            (None, None) => {
                 return Err(eyre!(
                     "no Solidity or Move source files found under {}",
                     root_dir.display()
@@ -405,6 +429,31 @@ mod tests {
             .unwrap();
         assert_eq!(pd.language, SourceLanguage::Solidity);
         assert_eq!(pd.display_id(), "p");
+    }
+
+    #[tokio::test]
+    async fn from_source_dir_spec_including_lib_loads_project_lib() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("interfaces"))?;
+        std::fs::create_dir_all(dir.path().join("lib"))?;
+        std::fs::create_dir_all(dir.path().join("test"))?;
+        std::fs::write(
+            dir.path().join("interfaces/IThing.sol"),
+            "interface IThing {}",
+        )?;
+        std::fs::write(dir.path().join("lib/Thing.sol"), "contract Thing {}")?;
+        std::fs::write(dir.path().join("test/Thing.t.sol"), "contract ThingTest {}")?;
+        let spec = format!("p:{}", dir.path().display());
+        let pd = ProjectData::from_source_dir_spec_including_lib(&spec).await?;
+        let paths: Vec<&Path> = pd
+            .source_files()
+            .iter()
+            .map(|file| file.relative_path.as_path())
+            .collect();
+        assert!(paths.contains(&Path::new("interfaces/IThing.sol")));
+        assert!(paths.contains(&Path::new("lib/Thing.sol")));
+        assert!(!paths.contains(&Path::new("test/Thing.t.sol")));
+        Ok(())
     }
 
     #[tokio::test]

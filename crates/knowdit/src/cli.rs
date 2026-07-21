@@ -31,6 +31,12 @@ pub struct ProjectArgs {
     /// the SQLite DB.
     #[arg(long = "project", short = 'p')]
     pub project: String,
+
+    /// Treat `lib/` directories as audited project source instead of vendored
+    /// dependencies. Use only for repositories whose implementation actually
+    /// lives under `lib/`.
+    #[arg(long, default_value_t = false)]
+    pub include_lib_sources: bool,
 }
 
 /// `--repo-database` (alias `--database-path`). The optional per-project
@@ -371,9 +377,12 @@ impl ProjectArgs {
     /// [`ProjectData`]. Auto-detects Solidity vs Move from the
     /// extensions present under the spec's `path`.
     pub async fn to_project_data(&self) -> Result<ProjectData> {
-        ProjectData::from_source_dir_spec(&self.project)
-            .await
-            .wrap_err_with(|| format!("failed to load --project `{}`", self.project))
+        let loaded = if self.include_lib_sources {
+            ProjectData::from_source_dir_spec_including_lib(&self.project).await
+        } else {
+            ProjectData::from_source_dir_spec(&self.project).await
+        };
+        loaded.wrap_err_with(|| format!("failed to load --project `{}`", self.project))
     }
 
     /// Open the per-project SQLite database, migrate the schema,
