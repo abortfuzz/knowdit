@@ -258,6 +258,7 @@ impl StreamloopArgs {
                         &repo,
                         &repo_root,
                         &self.backend,
+                        self.harness.forge_bin.clone(),
                     )
                     .await?;
                 }

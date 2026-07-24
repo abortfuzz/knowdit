@@ -105,6 +105,13 @@ pub struct KgStats {
     pub cross_links_per_canonical_finding: f64,
     pub cross_high_per_canonical_finding: f64,
     pub cross_links_per_canonical_semantic: f64,
+    /// Cross-project links whose finding endpoint is a FOLDED child — should
+    /// be 0; nonzero means a merge/carry pass violated the "links live on
+    /// canonicals" convention (double-counted, invisible to canonical-only
+    /// consumers).
+    pub cross_links_on_folded_findings: usize,
+    /// Same anomaly for the semantic endpoint — should be 0.
+    pub cross_links_on_folded_semantics: usize,
     /// Distinct canonical findings carrying ≥1 cross-project link.
     pub linked_canonical_findings: usize,
     /// Distinct canonical semantics carrying ≥1 cross-project link.
@@ -240,6 +247,13 @@ impl std::fmt::Display for KgStats {
             self.semantics_canonical,
             pct(self.linked_canonical_semantics, self.semantics_canonical),
         )?;
+        if self.cross_links_on_folded_findings > 0 || self.cross_links_on_folded_semantics > 0 {
+            writeln!(
+                f,
+                "  ⚠ cross-links stranded on FOLDED nodes (should be 0): findings {} | semantics {}",
+                self.cross_links_on_folded_findings, self.cross_links_on_folded_semantics,
+            )?;
+        }
         writeln!(
             f,
             "distinct source projects per canonical (its own + folded children's, deduped): semantic {:.2} (max {}) | finding {:.2}",
@@ -383,6 +397,12 @@ impl HistoricalDatabase {
                 LinkStrength::High => stats.cross_high += 1,
                 LinkStrength::Medium => stats.cross_medium += 1,
                 LinkStrength::Low => stats.cross_low += 1,
+            }
+            if folded_findings.contains(&link.audit_finding_id) {
+                stats.cross_links_on_folded_findings += 1;
+            }
+            if folded_semantics.contains(&link.semantic_node_id) {
+                stats.cross_links_on_folded_semantics += 1;
             }
             linked_findings.insert(link.audit_finding_id);
             linked_semantics.insert(link.semantic_node_id);

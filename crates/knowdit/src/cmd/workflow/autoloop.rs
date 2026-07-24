@@ -185,8 +185,13 @@ impl AutoloopArgs {
         let cg = repo.load_call_graph().await?;
         if cg.contracts.is_empty() {
             tracing::info!("No contracts in call graph — running static call-graph phase");
-            SolidityCallGraphStaticArgs::update_call_graph(&repo, &repo_root, &self.backend)
-                .await?;
+            SolidityCallGraphStaticArgs::update_call_graph(
+                &repo,
+                &repo_root,
+                &self.backend,
+                self.harness.forge_bin.clone(),
+            )
+            .await?;
         }
         let cg = repo.load_call_graph().await?;
         if cg.contracts.is_empty() {

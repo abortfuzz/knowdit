@@ -2088,8 +2088,8 @@ pub async fn retro_link_pending_semantics(
     options.warn_param_drift(model);
     let budgets = FindingLinkBudgets::from_options(model, options);
 
-    // Render the (small, bounded) pending semantics as a single candidate
-    // block — they all fit in one prompt.
+    // Render the pending semantics as link candidates (chunked below — a
+    // merge-kg import can queue 1000+ at once).
     let candidate_entries: Vec<FindingLinkCandidateEntry> = pending_semantics
         .iter()
         .map(|node| {
@@ -2121,13 +2121,18 @@ pub async fn retro_link_pending_semantics(
         })
         .collect();
 
-    let context_key = FindingLinkContextKey::empty();
-    let context = std::sync::Arc::new(FindingLinkContext::build(
-        model,
-        &context_key,
-        candidate_entries,
-    ));
-    let finding_token_budget = budgets.finding_token_budget(model, context.as_ref())?;
+    // merge-kg can queue a whole source KG's worth of new canonicals (1000+),
+    // far beyond one prompt: chunk the candidate block exactly like the main
+    // link pass — an unchunked prefix would eat the entire input budget (hard
+    // error today) or silently exceed 256K-window deployments.
+    let semantic_token_budget = budgets.semantic_token_budget(model, None)?;
+    let candidate_groups = group_finding_link_candidate_entries(candidate_entries)?;
+    let candidate_chunks = partition_finding_link_candidate_groups(
+        candidate_groups,
+        semantic_token_budget,
+        budgets.max_semantics_per_batch,
+    );
+    let chunk_count = candidate_chunks.len();
 
     // Build per-finding entries.
     let entries: Vec<FindingLinkBatchEntry> = already_linked_findings
@@ -2157,48 +2162,56 @@ pub async fn retro_link_pending_semantics(
         .collect();
 
     let total = entries.len();
-    let batches = partition_finding_link_entries(
-        entries,
-        finding_token_budget,
-        budgets.max_findings_per_batch,
-    );
-    tracing::info!(
-        "Retro-link: {} pending canonical semantic(s) × {} pre-linked finding(s) → {} batch(es)",
-        context.candidate_map.len(),
-        total,
-        batches.len()
-    );
 
-    let mut total_inserted = 0usize;
-    for (idx, batch_entries) in batches.into_iter().enumerate() {
-        let finding_token_count = batch_entries.iter().map(|e| e.token_count).sum();
-        let batch = FindingLinkBatch {
-            context_key: context_key.clone(),
-            entries: batch_entries,
-            finding_token_count,
+    // Materialize every chunk's context and its finding batches up front so
+    // a worker pool can drain the whole chunk × batch grid concurrently.
+    let mut contexts: BTreeMap<FindingLinkContextKey, std::sync::Arc<FindingLinkContext>> =
+        BTreeMap::new();
+    let mut all_batches: Vec<FindingLinkBatch> = Vec::new();
+    for (chunk_index, chunk_entries) in candidate_chunks.into_iter().enumerate() {
+        let context_key = FindingLinkContextKey::empty().with_semantic_chunk(chunk_index);
+        let context = std::sync::Arc::new(FindingLinkContext::build(
+            model,
+            &context_key,
+            chunk_entries,
+        ));
+        let finding_token_budget = budgets.finding_token_budget(model, context.as_ref())?;
+        // Prefix size differs per chunk, so each chunk re-partitions its own
+        // copy of the finding entries under its own finding budget.
+        let batches = partition_finding_link_entries(
+            entries.clone(),
             finding_token_budget,
-            input_token_budget: budgets.input_token_budget,
-        };
-        tracing::info!(
-            "Retro-link batch {}: {} finding(s)",
-            idx + 1,
-            batch.entries.len()
+            budgets.max_findings_per_batch,
         );
-        let runner = FindingLinkBatchAgentRunner {
-            llm: llm.clone(),
-            batch: &batch,
-            context: context.as_ref(),
-            agent_options: agent_options.clone(),
-            max_response_attempts,
-            evidence_min_high_medium: options.evidence_min_high_medium,
-            evidence_min_low: options.evidence_min_low,
-            high_quote_min_chars: options.high_quote_min_chars,
-        };
-        let results = runner.run().await?;
+        tracing::info!(
+            "Retro-link chunk {}/{}: {} candidate semantic(s) × {} pre-linked finding(s) → {} batch(es)",
+            chunk_index + 1,
+            chunk_count,
+            context.candidate_map.len(),
+            total,
+            batches.len()
+        );
+        for batch_entries in batches {
+            let finding_token_count = batch_entries.iter().map(|e| e.token_count).sum();
+            all_batches.push(FindingLinkBatch {
+                context_key: context_key.clone(),
+                entries: batch_entries,
+                finding_token_count,
+                finding_token_budget,
+                input_token_budget: budgets.input_token_budget,
+            });
+        }
+        contexts.insert(context_key, context);
+    }
 
-        // Translate to LinkEdge rows (carrying strength + evidence) and
-        // write directly. Skip writing finding_link_status — these
-        // findings are already there.
+    /// Translate one batch's agent results into link edges and append them
+    /// (idempotent per (semantic, finding) pair, so interrupted retro-links
+    /// can simply be re-run).
+    async fn persist_retro_results(
+        db: &HistoricalDatabase,
+        batch_label: &str,
+        results: Vec<PersistedFindingLinkResult>,
+    ) -> Result<usize> {
         let mut edges = Vec::new();
         for result in results {
             for link in result.semantic_links {
@@ -2211,12 +2224,129 @@ pub async fn retro_link_pending_semantics(
             }
         }
         let inserted = db.append_semantic_finding_links(&edges).await?;
-        total_inserted += inserted;
         tracing::info!(
             "Retro-link batch {} inserted {} new semantic_finding_link row(s)",
-            idx + 1,
+            batch_label,
             inserted
         );
+        Ok(inserted)
+    }
+
+    let concurrency = options.concurrency.max(1);
+    let total_batches = all_batches.len();
+    let mut total_inserted = 0usize;
+
+    if concurrency <= 1 {
+        for batch in all_batches {
+            let context = contexts
+                .get(&batch.context_key)
+                .ok_or_else(|| {
+                    KgError::other(format!(
+                        "Missing retro-link context for key '{}'",
+                        batch.context_key.label()
+                    ))
+                })?
+                .clone();
+            tracing::info!(
+                "Retro-link batch {}: {} finding(s)",
+                &batch,
+                batch.entries.len()
+            );
+            let runner = FindingLinkBatchAgentRunner {
+                llm: llm.clone(),
+                batch: &batch,
+                context: context.as_ref(),
+                agent_options: agent_options.clone(),
+                max_response_attempts,
+                evidence_min_high_medium: options.evidence_min_high_medium,
+                evidence_min_low: options.evidence_min_low,
+                high_quote_min_chars: options.high_quote_min_chars,
+            };
+            let results = runner.run().await?;
+            total_inserted += persist_retro_results(db, &format!("{}", &batch), results).await?;
+        }
+    } else {
+        use tokio::sync::mpsc;
+        use tokio::task::JoinSet;
+
+        let contexts = std::sync::Arc::new(contexts);
+        let (tx, rx) = async_channel::bounded::<FindingLinkBatch>(total_batches + 1);
+        let (out_tx, mut out_rx) = mpsc::channel::<(
+            FindingLinkBatch,
+            Result<Vec<PersistedFindingLinkResult>>,
+        )>(concurrency + 1);
+        let mut handles = JoinSet::new();
+
+        for _ in 0..concurrency {
+            let rx = rx.clone();
+            let out = out_tx.clone();
+            let llm_clone = llm.clone();
+            let contexts = contexts.clone();
+            let worker_agent_options = agent_options.clone();
+            let options = options;
+
+            handles.spawn(async move {
+                while let Ok(batch) = rx.recv().await {
+                    let result = match contexts.get(&batch.context_key) {
+                        Some(context) => {
+                            let runner = FindingLinkBatchAgentRunner {
+                                llm: llm_clone.clone(),
+                                batch: &batch,
+                                context: context.as_ref(),
+                                agent_options: worker_agent_options.clone(),
+                                max_response_attempts,
+                                evidence_min_high_medium: options.evidence_min_high_medium,
+                                evidence_min_low: options.evidence_min_low,
+                                high_quote_min_chars: options.high_quote_min_chars,
+                            };
+                            runner.run().await
+                        }
+                        None => Err(KgError::other(format!(
+                            "Missing retro-link context for key '{}'",
+                            batch.context_key.label()
+                        ))),
+                    };
+                    if out.send((batch, result)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(out_tx);
+
+        for batch in all_batches {
+            tx.send(batch)
+                .await
+                .map_err(|e| KgError::other(format!("retro-link work queue closed early: {e}")))?;
+        }
+        tx.close();
+
+        // Single-writer collector: agents run concurrently, edge inserts stay
+        // serialized here. A failed batch does NOT clear the pending queue —
+        // the error propagates after the pool drains and a re-run resumes
+        // idempotently.
+        let mut first_error: Option<KgError> = None;
+        while let Some((batch, result)) = out_rx.recv().await {
+            match result {
+                Ok(results) => {
+                    match persist_retro_results(db, &format!("{}", &batch), results).await {
+                        Ok(inserted) => total_inserted += inserted,
+                        Err(e) => {
+                            tracing::error!("Retro-link batch {} failed to persist: {}", &batch, e);
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Retro-link batch {} failed: {}", &batch, e);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        while handles.join_next().await.is_some() {}
+        if let Some(e) = first_error {
+            return Err(e);
+        }
     }
 
     let cleared = db.clear_pending_semantic_queue().await?;

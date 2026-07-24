@@ -98,6 +98,58 @@ impl FoundryProject {
     /// `options` controls profile selection, source-dir override, and
     /// the `viaIR` solc flag — see [`FoundryOptions`].
     pub async fn build(repo_root: PathBuf, options: FoundryOptions) -> Result<Self> {
+        let repo_root = Self::canonical_repo_root(repo_root)?;
+        let inputs = Self::compile_source_units(&repo_root, &options).await?;
+        Self::finish_build(repo_root, inputs)
+    }
+
+    /// Compile via the caller-supplied `forge` binary (`forge build --force
+    /// --ast --build-info`, all outputs redirected to a temp dir) and parse
+    /// the emitted build-info JSON for per-source ASTs. This inherits forge's
+    /// EXACT config resolution — remappings (incl. context-scoped nested
+    /// ones), profile selection, solc version management, `ignored_error_codes`
+    /// — so any project `forge build` accepts compiles here identically.
+    /// Prefer this whenever a forge binary is available; the in-process
+    /// foundry-compilers pipeline ([`Self::build`]) remains the fallback and
+    /// hand-mirrors that resolution. Requires a forge new enough to know
+    /// `--ast` (validated on 1.7.x).
+    pub async fn build_with_forge_bin(
+        forge_bin: PathBuf,
+        repo_root: PathBuf,
+        options: FoundryOptions,
+    ) -> Result<Self> {
+        let repo_root = Self::canonical_repo_root(repo_root)?;
+        let inputs =
+            Self::compile_source_units_with_forge(&forge_bin, &repo_root, &options).await?;
+        Self::finish_build(repo_root, inputs)
+    }
+
+    /// Pick the compile backend from `forge_bin`: `Some` → the forge-binary
+    /// build-info pipeline ([`Self::build_with_forge_bin`]), `None` → the
+    /// in-process foundry-compilers fallback ([`Self::build`]).
+    pub async fn may_build_forge(
+        forge_bin: Option<PathBuf>,
+        repo_root: PathBuf,
+        options: FoundryOptions,
+    ) -> Result<Self> {
+        match forge_bin {
+            Some(bin) => {
+                tracing::info!(
+                    "FoundryProject: compiling via forge binary {}",
+                    bin.display()
+                );
+                Self::build_with_forge_bin(bin, repo_root, options).await
+            }
+            None => {
+                tracing::info!(
+                    "FoundryProject: no forge binary supplied; compiling via in-process foundry-compilers"
+                );
+                Self::build(repo_root, options).await
+            }
+        }
+    }
+
+    fn canonical_repo_root(repo_root: PathBuf) -> Result<PathBuf> {
         let repo_root = repo_root.canonicalize().wrap_err_with(|| {
             format!("failed to canonicalize repo root {}", repo_root.display())
         })?;
@@ -106,8 +158,12 @@ impl FoundryProject {
             "repo root {} is not a directory",
             repo_root.display(),
         );
+        Ok(repo_root)
+    }
 
-        let inputs = Self::compile_source_units(&repo_root, &options).await?;
+    /// Shared tail of every compile backend: static call-graph + storage
+    /// analyses over the source-unit ASTs.
+    fn finish_build(repo_root: PathBuf, inputs: Vec<SourceUnitInput>) -> Result<Self> {
         let (call_graph, id_maps) = build_call_graph_with_maps(&repo_root, &inputs)
             .wrap_err("failed to build static Solidity call graph")?;
         let storage = analyze_storage(&repo_root, &inputs, &id_maps)
@@ -267,6 +323,148 @@ impl FoundryProject {
         .wrap_err("solc compile task panicked")?
     }
 
+    /// `forge build` the project and harvest per-source ASTs from its
+    /// build-info JSON. Outputs (`out`, `build-info`, compile cache) all live
+    /// in a temp dir so the project checkout stays pristine; `--force`
+    /// guarantees a fresh compile (cached artifacts carry no AST). Test and
+    /// script sources are skipped to match the in-process backend's
+    /// `.knowdit-no-walk` behaviour.
+    async fn compile_source_units_with_forge(
+        forge_bin: &Path,
+        repo_root: &Path,
+        options: &FoundryOptions,
+    ) -> Result<Vec<SourceUnitInput>> {
+        let tmp = tempfile::tempdir().wrap_err("failed to create temp dir for forge outputs")?;
+        let out_dir = tmp.path().join("out");
+        let bi_dir = tmp.path().join("build-info");
+        let cache_dir = tmp.path().join("cache");
+
+        let mut cmd = tokio::process::Command::new(forge_bin);
+        cmd.current_dir(repo_root)
+            .arg("build")
+            .arg("--force")
+            .arg("--ast")
+            .arg("--build-info")
+            // `test` / `script` are forge aliases for the `.t.sol` / `.s.sol`
+            // suffixes only; the dir globs also exclude un-suffixed helpers
+            // (mocks under test/, config helpers under script/) to match the
+            // in-process backend's whole-dir `.knowdit-no-walk` exclusion.
+            .args(["--skip", "test"])
+            .args(["--skip", "script"])
+            .args(["--skip", "**/test/**"])
+            .args(["--skip", "**/script/**"])
+            .arg("-o")
+            .arg(&out_dir)
+            .arg("--build-info-path")
+            .arg(&bi_dir)
+            .arg("--cache-path")
+            .arg(&cache_dir)
+            .env("FOUNDRY_PROFILE", &options.profile);
+        if options.via_ir {
+            cmd.arg("--via-ir");
+        }
+        if let Some(src) = &options.src {
+            cmd.env("FOUNDRY_SRC", src);
+        }
+
+        let output = cmd
+            .output()
+            .await
+            .wrap_err_with(|| format!("failed to spawn forge binary {}", forge_bin.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let tail = |s: &str| {
+                s.char_indices()
+                    .rev()
+                    .nth(3999)
+                    .map(|(i, _)| s[i..].to_string())
+                    .unwrap_or_else(|| s.to_string())
+            };
+            return Err(eyre!(
+                "forge build failed ({}) in {}:\nstdout tail: {}\nstderr tail: {}",
+                output.status,
+                repo_root.display(),
+                tail(&stdout),
+                tail(&stderr),
+            ));
+        }
+
+        // One build-info file per compiler job — read them all and merge
+        // sources (first occurrence of a path wins).
+        let mut inputs: Vec<SourceUnitInput> = Vec::new();
+        let mut seen_paths: BTreeSet<String> = BTreeSet::new();
+        for entry in fs::read_dir(&bi_dir)
+            .wrap_err_with(|| format!("failed to read build-info dir {}", bi_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let file = fs::File::open(&path)
+                .wrap_err_with(|| format!("failed to open build-info {}", path.display()))?;
+            let value: serde_json::Value =
+                serde_json::from_reader(std::io::BufReader::new(file))
+                    .wrap_err_with(|| format!("failed to parse build-info {}", path.display()))?;
+
+            let input_sources = value
+                .get("input")
+                .and_then(|i| i.get("sources"))
+                .and_then(|s| s.as_object());
+            let Some(sources) = value
+                .get("output")
+                .and_then(|o| o.get("sources"))
+                .and_then(|s| s.as_object())
+            else {
+                continue;
+            };
+
+            for (source_path, source_entry) in sources {
+                if seen_paths.contains(source_path) {
+                    continue;
+                }
+                let Some(ast) = source_entry.get("ast") else {
+                    tracing::warn!("forge emitted no AST for {source_path} (skipping)");
+                    continue;
+                };
+                let source_unit: AstSourceUnit = serde_json::from_value(ast.clone())
+                    .wrap_err_with(|| {
+                        format!("failed to deserialize solc AST for {source_path}")
+                    })?;
+
+                // Prefer the exact bytes solc compiled (standard-json input
+                // section); fall back to reading the file from disk.
+                let source = match input_sources
+                    .and_then(|s| s.get(source_path))
+                    .and_then(|s| s.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    Some(content) => content.to_string(),
+                    None => {
+                        let abs = repo_root.join(source_path);
+                        fs::read_to_string(&abs).wrap_err_with(|| {
+                            format!("failed to read source content from {}", abs.display())
+                        })?
+                    }
+                };
+
+                seen_paths.insert(source_path.clone());
+                inputs.push(SourceUnitInput {
+                    absolute_path: source_unit.absolute_path.clone(),
+                    source,
+                    source_unit,
+                });
+            }
+        }
+
+        ensure!(
+            !inputs.is_empty(),
+            "forge build produced no source unit ASTs for the project (build-info dir {})",
+            bi_dir.display(),
+        );
+        Ok(inputs)
+    }
+
     /// Construct a `ProjectPathsConfig` that mirrors what `forge`
     /// resolves at startup: sources dir + libs (`lib`, `node_modules`)
     /// + remappings (foundry.toml → remappings.txt → nested
@@ -361,14 +559,10 @@ impl FoundryProject {
         project_path_names.insert("test/".to_string());
         project_path_names.insert("script/".to_string());
 
-        // ----- user remappings: foundry.toml (selected profile + legacy `[default]`),
-        // then remappings.txt -----
+        // ----- user remappings: remappings.txt FIRST, then foundry.toml
+        // (selected profile + legacy `[default]`) — matches forge's
+        // precedence (`remappings.txt` wins on an exact-name duplicate) -----
         let mut user_remappings: Vec<Remapping> = Vec::new();
-        for raw in foundry.remappings_for_profile(&options.profile) {
-            if let Some(r) = parse_remapping_line(&raw, "foundry.toml", None) {
-                user_remappings.push(r);
-            }
-        }
         let remappings_txt = repo_root.join("remappings.txt");
         if remappings_txt.is_file() {
             let text = fs::read_to_string(&remappings_txt).wrap_err_with(|| {
@@ -385,9 +579,14 @@ impl FoundryProject {
                 }
             }
         }
+        for raw in foundry.remappings_for_profile(&options.profile) {
+            if let Some(r) = parse_remapping_line(&raw, "foundry.toml", None) {
+                user_remappings.push(r);
+            }
+        }
 
         let mut all = Remappings::with_project_paths(project_path_names);
-        all.extend(user_remappings);
+        all.extend_user(user_remappings);
 
         // ----- auto-detect: nested foundry + Remapping::find_many -----
         // Mirrors foundry-config's `get_remappings` loop. All paths in
@@ -507,6 +706,41 @@ impl Remappings {
     fn extend(&mut self, remappings: Vec<Remapping>) {
         for r in remappings {
             self.push(r);
+        }
+    }
+
+    /// Insert a USER remapping (`remappings.txt` / `foundry.toml`). Unlike
+    /// [`Self::push`], user remappings are deduped EXACTLY (same context +
+    /// name; first one wins, so pass `remappings.txt` before `foundry.toml`)
+    /// — nested prefixes like `@openzeppelin/` alongside
+    /// `@openzeppelin/contracts-upgradeable/` are all kept, and solc's
+    /// longest-prefix match picks the right one per import. Routing user
+    /// remappings through `push`'s prefix-conflict filter (meant for
+    /// AUTO-DETECTED remappings, foundry/foundry#3440) silently dropped the
+    /// longer user rules and mis-resolved imports `forge build` accepts.
+    fn push_user(&mut self, remapping: Remapping) {
+        if remapping.name.ends_with(".sol") && !remapping.path.ends_with(".sol") {
+            return;
+        }
+        let duplicate = self.remappings.iter().any(|existing| {
+            existing.context == remapping.context && existing.name == remapping.name
+        });
+        if duplicate {
+            return;
+        }
+        if self
+            .project_paths
+            .iter()
+            .any(|p| remapping.name.eq_ignore_ascii_case(p))
+        {
+            return;
+        }
+        self.remappings.push(remapping);
+    }
+
+    fn extend_user(&mut self, remappings: Vec<Remapping>) {
+        for r in remappings {
+            self.push_user(r);
         }
     }
 

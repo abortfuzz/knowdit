@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use color_eyre::eyre::{Result, WrapErr, ensure};
+use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use knowdit_agents::{
     cg::{CallGraphAgentConfig, analyze_repo_call_graph},
     storage::{StorageAgentConfig, analyze_repo_storage},
@@ -168,6 +168,13 @@ pub struct SolidityCallGraphStaticArgs {
 
     #[command(flatten)]
     pub backend: crate::cli::ProjectBackendCliOptions,
+
+    /// Path to a local `forge` binary. When set, the project is compiled by
+    /// running `forge build --ast --build-info` (inheriting forge's exact
+    /// remapping/profile resolution); when unset, the in-process
+    /// foundry-compilers pipeline is used.
+    #[arg(long = "forge-bin")]
+    pub forge_bin: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -425,7 +432,9 @@ impl SolidityCallGraphStaticArgs {
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
-        let (cg, sg) = Self::update_call_graph(&repo, &spec.root, &self.backend).await?;
+        let (cg, sg) =
+            Self::update_call_graph(&repo, &spec.root, &self.backend, self.forge_bin.clone())
+                .await?;
         let url = database_path.display();
         println!(
             "Wrote callgraph to {url} (contracts={}, interfaces={}, functions={}, calls={})",
@@ -450,10 +459,29 @@ impl SolidityCallGraphStaticArgs {
         repo: &knowdit_repo_model::RepoDatabase,
         repo_root: &Path,
         backend: &crate::cli::ProjectBackendCliOptions,
+        forge_bin: Option<PathBuf>,
     ) -> Result<(
         knowdit_project::StaticCallGraphResult,
         knowdit_project::StorageAnalysisResult,
     )> {
+        // Pin a relative `--forge-bin` to the invoking shell's cwd BEFORE it
+        // reaches the compile (which spawns forge with
+        // `current_dir(repo_root)` and would re-anchor it). Mirrors
+        // `ForgeBackend`'s handling for the fuzz phase
+        // (`harness/forge.rs::local_kind`), including the hard error.
+        let forge_bin = forge_bin
+            .map(|bin| {
+                std::fs::canonicalize(&bin).map_err(|err| {
+                    eyre!(
+                        "--forge-bin {} cannot be canonicalized ({err:#}). Pass an existing path; \
+                         relative paths are interpreted against your shell's cwd at the moment \
+                         knowdit was launched.",
+                        bin.display()
+                    )
+                })
+            })
+            .transpose()?;
+
         let resolved = backend.resolve(repo_root);
         tracing::info!(
             "Compiling Solidity project at {} (backend={})...",
@@ -463,8 +491,12 @@ impl SolidityCallGraphStaticArgs {
 
         let (call_graph, storage) = match resolved {
             crate::cli::ResolvedProjectBackend::Forge(opts) => {
-                let project =
-                    knowdit_project::FoundryProject::build(repo_root.to_path_buf(), opts).await?;
+                let project = knowdit_project::FoundryProject::may_build_forge(
+                    forge_bin,
+                    repo_root.to_path_buf(),
+                    opts,
+                )
+                .await?;
                 repo.write_call_graph(project.call_graph()).await?;
                 repo.write_storage_graph(project.storage_graph()).await?;
                 repo.write_inheritance_graph(project.inheritance_graph())

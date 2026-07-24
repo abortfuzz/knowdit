@@ -2540,6 +2540,14 @@ impl HistoricalDatabase {
         let mut pending = Vec::new();
         for finding in findings {
             let canonical_id = resolve_merge_target(finding.id, &finding_merge_map);
+            if canonical_id != finding.id {
+                // Folded children add no distinct link surface: their text is
+                // a near-duplicate of the canonical's and their emitted links
+                // resolve onto it anyway. Skipping them here removes the
+                // duplicate prompt entries (~1/3 of a post-merge retro pass)
+                // and the union noise of linking the same knowledge twice.
+                continue;
+            }
             let taxonomy = match finding_taxonomy.get(&finding.id) {
                 Some(t) => t.clone(),
                 None => continue,
@@ -4504,7 +4512,27 @@ impl HistoricalDatabase {
             }
         }
 
-        // ---- structural link carry (verbatim, no LLM) ----
+        // ---- structural link carry (no LLM). Both endpoints resolve through
+        // the merge indirection: a link whose source node was folded onto a
+        // dst canonical belongs to that CANONICAL — cross-links left on folded
+        // children are invisible to canonical-only consumers and double-count
+        // the knowledge (a sherlock→c4 merge left 2,263 finding-side + 1,219
+        // semantic-side rows stranded on folded nodes before this fix). The
+        // pair-existence check below dedups the resulting collisions. ----
+        let finding_fold_map = build_merge_map(
+            finding_merge::Entity::find()
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|m| (m.from_finding_id, m.to_finding_id)),
+        );
+        let semantic_fold_map = build_merge_map(
+            semantic_merge::Entity::find()
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|m| (m.from_semantic_id, m.to_semantic_id)),
+        );
         for link in links {
             let (Some(&fid), Some(&sid)) = (
                 out.find_map.get(&link.src_finding_id),
@@ -4512,6 +4540,8 @@ impl HistoricalDatabase {
             ) else {
                 continue;
             };
+            let fid = resolve_merge_target(fid, &finding_fold_map);
+            let sid = resolve_merge_target(sid, &semantic_fold_map);
             let exists = semantic_finding_link::Entity::find()
                 .filter(semantic_finding_link::Column::SemanticNodeId.eq(sid))
                 .filter(semantic_finding_link::Column::AuditFindingId.eq(fid))
