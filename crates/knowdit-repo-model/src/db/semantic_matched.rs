@@ -20,8 +20,8 @@ use std::fmt;
 ///
 /// Encodes how relevant the historical semantic is to *this* project,
 /// judged on the historical semantic's `definition`/`description`
-/// versus the project's profile + extracted semantics. See
-/// `plan_mapper.md` §6.2 for the rubric.
+/// versus the project's profile + extracted semantics. The rubric itself
+/// lives in the mapper's system prompt (`knowdit-audit/src/mapper.rs`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize,
 )]

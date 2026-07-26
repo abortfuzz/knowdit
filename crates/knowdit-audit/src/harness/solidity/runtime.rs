@@ -43,7 +43,7 @@ use super::utils::{
     next_attempt_id,
 };
 use super::{HarnessKind, harness as handler_mode, poc as poc_mode};
-use crate::harness::forge::{ForgeBackend, ForgeRunner};
+use crate::harness::forge::{ForgeBackend, ForgeRunner, ForgeTimeouts};
 use crate::spec::{
     LinkInput, LookupCallGraphTool, LookupStateVariableXrefsTool, ProjectIndex,
     ReadContractSourceTool, ReadFunctionSourceTool, spec_memory_criteria,
@@ -131,7 +131,10 @@ impl FuzzRuntime {
         let forge_runner = ForgeRunner::new(
             backend.clone(),
             forge_work_dir,
-            Duration::from_secs(options.forge_timeout_secs),
+            ForgeTimeouts {
+                test: Duration::from_secs(options.forge_timeout_secs),
+                coverage: Duration::from_secs(options.forge_coverage_timeout_secs),
+            },
         );
         let project_conventions = Arc::new(ProjectConventions::load(&options.repo_root).await);
 

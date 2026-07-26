@@ -44,6 +44,7 @@ fn tail_utf8(s: &str, max_bytes: usize) -> &str {
 }
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use knowdit_repo_model::db::harness_run::RunKind;
 use tokio::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -318,6 +319,27 @@ fn find_forge_on_path() -> Option<PathBuf> {
     None
 }
 
+/// Per-[`RunKind`] subprocess deadlines. Coverage is a second, independent
+/// compile+run of the same harness whose result is *evidence* rather than the
+/// verdict itself (the `Test` run already decided pass/fail), so it earns a
+/// tighter deadline: a hung or pathologically slow `forge coverage` must not
+/// cost as much wall-clock as the run that produces the actual finding.
+#[derive(Debug, Clone, Copy)]
+pub struct ForgeTimeouts {
+    pub test: Duration,
+    pub coverage: Duration,
+}
+
+impl ForgeTimeouts {
+    /// Deadline for one invocation of `kind`.
+    pub fn for_kind(&self, kind: RunKind) -> Duration {
+        match kind {
+            RunKind::Test => self.test,
+            RunKind::Coverage => self.coverage,
+        }
+    }
+}
+
 /// Owns the chosen backend + per-invocation defaults. Splits forge
 /// invocations into `Test` (yields counter-example + trace) and `Coverage`
 /// (yields lcov rows).
@@ -330,7 +352,7 @@ pub struct ForgeRunner {
     /// both sides so foundry.toml + remappings + error-message paths all
     /// match the host).
     work_dir: PathBuf,
-    timeout: Duration,
+    timeouts: ForgeTimeouts,
     /// Optional override for the project's `test = '...'` foundry directive,
     /// passed through `FOUNDRY_TEST=<path>` so forge only walks one
     /// subdirectory and its dependency closure. Lets us isolate concurrent
@@ -339,7 +361,7 @@ pub struct ForgeRunner {
 }
 
 impl ForgeRunner {
-    pub fn new(backend: ForgeBackend, work_dir: PathBuf, timeout: Duration) -> Self {
+    pub fn new(backend: ForgeBackend, work_dir: PathBuf, timeouts: ForgeTimeouts) -> Self {
         // Docker rejects relative `-v`/`-w` paths ("the working directory
         // '...' is invalid, it needs to be an absolute path"), and a
         // relative `work_dir` is brittle for the local backends too once
@@ -364,7 +386,7 @@ impl ForgeRunner {
         Self {
             backend,
             work_dir,
-            timeout,
+            timeouts,
             test_dir_override: None,
         }
     }
@@ -427,13 +449,14 @@ impl ForgeRunner {
         (uid, gid)
     }
 
-    /// Spawn `forge args...` and return [`ForgeOutput`]. Hard-bounded by
-    /// `self.timeout` — if exceeded the handle is dropped and the
-    /// per-backend cleanup fires (kill child / docker kill / cgroup.kill).
-    pub async fn run(&self, args: &[String]) -> Result<ForgeOutput> {
+    /// Spawn `forge args...` and return [`ForgeOutput`]. Hard-bounded by the
+    /// deadline `self.timeouts` assigns to `kind` — if exceeded the handle is
+    /// dropped and the per-backend cleanup fires (kill child / docker kill /
+    /// cgroup.kill).
+    pub async fn run(&self, kind: RunKind, args: &[String]) -> Result<ForgeOutput> {
         let start = Instant::now();
         let handle = self.spawn(args)?;
-        let timeout = self.timeout;
+        let timeout = self.timeouts.for_kind(kind);
         let outcome = tokio::time::timeout(timeout, handle.wait_with_output()).await;
         let duration_ms = start.elapsed().as_millis() as i64;
         match outcome {
@@ -528,7 +551,7 @@ contract KnowditPreflight is Test {
             "1".to_string(),
         ];
 
-        let out_result = scoped.run(&argv).await;
+        let out_result = scoped.run(RunKind::Test, &argv).await;
 
         // Clean up regardless — leaving the file around lets stale
         // state poison the next preflight (different solc / shim).

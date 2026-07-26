@@ -4,7 +4,8 @@
 //!
 //! Carries `strength` + `evidence` straight from the KG side so downstream
 //! consumers (gen-specs etc.) can filter by `strength.rank()` without
-//! cross-DB joins — see `plan_link.md` §7.2.
+//! cross-DB joins: the audit database is a self-contained mirror of the
+//! knowledge graph rows a run touched.
 use sea_orm::entity::prelude::*;
 
 use knowdit_kg_model::db::semantic_finding_link;

@@ -26,7 +26,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use color_eyre::eyre::eyre;
 use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
 use knowdit_kg::agents::CanonicalWithChildren;
@@ -50,7 +49,7 @@ const DEFAULT_BATCH_SIZE: usize = 16;
 const DEFAULT_MAX_RENDERED_RAW_CHILDREN: usize = 5;
 
 /// Minimum length of the LLM-emitted `evidence` string per strength
-/// tier. Plan §6.4 forced-per-candidate-emit + §6.1 evidence rules:
+/// tier. The agent is required to emit one entry per candidate pair, so:
 /// High/Medium must be substantive (40 chars); Low can be short
 /// (15 chars) because the agent is required to emit per-candidate
 /// and most candidates will be Low — over-tight evidence floor on Low
@@ -105,7 +104,7 @@ impl Default for MapperOptions {
 ///
 /// Owns the project profile + language prompt prefix; `repo` /
 /// `kg` / `llm` are method arguments to [`Self::run`] so this
-/// struct has no lifetime params (plan §1.6).
+/// struct has no lifetime params.
 #[derive(Debug, Clone)]
 pub struct KnowledgeMapper {
     profile: ProjectProfile,
@@ -541,7 +540,7 @@ async fn run_one_batch(
 
     let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
 
-    // Forced per-candidate emit (plan_link.md §6.4): every
+    // Forced per-candidate emit: every
     // (extract_id × historical_id) pair shown in this batch should
     // appear in the response. We don't bounce the response on missing
     // coverage (no agent re-loop on the JSON path right now), but we
@@ -606,9 +605,12 @@ async fn run_one_batch(
     let missing: Vec<(i32, i32)> = expected_pairs.difference(&emitted_pairs).copied().collect();
     if !missing.is_empty() {
         tracing::warn!(
-            "{label}: response omitted {} of {} expected (extract, historical) pair(s); \
-             plan §6.4 contract requires per-candidate emit. First few missing: {:?}",
-            missing.len(),
+            "{label}: model scored only {} of the {} (extract, historical) pair(s) it was shown. \
+             Every pair must get a verdict — an omitted pair is silently treated as no match, so \
+             a real match can be lost here. Usually means the batch was too large for the model \
+             to answer exhaustively; lower --map-batch-size if it keeps happening. First few \
+             unscored: {:?}",
+            emitted_pairs.len(),
             expected_pairs.len(),
             &missing[..missing.len().min(5)],
         );

@@ -143,7 +143,7 @@ impl AutoloopArgs {
         let repo_root = loaded.spec.root.clone();
         let repo = loaded.repo;
 
-        // Stage 7 of plan_move_lang.md: autoloop stays Solidity-only on
+        // autoloop stays Solidity-only on
         // purpose. It's the cycle-based driver kept for benchmarking +
         // regression comparison against past runs; `workflow streamloop`
         // is the unified bounded-pipeline entry that dispatches on
@@ -221,7 +221,7 @@ impl AutoloopArgs {
             semantics.len()
         );
 
-        // Profile phase (plan §5.4 / §1.1): runs once between extract
+        // Profile phase: runs once between extract
         // and map. Resume-safe via `get_project_profile()` inside the
         // generator — if a profile is already cached, this is a cheap
         // DB read.

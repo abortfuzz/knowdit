@@ -9,6 +9,7 @@
 use clap::Args;
 use color_eyre::eyre::Result;
 use knowdit_audit::profile::{ProfileOptions, ProjectProfileGenerator};
+use knowdit_kg::text::truncate_text;
 use knowdit_repo_model::{ProjectProfile, RepoDatabase};
 use llmy::client::client::LLM;
 use std::path::Path;
@@ -80,7 +81,7 @@ impl ProfileArgs {
             profile.subsystems.len(),
             profile.core_components.len(),
             profile.source_files_read.len(),
-            truncate(&profile.out_of_scope_notes, 80)
+            truncate_text(&profile.out_of_scope_notes, 80)
         );
         Ok(())
     }
@@ -110,15 +111,5 @@ impl ProfileArgs {
         ProjectProfileGenerator::new(options)
             .run(repo, llm, repo_root)
             .await
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    let trimmed = s.trim();
-    if trimmed.chars().count() <= n {
-        trimmed.to_string()
-    } else {
-        let cut: String = trimmed.chars().take(n).collect();
-        format!("{cut}…")
     }
 }

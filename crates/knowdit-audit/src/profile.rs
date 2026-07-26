@@ -6,16 +6,16 @@
 //! and injects it into its system prompt to ground per-pair strength
 //! judgements in actual project context.
 //!
-//! Data flow (single struct + member fns per §1.1):
+//! Data flow (a single struct plus member functions):
 //!
 //! 1. Caller constructs [`ProjectProfileGenerator::new`] with
 //!    [`ProfileOptions`] (cache key / budget knobs / regenerate flag).
 //! 2. [`ProjectProfileGenerator::run`] takes `repo`, `llm`,
-//!    `repo_root` as method arguments (no `&self` reference fields →
-//!    no `<'a>` per §1.6).
+//!    `repo_root` as method arguments, so the struct holds no
+//!    reference fields and needs no lifetime parameter.
 //! 3. Resume: if `repo.get_project_profile()` is already `Some` and
 //!    `regenerate == false`, short-circuit and return the cached
-//!    profile (plan §1.5 "断点续跑").
+//!    profile, so an interrupted run resumes without re-paying for it.
 //! 4. Otherwise build a `ToolBox` with three llmy-agent-tools file
 //!    tools (`read_file`, `list_dir`, `find_file`) rooted at
 //!    `repo_root` plus one local `finalize_profile` sink, drive a
@@ -39,7 +39,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 /// Tunables for one profile-gen pass. Owned, no lifetime params; all
-/// knobs come from clap-derive in the CLI layer per §1.2.
+/// knobs come from clap-derive in the CLI layer.
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
     /// `llmy` cache key prefix for this run.
@@ -64,8 +64,7 @@ pub struct ProfileOptions {
 /// Project profile generator agent.
 ///
 /// `repo` / `llm` are passed as method arguments to [`Self::run`], not
-/// held as struct fields, so this type has **no** lifetime parameter
-/// (plan §1.6).
+/// held as struct fields, so this type has **no** lifetime parameter.
 #[derive(Debug, Clone)]
 pub struct ProjectProfileGenerator {
     options: ProfileOptions,

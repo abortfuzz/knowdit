@@ -21,7 +21,7 @@
 //! struct?") is recoverable from [`crate::cg::CallGraph`] +
 //! [`MoveStruct`] without a separate pre-computed table. Audit
 //! prompts pull this signal on demand rather than from a denormalised
-//! schema. (plan_move_lang.md §10 records the decision.)
+//! schema.
 //!
 //! Writer pattern matches the Solidity-side graph writers:
 //! `clear + bulk insert` inside one transaction so a partial write

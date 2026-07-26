@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
+use knowdit_kg::text::truncate_text;
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::{
     HistoricalSemanticRecord, RepoDatabase, SemanticMatchSet, repo::SpecificationRecord,
@@ -36,10 +37,25 @@ use crate::types::AuditSpecification;
 
 mod backend;
 mod index;
+mod novelty;
 mod prompt;
 mod tools;
 pub use backend::SpecBackend;
 pub use index::ProjectIndex;
+pub use novelty::{
+    LinkNovelty, LinkNoveltyJudge, NoveltyCandidate, NoveltyOptions, ReportedFindingDigest,
+};
+
+/// The canonical-finding fields the gen-spec prompt needs. Mirrors the subset
+/// of `knowdit_repo_model::LoadedReportFinding` this crate reads, so callers do
+/// not have to hand the whole row across the boundary.
+pub struct ReportedFinding {
+    pub id: i32,
+    pub title: String,
+    pub root_cause: String,
+    pub primary_contract: String,
+    pub primary_function: String,
+}
 use prompt::{build_regen_prompt_extension, build_system_prompt, build_user_prompt};
 pub(crate) use tools::{
     LookupCallGraphTool, LookupStateVariableXrefsTool, ReadContractSourceTool,
@@ -302,8 +318,27 @@ pub struct SpecGenOutcome {
 pub struct SpecGenStream {
     project_index: Arc<ProjectIndex>,
     queue: VecDeque<LinkInput>,
+    /// Back lane for links the novelty judge called duplicates of an
+    /// already-built specification. It drains only once `queue` is empty, and
+    /// its members are never re-judged — that is the aging rule that keeps a
+    /// deferral from becoming a silent drop. A run with enough budget still
+    /// executes every candidate link; the judge only decides what goes first.
+    deferred: VecDeque<LinkInput>,
+    /// Links handed out for judging and not yet returned. Held here (rather
+    /// than left in `queue`) so the scheduler can run the judge's LLM call
+    /// without holding the stream lock, and so a crash mid-judgement loses the
+    /// batch's *ordering* rather than leaving duplicated queue entries.
+    in_judgement: Vec<LinkInput>,
+    /// How many links at the front of `queue` have already been through the
+    /// novelty judge. Judged-`New` links are pushed back to the front, so
+    /// without this counter the scheduler would re-judge the same head batch
+    /// before every single claim and burn one LLM call per launched link.
+    /// Decremented as those links are popped; a fresh batch is judged only
+    /// once it reaches zero.
+    judged_prefix: usize,
     total_links: usize,
     processed_links: usize,
+    deferred_links: usize,
     options: SpecGenOptions,
     matched_extract_count: usize,
     historical_finding_total: usize,
@@ -319,7 +354,58 @@ impl SpecGenStream {
     }
 
     pub fn remaining_links(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + self.deferred.len() + self.in_judgement.len()
+    }
+
+    /// How many links the novelty judge has pushed to the back lane so far.
+    pub fn deferred_links(&self) -> usize {
+        self.deferred_links
+    }
+
+    /// Whether the front of the queue has already been judged, so the caller
+    /// can skip the whole novelty pass (including its database read) without
+    /// taking a batch apart.
+    pub fn front_is_judged(&self) -> bool {
+        self.judged_prefix > 0 || self.queue.is_empty()
+    }
+
+    /// Pull up to `batch_size` links off the front of the main queue for the
+    /// novelty judge. They leave the queue immediately and must be handed back
+    /// via [`Self::return_judged`]; the caller runs the LLM call in between
+    /// without holding the stream lock.
+    ///
+    /// Returns empty when the front is already judged or the main queue is
+    /// exhausted — links in the back lane are deliberately never re-judged.
+    pub fn take_for_judgement(&mut self, batch_size: usize) -> Vec<LinkInput> {
+        if self.front_is_judged() {
+            return Vec::new();
+        }
+        let take = batch_size.min(self.queue.len());
+        let batch: Vec<LinkInput> = self.queue.drain(..take).collect();
+        self.in_judgement = batch.clone();
+        batch
+    }
+
+    /// Return a judged batch: `New` (and unjudged) links go back to the front
+    /// of the main queue in their original order, duplicates go to the back
+    /// lane. A link missing from `verdicts` counts as `New` — an omission by
+    /// the judge must never defer work.
+    pub fn return_judged(&mut self, verdicts: &BTreeMap<LinkKey, novelty::LinkNovelty>) {
+        let batch = std::mem::take(&mut self.in_judgement);
+        let mut keep: Vec<LinkInput> = Vec::with_capacity(batch.len());
+        for link in batch {
+            match verdicts.get(&link.key()) {
+                Some(novelty::LinkNovelty::DuplicateOf(_)) => {
+                    self.deferred_links += 1;
+                    self.deferred.push_back(link);
+                }
+                _ => keep.push(link),
+            }
+        }
+        self.judged_prefix = keep.len();
+        for link in keep.into_iter().rev() {
+            self.queue.push_front(link);
+        }
     }
 
     pub fn matched_extract_count(&self) -> usize {
@@ -331,11 +417,14 @@ impl SpecGenStream {
     }
 
     pub fn next_link_key(&self) -> Option<LinkKey> {
-        self.queue.front().map(LinkInput::key)
+        self.queue
+            .front()
+            .or_else(|| self.deferred.front())
+            .map(LinkInput::key)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && self.deferred.is_empty() && self.in_judgement.is_empty()
     }
 
     /// Claim one link from the stream **without** running it. Lets an
@@ -347,7 +436,16 @@ impl SpecGenStream {
     /// scheduler must guarantee the claimed work is either run or
     /// dropped — there is no `unpop`.
     pub fn pop_next_work(&mut self) -> Option<PlannedLinkWork> {
-        let link = self.queue.pop_front()?;
+        // Main queue first; the judge's back lane drains only once nothing
+        // fresh is left, which is what makes a `DuplicateOf` verdict a
+        // deferral rather than a drop.
+        let link = match self.queue.pop_front() {
+            Some(link) => {
+                self.judged_prefix = self.judged_prefix.saturating_sub(1);
+                link
+            }
+            None => self.deferred.pop_front()?,
+        };
         let ordinal = self.processed_links + 1;
         self.processed_links += 1;
         Some(PlannedLinkWork {
@@ -356,6 +454,7 @@ impl SpecGenStream {
             link,
             project_index: self.project_index.clone(),
             options: self.options.clone(),
+            already_reported: String::new(),
         })
     }
 }
@@ -372,9 +471,65 @@ pub struct PlannedLinkWork {
     link: LinkInput,
     project_index: Arc<ProjectIndex>,
     options: SpecGenOptions,
+    /// Pre-rendered block naming the canonical findings this run has already
+    /// reported, injected into the gen-spec agent's user prompt. Empty until
+    /// the run reports something (and whenever the caller does not supply it).
+    ///
+    /// Without this every gen-spec agent works blind: on the metric-* baselines
+    /// each distinct project bug was independently rediscovered by ~8.5 links,
+    /// because eight agents reading the same contract with no idea what their
+    /// peers already found all converge on that contract's most salient defect.
+    /// Telling the agent what is already reported does not filter anything out
+    /// — it redirects the exploration it was going to do anyway toward defects
+    /// the report does not have yet, which is the one intervention that acts
+    /// on the *source* of the redundancy rather than on its symptoms.
+    already_reported: String,
 }
 
 impl PlannedLinkWork {
+    /// Attach the run's already-reported findings, rendered by
+    /// [`Self::render_already_reported`]. The scheduler calls this at claim
+    /// time so each agent sees the report as of the moment it starts.
+    pub fn with_already_reported(mut self, block: String) -> Self {
+        self.already_reported = block;
+        self
+    }
+
+    /// Render canonical findings into the block the gen-spec prompt embeds.
+    /// Lives here (rather than at the call site) so both the wording and the
+    /// per-field truncation stay next to the prompt that consumes them.
+    ///
+    /// `max_findings` bounds how many are rendered, keeping the most recent —
+    /// the block rides in every gen-spec prompt for the rest of the run, so on
+    /// a long audit an uncapped list would grow without limit. Newest-first
+    /// because a run reports its coarsest findings early and its subtler ones
+    /// late, and the subtle ones are what an agent is most likely to re-derive.
+    pub fn render_already_reported(
+        findings: &[ReportedFinding],
+        max_findings: usize,
+        field_chars: usize,
+    ) -> String {
+        let skip = findings.len().saturating_sub(max_findings);
+        let mut out = String::with_capacity((findings.len() - skip) * field_chars);
+        for f in &findings[skip..] {
+            out.push_str(&format!(
+                "- [#{}] {}\n    where: {}.{}\n    root cause: {}\n",
+                f.id,
+                f.title.trim(),
+                f.primary_contract,
+                f.primary_function,
+                truncate_text(f.root_cause.trim(), field_chars),
+            ));
+        }
+        if skip > 0 {
+            out.push_str(&format!(
+                "- (+{skip} older reported finding(s) not listed; the report already covers more \
+                 than what you see here)\n"
+            ));
+        }
+        out
+    }
+
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
@@ -476,6 +631,7 @@ impl SpecificationGenerator {
             let mut outcomes: Vec<LinkSpecOutcome> = Vec::with_capacity(total_links);
             for (idx, link) in links.into_iter().enumerate() {
                 let work = PlannedLinkWork {
+                    already_reported: String::new(),
                     ordinal: idx + 1,
                     total_links,
                     link,
@@ -512,6 +668,7 @@ impl SpecificationGenerator {
                             break;
                         };
                         let work = PlannedLinkWork {
+                            already_reported: String::new(),
                             ordinal: idx + 1,
                             total_links,
                             link,
@@ -596,7 +753,11 @@ impl SpecificationGenerator {
             project_index,
             total_links: links.len(),
             queue: VecDeque::from(links),
+            deferred: VecDeque::new(),
+            in_judgement: Vec::new(),
+            judged_prefix: 0,
             processed_links: 0,
+            deferred_links: 0,
             options: options.clone(),
             matched_extract_count,
             historical_finding_total,
@@ -701,7 +862,7 @@ impl SpecificationGenerator {
         };
         let raw_link_count = links.len();
 
-        // Strength filter (plan §7.1). Applied BEFORE the existing
+        // Strength filter. Applied BEFORE the existing
         // caps so links removed at the rubric layer don't burn through
         // per-extract / per-pair quotas.
         let min_rank = options.min_strength.rank();
@@ -906,6 +1067,7 @@ impl SpecificationGenerator {
         // the same agent loop as the streaming path. `total_links = 1` and the
         // ordinal is the cache-key serial (a regen, not a stream position).
         let work = PlannedLinkWork {
+            already_reported: String::new(),
             ordinal: request.serial_for_cache_key,
             total_links: 1,
             link,
@@ -974,7 +1136,7 @@ pub struct SpecRegenRequest {
     pub serial_for_cache_key: usize,
 }
 
-/// Patch vs from-scratch (per `plan_reflection.md` §3.2). Patch mode
+/// Patch vs from-scratch. Patch mode
 /// shows the agent the prior spec; from-scratch tells it to discard
 /// history.
 #[derive(Debug, Clone)]
@@ -1109,7 +1271,7 @@ impl PlannedLinkWork {
             (llm.model.config.max_input() as f64 * DEFAULT_COMPACT_RATIO) as usize
         });
 
-        let user_prompt = build_user_prompt(link, project_index);
+        let user_prompt = build_user_prompt(link, project_index, &self.already_reported);
         let mut step_result = agent
             .step_with_user(
                 user_prompt,

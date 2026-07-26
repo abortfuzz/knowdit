@@ -1,7 +1,7 @@
 //! Tests for [`crate::RepoDatabase::write_package_structure`] /
 //! [`crate::RepoDatabase::load_package_structure`].
 //!
-//! What we cover (§0.1.D rules):
+//! What we cover:
 //!
 //! * **Round-trip**: write → load → assert eq. Pulls in JSON-encoded
 //!   sub-fields (generic_params, fields) so a serde drift in either

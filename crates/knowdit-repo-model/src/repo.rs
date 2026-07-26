@@ -267,6 +267,45 @@ impl RepoDatabase {
             .await
             .wrap_err("failed to create compound index on specification")?;
 
+        // Compound INDEX (path, line_number) on `line_coverage`, for the
+        // per-file question "which lines has this audit executed in
+        // <contract>?". Coverage is the largest table in a finished project
+        // DB — a $200 run records ~100k rows and a full one several times
+        // that — so an unindexed lookup is a full scan whose cost grows with
+        // how long the audit has been running, while an indexed one costs
+        // only the slice belonging to that one file (bounded by the file's
+        // own size). Measured on a 623k-row DB: 190ms → 8ms.
+        //
+        // No `hit_count` predicate is needed: [`CoverageEntry`] guarantees
+        // every stored row was executed, so the index stays dialect-agnostic
+        // rather than needing a partial-index dialect (which SeaQuery cannot
+        // express portably).
+        let coverage_path_idx = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("ix_line_coverage_path_line")
+            .table(line_coverage_model::Entity)
+            .col(line_coverage_model::Column::RelativeContractPath)
+            .col(line_coverage_model::Column::LineNumber)
+            .to_owned();
+        self.db
+            .execute(&coverage_path_idx)
+            .await
+            .wrap_err("failed to create (path, line) index on line_coverage")?;
+
+        // FK index on `line_coverage.run_id`. SQLite does not index foreign
+        // keys automatically, so without this every `harness_run` delete (and
+        // every `--fuzz-regenerate` wipe) scans the whole coverage table.
+        let coverage_run_idx = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("ix_line_coverage_run")
+            .table(line_coverage_model::Entity)
+            .col(line_coverage_model::Column::RunId)
+            .to_owned();
+        self.db
+            .execute(&coverage_run_idx)
+            .await
+            .wrap_err("failed to create run_id index on line_coverage")?;
+
         // UNIQUE on (contract_id, name) for `move_struct`. A Move
         // module can't declare two structs with the same name; the
         // unique constraint lets `INSERT OR REPLACE` / `on_conflict`
@@ -1900,7 +1939,7 @@ impl RepoDatabase {
     /// correct dialect (`INSERT OR REPLACE` on SQLite,
     /// `INSERT ... ON DUPLICATE KEY UPDATE` on MySQL) for the same
     /// builder call, so we don't hand-roll dialect-specific SQL.
-    /// Single statement → atomic → satisfies plan §1.5 "no dirty data
+    /// Single statement → atomic → satisfies the "no dirty data
     /// on interrupt".
     pub async fn set_metadata(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let serialized = serde_json::to_string(value)
@@ -1935,7 +1974,7 @@ impl RepoDatabase {
 
     /// Typed write of the [`ProjectProfile`] payload. Single atomic
     /// `INSERT OR REPLACE`, so a profile-gen agent that crashes
-    /// mid-run leaves no partial row behind (plan §1.5).
+    /// mid-run leaves no partial row behind.
     pub async fn set_project_profile(&self, profile: &ProjectProfile) -> Result<()> {
         let value =
             serde_json::to_value(profile).wrap_err("failed to serialise ProjectProfile to JSON")?;
@@ -2400,6 +2439,12 @@ pub struct CodeGenRecord {
 
 /// A coverage entry parsed from lcov, scoped to a single
 /// [`super::db::harness_run`].
+///
+/// **`hit_count` is always > 0.** lcov's `DA:` records list every instrumented
+/// line, scoring unreached ones `,0`; those are dropped at the parse boundary
+/// because no consumer wants them, so a row in `line_coverage` means exactly
+/// "this run executed this line". Per-file lookups therefore need no
+/// `hit_count` predicate and a plain `(path, line_number)` index is enough.
 #[derive(Debug, Clone)]
 pub struct CoverageEntry {
     pub relative_contract_path: String,
@@ -3952,7 +3997,7 @@ impl RepoDatabase {
     }
 
     // -----------------------------------------------------------------
-    // Move-language schema (Stage 3a of plan_move_lang.md). Written
+    // Move-language schema. Written
     // by movy CLI subprocesses, read by the audit pipeline (gen-spec /
     // mapper prompts) when language == Move. Solidity paths never
     // touch these tables; the rows stay empty in OSS builds.
@@ -3969,7 +4014,7 @@ impl RepoDatabase {
     /// independently idempotent, so a crash between them leaves
     /// the DB in a valid partial state (CG written, structure
     /// stale or empty) that the next invocation overwrites
-    /// cleanly. The §0.1.D resume-safety property holds without
+    /// cleanly. The resume-safety property holds without
     /// the complexity of threading a shared transaction through
     /// two large writer paths.
     ///

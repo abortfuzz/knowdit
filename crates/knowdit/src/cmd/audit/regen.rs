@@ -2,7 +2,7 @@
 //! regenerate code_gens (and, for `IncompleteSpecification`, specs too)
 //! with the prior reflection feedback fed back into the agent.
 //!
-//! Per `plan_reflection.md` §3 / §5:
+//! Two regeneration modes:
 //!
 //! * Pending = reflection rows whose `result ∈ {Suspect, IncompleteStep,
 //!   IncompleteSpecification}` and which no `*_regen` row has consumed

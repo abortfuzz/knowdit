@@ -9,6 +9,7 @@
 
 use knowdit_kg_model::ExtractedFunction;
 use knowdit_kg_model::audit_finding::FindingSeverity;
+use knowdit_repo_model::ProjectProfile;
 
 use super::{LinkInput, LinkSource, ProjectIndex, SpecRegenMode};
 
@@ -230,12 +231,37 @@ fn format_severity(s: FindingSeverity) -> &'static str {
     }
 }
 
-pub(super) fn build_user_prompt(link: &LinkInput, project_index: &ProjectIndex) -> String {
+pub(super) fn build_user_prompt(
+    link: &LinkInput,
+    project_index: &ProjectIndex,
+    already_reported: &str,
+) -> String {
     let contract_count = project_index.call_graph.contracts.len();
     let interface_count = project_index.call_graph.interfaces.len();
     let extract_functions = render_extracted_functions(&link.extract.functions);
+    // Peers working the same contract have no other way to know what has
+    // already been reported, and left blind they all converge on that
+    // contract's most salient defect — ~8.5 links per distinct bug on the
+    // metric-* baselines. This block is guidance, not a filter: it never
+    // forbids committing a spec, it only tells the agent which ground is
+    // already covered so its exploration lands somewhere new.
+    let already_reported_block = if already_reported.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Already reported in this audit — do NOT re-report these\n\n{already_reported}\n\
+             These bugs are already in the report. A spec that restates one of them adds nothing \
+             to this audit, however real it is. While you explore, treat them as covered ground: \
+             prefer a DIFFERENT defect, even in the same contract or the same function (a function \
+             that already has one reported bug very often has others — a missing zero check and a \
+             missing equality check in one setter are two findings, not one). Only if you find \
+             nothing else should you fall back to `finalize(status=\"abandoned\")` and say which of \
+             these already covered what you saw.\n"
+        )
+    };
     format!(
         r#"Explore the matched project semantic for any issue *related to* the historical finding in your system prompt, then commit AuditSpecification(s) for what you find.
+{already_reported_block}
 
 Project static-analysis short-term memory: {contract_count} contract entr(ies), {interface_count} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.
 
@@ -253,6 +279,7 @@ Reason briefly out loud, then start issuing tool calls. Keep `finalize` for the 
 
 Link summary: extract_id={extract}, historical_id={historical}, finding_id={finding}.
 "#,
+        already_reported_block = already_reported_block,
         contract_count = contract_count,
         interface_count = interface_count,
         extract_functions = extract_functions,
@@ -286,3 +313,68 @@ fn render_extracted_functions(functions: &[ExtractedFunction]) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Link novelty judge
+// ---------------------------------------------------------------------------
+
+/// Assemble the novelty judge's system prompt: the rubric wrapped around a
+/// rendered snapshot of the project profile, so the judge weighs candidates
+/// against what this project actually is. Lives here with the rest of the
+/// spec-phase prompt text so the wording is editable without touching the
+/// judge's wiring — same convention as [`build_system_prompt`].
+pub(super) fn novelty_system(profile: &ProjectProfile, language_prompt_prefix: &str) -> String {
+    let mut block = String::new();
+    let prefix = language_prompt_prefix.trim();
+    if !prefix.is_empty() {
+        block.push_str(prefix);
+        block.push_str("\n\n");
+    }
+    block.push_str("## Project profile\n");
+    block.push_str(&format!(
+        "Domain summary: {}\n\n",
+        profile.domain_summary.trim()
+    ));
+    block.push_str("Subsystems:\n");
+    for s in &profile.subsystems {
+        block.push_str(&format!("- {} — {}\n", s.name, s.summary.trim()));
+    }
+    block.push_str("\nCore components:\n");
+    for c in &profile.core_components {
+        block.push_str(&format!("- {} ({}) — {}\n", c.name, c.path, c.role.trim()));
+    }
+    block.push('\n');
+    format!("{NOVELTY_PREAMBLE}\n\n{block}{NOVELTY_RUBRIC}")
+}
+
+pub(super) const NOVELTY_PREAMBLE: &str = "You are the Link Novelty Judge for an agentic smart-contract auditing pipeline. The pipeline expands historical vulnerability knowledge into candidate links and runs an expensive agent on each one, which tries to reproduce that historical defect against THIS project. Many unrelated historical findings converge on the same project bug, so most of a run's budget is spent rediscovering findings the report already contains.\n\nYou are shown the canonical findings this run has ALREADY reported and a batch of candidate links that have NOT run yet. For each candidate, decide whether running it would rediscover one of those reported findings.\n\nA `duplicate` verdict does not discard the link — it moves to the back of the queue and a well-funded run still executes it. A wrong `duplicate` costs only ordering; a missed duplicate costs a whole agent pipeline. Reply with strict JSON only, no commentary.";
+
+pub(super) const NOVELTY_RUBRIC: &str = r#"## What makes a candidate a duplicate
+
+Judge on the DEFECT, not on wording and not on location. A candidate is `duplicate` only when its defect is the SAME BUG as one already reported — same broken property, same missing check, one fix kills both.
+
+  duplicate  The candidate's root cause maps onto a reported finding's root cause. Different historical projects, different phrasing, different severity, and different naming do NOT make it new.
+
+  new        Anything else, including — and this is the common case —
+             - SAME contract and SAME function as a reported finding, but a DIFFERENT defect. A hot function typically carries several distinct bugs: a missing zero-address check, a value-equality check that is also missing, an unbounded numeric parameter, and a stale-config path can all live in one setter and are FOUR findings, not one.
+             - a defect whose surface is not represented in the reported set at all.
+
+`primary_contract` / `primary_function` in the reported set are locating hints, not the dedup key. Matching them is NOT sufficient evidence of duplication — compare root causes, and only call `duplicate` when the underlying defect is the same.
+
+## Method
+
+- Read `defect_root_cause` and `defect_detail` first: they describe the code shape of the defect.
+- Look for a reported finding whose `root_cause` describes that same defect.
+- Ask yourself: would one patch fix both? If no, it is `new`.
+- When genuinely torn, answer `new`. Missing a real bug is the expensive error; re-checking a duplicate merely costs one pipeline.
+
+## Output
+
+Emit one entry per candidate shown — no silent omission:
+
+{"verdicts":[{"candidate_id":0,"verdict":"duplicate","duplicate_of_finding_id":41,"reason":"..."},{"candidate_id":1,"verdict":"new","reason":"..."}]}
+
+Hard rules:
+- `candidate_id` must be one of the ids shown in this batch.
+- `duplicate_of_finding_id` is REQUIRED when `verdict` is `duplicate`, and must be a `finding_id` from `reported_findings`. Never invent one.
+- `reason` is one short sentence naming the shared defect (for `duplicate`) or what makes it distinct (for `new`)."#;

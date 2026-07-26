@@ -38,7 +38,7 @@ pub struct FindingLinkDecision {
 
 /// Concrete evidence justifying one finding↔semantic link.
 ///
-/// Under the v2 "forced per-candidate emit" contract (plan_link.md §6.1),
+/// Under the "forced per-candidate emit" contract,
 /// the agent must emit one LinkEvidence per candidate semantic shown,
 /// each tagged with a `strength` label from `{High, Medium, Low}`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1629,8 +1629,8 @@ impl EmitFindingLinkDecisionTool {
         // allowed and means "no link" for unreferenced candidates —
         // the full per-candidate coverage contract was unworkable at
         // the link agent's scale (1493 canonical sems per context vs
-        // mapper's ~16); see plan_link.md §4 撤回 entry for the post-
-        // mortem.
+        // mapper's ~16): asking for a verdict on every candidate blew the
+        // context and degraded the verdicts that were emitted.
         let invalid_ids: Vec<&String> = args
             .semantic_evidence
             .iter()

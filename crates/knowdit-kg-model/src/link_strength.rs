@@ -6,7 +6,8 @@
 //! them as separate types so a future divergence is a type-level
 //! signal rather than a silent semantic shift.
 //!
-//! See `plan_link.md` §5.1 and §6.2 for the rubric definition.
+//! The rubric the linker applies lives in the linker's own system prompt
+//! (`knowdit-kg/src/prompts.rs`); this enum is only its storage form.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

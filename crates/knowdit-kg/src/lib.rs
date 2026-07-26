@@ -10,4 +10,5 @@ pub mod merge_kg;
 pub mod project_loader;
 pub mod prompts;
 pub mod stats;
+pub mod text;
 pub mod vulnerability;

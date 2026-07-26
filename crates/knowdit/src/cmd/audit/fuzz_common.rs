@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use clap::Args;
 use color_eyre::eyre::Result;
-use knowdit_audit::harness::forge::{ForgeBackend, ForgeRunner};
+use knowdit_audit::harness::forge::{ForgeBackend, ForgeRunner, ForgeTimeouts};
 use knowdit_audit::harness::solidity::{FuzzOptions, HarnessKind, SolidityHarness};
 
 /// CLI mirror of [`HarnessKind`] (kebab-cased on the command line).
@@ -89,9 +89,16 @@ pub struct HarnessSharedArgs {
     #[arg(long = "harness-dir")]
     pub harness_dir: Option<PathBuf>,
 
-    /// Hard timeout per forge subprocess (seconds).
+    /// Hard timeout per `forge test` subprocess (seconds).
     #[arg(long = "forge-timeout-secs", default_value_t = 600)]
     pub forge_timeout_secs: u64,
+
+    /// Hard timeout per `forge coverage` subprocess (seconds). Coverage runs
+    /// after every test attempt (it is the reflect grader's evidence and the
+    /// link scheduler's breadth signal), so this bounds what a hung or
+    /// hopeless attempt costs. Kept below `--forge-timeout-secs`.
+    #[arg(long = "forge-coverage-timeout-secs", default_value_t = 300)]
+    pub forge_coverage_timeout_secs: u64,
 
     /// `--fuzz-runs` for the `forge test` invocation.
     #[arg(long = "forge-test-runs", default_value_t = 100_000)]
@@ -238,8 +245,16 @@ impl HarnessSharedArgs {
         };
         // Preflight harness is one trivial test; 60s is generous even
         // for slow docker pulls. Independent of `forge_timeout_secs`
-        // (which the agent uses for real fuzz runs).
-        let runner = ForgeRunner::new(backend.clone(), forge_work_dir, Duration::from_secs(60));
+        // (which the agent uses for real fuzz runs). Preflight never
+        // invokes coverage, so both deadlines are the same 60s here.
+        let runner = ForgeRunner::new(
+            backend.clone(),
+            forge_work_dir,
+            ForgeTimeouts {
+                test: Duration::from_secs(60),
+                coverage: Duration::from_secs(60),
+            },
+        );
         runner.preflight(&harness_dir).await
     }
 
@@ -276,6 +291,7 @@ impl HarnessSharedArgs {
             docker_image: self.docker_image.clone(),
             forge_mem_cap_bytes,
             forge_timeout_secs: self.forge_timeout_secs,
+            forge_coverage_timeout_secs: self.forge_coverage_timeout_secs,
             forge_test_runs: self.forge_test_runs,
             forge_coverage_runs: self.forge_coverage_runs,
             max_agent_steps: self.harness_max_agent_steps,

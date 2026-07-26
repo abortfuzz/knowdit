@@ -25,7 +25,7 @@ use knowdit_repo_model::RepoDatabase;
 use llmy::client::client::LLM;
 
 use crate::harness::backend::HarnessBackend;
-use crate::harness::forge::{ForgeBackend, ForgeRunner};
+use crate::harness::forge::{ForgeBackend, ForgeRunner, ForgeTimeouts};
 use crate::harness::solidity::{
     CodegenRegenInMemory, FuzzOneOutcome, FuzzOptions, FuzzOutcome, HarnessKind, RegenOutcome,
     SolidityHarnessGenerator,
@@ -139,7 +139,10 @@ impl HarnessBackend for SolidityHarness {
         let runner = ForgeRunner::new(
             self.forge_backend.clone(),
             forge_work_dir,
-            Duration::from_secs(60),
+            ForgeTimeouts {
+                test: Duration::from_secs(60),
+                coverage: Duration::from_secs(60),
+            },
         );
         runner.preflight(&harness_dir).await
     }

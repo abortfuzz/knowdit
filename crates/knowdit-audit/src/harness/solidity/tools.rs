@@ -110,7 +110,7 @@ impl RunForgeTool {
         args: RunForgeArgs,
     ) -> std::result::Result<String, llmy::agent::LLMYError> {
         let test_argv = self.build_test_argv(&args);
-        let test_out = match self.runner.run(&test_argv).await {
+        let test_out = match self.runner.run(RunKind::Test, &test_argv).await {
             Ok(o) => o,
             Err(e) => return Ok(format!("error: forge test spawn failed: {e:#}")),
         };
@@ -135,17 +135,23 @@ impl RunForgeTool {
             _ => None,
         };
 
-        // Coverage worth chasing? Both modes benefit: handler-invariant
-        // needs it for Gate 2; PoC mode runs it as evidence that the
-        // deterministic test actually exercised project lines (helps
-        // the reflect grader judge ValidFinding vs hallucination).
-        let run_coverage = test_out.exit_code == 0
-            && (test_summary.total_calls > 0 || test_summary.deterministic_test_failure)
-            && !test_out.timed_out;
+        // Coverage runs unconditionally. Both modes need it: handler-invariant
+        // for Gate 2, PoC mode as evidence that the deterministic test actually
+        // exercised project lines (helps the reflect grader judge ValidFinding
+        // vs hallucination). It is also the audit-wide breadth signal the link
+        // scheduler feeds on, so a run that skips it leaves a permanent hole.
+        //
+        // The previous `exit_code == 0 && (total_calls > 0 || deterministic)`
+        // guard made this dead code in PoC mode: a reproduced PoC fails its
+        // `KNOWDIT_POST_ATTACK_REACHED:` assertion, so exit_code != 0, while a
+        // clean deterministic run has total_calls == 0 and is not flagged
+        // deterministic — the two arms were mutually exclusive and no PoC-mode
+        // project ever recorded a single coverage row. `ForgeTimeouts::coverage`
+        // bounds the cost of running it on hopeless attempts.
         let mut cov_summary: Option<CoverageBlockBundle> = None;
-        if run_coverage {
+        {
             let cov_argv = self.build_coverage_argv(&args);
-            match self.runner.run(&cov_argv).await {
+            match self.runner.run(RunKind::Coverage, &cov_argv).await {
                 Ok(out) => {
                     let lcov_path = self.runner.work_dir().join("lcov.info");
                     let coverage = match tokio::fs::read_to_string(&lcov_path).await {
@@ -289,16 +295,12 @@ impl RunForgeTool {
                 "--- forge coverage stdout (last 4K) ---\n{}",
                 tail_str(&block.record.stdout, 4_000)
             ));
-        } else if run_coverage {
+        } else {
+            // Coverage is attempted after every test run now, so reaching here
+            // means the spawn itself failed (see the `Err` arm above).
             sections.push(
                 "note: orchestrator attempted to run forge coverage but the spawn failed; \
                  coverage gate skipped this turn."
-                    .to_string(),
-            );
-        } else {
-            sections.push(
-                "note: forge coverage was skipped this turn (no clean exit or no project \
-                 execution). Fix the test run first."
                     .to_string(),
             );
         }

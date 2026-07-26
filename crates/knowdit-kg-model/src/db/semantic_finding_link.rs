@@ -4,8 +4,9 @@
 //! composite primary key `(semantic_node_id, audit_finding_id)`
 //! enforces uniqueness without needing a separate UNIQUE index.
 //!
-//! See `plan_link.md` §5.1 and §6.2 for the rubric definition that
-//! drives the `strength` value.
+//! The rubric that decides `strength` lives in the linker's system prompt
+//! (`knowdit-kg/src/prompts.rs`), not here — this table only stores the
+//! verdict.
 
 use sea_orm::entity::prelude::*;
 

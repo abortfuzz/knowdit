@@ -31,6 +31,7 @@
 //! old ordinal-named layout) are harmless and can be deleted at any
 //! time.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,8 +40,9 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
-    BillingExhausted, LinkKey, LinkSource, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork,
-    SpecGenOptions, SpecGenStream, SpecificationGenerator, billing_exhaustion,
+    BillingExhausted, LinkKey, LinkNovelty, LinkNoveltyJudge, LinkSource, LinkSpecOutcome,
+    LinkSpecStatus, NoveltyOptions, PlannedLinkWork, ReportedFinding, SpecGenOptions,
+    SpecGenStream, SpecificationGenerator, billing_exhaustion,
 };
 use knowdit_audit::types::AuditSpecification;
 use knowdit_kg::db::HistoricalDatabase;
@@ -138,6 +140,36 @@ pub struct StreamloopArgs {
     #[arg(long)]
     pub stream_fuzz_cache_key: Option<String>,
 
+    /// Candidate links judged per novelty call. Before claiming work the
+    /// scheduler asks one cheap JSON call whether each queued link would
+    /// rediscover a canonical finding this run already reported; duplicates
+    /// move to a back lane that drains once the main queue empties, so nothing
+    /// is dropped — only reordered. `0` disables the pass. Requires
+    /// `--review-findings` (that is what fills the canonical set).
+    ///
+    /// This exists because the same project defect is typically reachable from
+    /// 13–31 different historical findings, and paying a full gen-spec → fuzz
+    /// → reflect pipeline for each rediscovery is where most of a run's budget
+    /// goes.
+    #[arg(long, default_value_t = 40)]
+    pub stream_novelty_batch: usize,
+
+    /// Canonical findings rendered as the novelty judge's comparison
+    /// inventory. The canonical set stays small in practice (the metric-*
+    /// baselines finished at 83–92 findings), so this rarely binds.
+    #[arg(long, default_value_t = 200)]
+    pub stream_novelty_max_inventory: usize,
+
+    /// Characters of each historical-finding field (title / root cause /
+    /// patterns) rendered into a novelty candidate.
+    #[arg(long, default_value_t = 600)]
+    pub stream_novelty_finding_chars: usize,
+
+    /// Characters of each canonical finding field (title / root cause)
+    /// rendered into the novelty judge's inventory.
+    #[arg(long, default_value_t = 400)]
+    pub stream_novelty_spec_chars: usize,
+
     /// Output folder for per-link `summary.json` files. The directory
     /// layout is deterministic on `(extract, historical, finding)`, so
     /// re-running with the same folder safely resumes — links whose
@@ -157,6 +189,29 @@ pub struct StreamloopArgs {
     #[arg(short = 'r', long = "review-findings", default_value_t = false)]
     pub review_findings: bool,
 
+    /// Show every gen-spec agent the canonical findings this audit has already
+    /// reported, so it hunts a *different* defect instead of re-deriving one
+    /// the report already has.
+    ///
+    /// Without it, agents working the same contract are blind to each other and
+    /// all converge on its most salient defect — on the metric-* baselines each
+    /// distinct bug was independently rediscovered by ~8.5 links. Enabling it
+    /// roughly doubled the distinct findings produced per dollar (metric-core
+    /// +32% against an otherwise identical run; metric-periphery +105% against
+    /// the baseline at equal link count) and pushed the
+    /// valid-findings-per-canonical ratio from 2.8–3.8 down to ~1.7 on both.
+    ///
+    /// This changes what the gen-spec agent *writes*, not which links run: the
+    /// same link yields a different specification than it would with the flag
+    /// off, so runs with and without it are not spec-for-spec comparable. Pass
+    /// `--inject-reviewed-findings=false` to reproduce pre-flag behaviour.
+    ///
+    /// Requires `--review-findings` — that is what fills the canonical set this
+    /// injects. The combination is rejected at startup rather than silently
+    /// degrading to an empty block and a run that quietly loses the benefit.
+    #[arg(long = "inject-reviewed-findings", default_value_t = true)]
+    pub inject_reviewed_findings: bool,
+
     #[command(flatten)]
     pub review: crate::cmd::workflow::review_findings::ReviewFindingsSharedArgs,
 }
@@ -167,6 +222,19 @@ impl StreamloopArgs {
         // Validate --mapper-extra-categories up front so a typo aborts before
         // any LLM work instead of mid-pipeline at the map phase.
         self.map.extra_categories()?;
+        // Same rationale: `--inject-reviewed-findings` reads the canonical set
+        // that `--review-findings` produces. Without it the injected block is
+        // simply empty, which costs nothing and reports nothing — the run looks
+        // healthy and quietly forfeits the benefit. Fail loudly instead.
+        if self.inject_reviewed_findings && !self.review_findings {
+            return Err(eyre!(
+                "--inject-reviewed-findings needs --review-findings: the injected block is the \
+                 canonical finding set that the inline review + merge phase produces, so without \
+                 that phase it would always be empty and every gen-spec agent would run blind. \
+                 Add `--review-findings` (recommended), or pass \
+                 `--inject-reviewed-findings=false` to run without the injection."
+            ));
+        }
         tracing::info!("[streamloop stage 1/8] preparing output folder");
         self.prepare_output_folder()?;
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
@@ -421,6 +489,27 @@ impl StreamloopArgs {
         } else {
             None
         };
+        // Stage 3 wrote the profile row before we got here, so this read is
+        // the same source of truth the mapper used.
+        let novelty_profile = repo.get_project_profile().await?.ok_or_else(|| {
+            eyre!(
+                "link novelty judge requires a ProjectProfile; the profile stage should have \
+                 written one — re-run with `--stream-novelty-batch 0` to skip the pass"
+            )
+        })?;
+        let novelty = (self.stream_novelty_batch > 0).then(|| {
+            LinkNoveltyJudge::new(
+                &novelty_profile,
+                NoveltyOptions {
+                    batch_size: self.stream_novelty_batch,
+                    max_inventory: self.stream_novelty_max_inventory,
+                    finding_field_chars: self.stream_novelty_finding_chars,
+                    spec_summary_chars: self.stream_novelty_spec_chars,
+                    cache_key: Some(format!("{spec_name}-knowdit-novelty")),
+                    language_prompt_prefix: language_prompt_prefix.clone(),
+                },
+            )
+        });
         let mut usage = LinkPipelineInputs {
             backend: harness_backend,
             primary_llm,
@@ -437,6 +526,11 @@ impl StreamloopArgs {
             max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
             report_cfg,
+            novelty,
+            novelty_spec_chars: self.stream_novelty_spec_chars,
+            novelty_max_inventory: self.stream_novelty_max_inventory,
+            novelty_batch: self.stream_novelty_batch,
+            inject_reviewed_findings: self.inject_reviewed_findings,
         }
         .run()
         .await?;
@@ -526,7 +620,7 @@ impl StreamloopArgs {
 /// drives both Solidity (`SolidityHarness`) and Sui Move
 /// (`MovyHarness`) runs. The concrete `B` is chosen at the top of
 /// `StreamloopArgs::run` based on the detected
-/// [`SourceLanguage`] (Stage 7 of plan_move_lang.md).
+/// [`SourceLanguage`].
 struct LinkContext<B: HarnessBackend + Clone + 'static> {
     repo: RepoDatabase,
     primary_llm: LLM,
@@ -640,7 +734,8 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         self.dump_valid_findings().await?;
         tracing::info!(
             "[streamloop link {ordinal:04}/{total}] DONE — {} cycle(s), {} codegen(s), \
-             fuzz[completed/violated]={}/{}, reflect_graded={}, regen[codegen/spec]={}/{} ({} total)",
+             fuzz[completed/violated]={}/{}, reflect_graded={}, \
+             regen[codegen/spec]={}/{} ({} total)",
             cycles_run,
             code_gen_ids.len(),
             drain.fuzz_completed,
@@ -1130,9 +1225,127 @@ struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
     /// (serial — this runs in the scheduler's single-threaded join loop, so no
     /// lock is needed). Returned to the caller to finalize.
     report: Option<review_findings::ReportContext>,
+    /// When set, each batch of queued links is checked against the
+    /// specifications already built for this project before any of them is
+    /// launched; links judged duplicates move to the stream's back lane.
+    /// `None` disables the pass entirely (`--stream-novelty-batch 0`).
+    novelty: Option<LinkNoveltyJudge>,
+    /// LLM scope the novelty judge bills into, kept separate from the per-link
+    /// scopes so its cost shows up as its own line in the usage report.
+    novelty_llm: LLM,
+    /// Per-field truncation for the already-reported block handed to each
+    /// gen-spec agent.
+    novelty_spec_chars: usize,
+    /// Cap on how many reported findings that block lists.
+    novelty_max_inventory: usize,
+    /// Candidate links handed to the novelty judge per call.
+    novelty_batch: usize,
+    /// Whether gen-spec agents are shown the run's canonical findings at all
+    /// (see `--inject-reviewed-findings`).
+    inject_reviewed_findings: bool,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
+    /// Run the novelty judge over the next batch at the head of the queue, if
+    /// one is configured and the run has already reported canonical findings to
+    /// compare against.
+    ///
+    /// The stream lock is released across the LLM call: the batch is taken out
+    /// of the queue first and handed back afterwards, so concurrent claims
+    /// never see a link that is mid-judgement, and the judge's latency does not
+    /// stall workers finishing their own links.
+    async fn judge_next_batch(
+        &self,
+        stream: &Arc<Mutex<SpecGenStream>>,
+        stats: &mut StreamStats,
+    ) -> Result<()> {
+        let Some(judge) = self.novelty.as_ref() else {
+            return Ok(());
+        };
+        // Cheap check before the database read: judged-`New` links go back to
+        // the front of the queue, so without this the scheduler would re-judge
+        // the same head batch before every single claim.
+        if stream.lock().await.front_is_judged() {
+            return Ok(());
+        }
+        // Canonical findings, not built specifications: several distinct
+        // canonical findings routinely share one hot function, so judging at
+        // specification-target granularity defers real bugs.
+        let reported = self.ctx.repo.load_report_findings().await?;
+        let inventory = judge.build_inventory(&reported);
+        if inventory.is_empty() {
+            return Ok(());
+        }
+        let batch = stream
+            .lock()
+            .await
+            .take_for_judgement(self.novelty_batch.max(1));
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let verdicts = judge.judge(&self.novelty_llm, &inventory, &batch).await;
+        let mut guard = stream.lock().await;
+        match verdicts {
+            Ok(verdicts) => {
+                let deferred = verdicts
+                    .values()
+                    .filter(|v| matches!(v, LinkNovelty::DuplicateOf(_)))
+                    .count();
+                guard.return_judged(&verdicts);
+                stats.novelty_judged += batch.len();
+                stats.novelty_deferred += deferred;
+                tracing::info!(
+                    "[streamloop scheduler] novelty pass: {} of {} candidate link(s) deferred as \
+                     duplicates of {} built spec(s) (run total deferred={})",
+                    deferred,
+                    batch.len(),
+                    inventory.len(),
+                    guard.deferred_links(),
+                );
+                Ok(())
+            }
+            Err(err) => {
+                // Hand the batch back untouched so a judge failure costs
+                // nothing but the call — the links stay in their original
+                // position and run unjudged.
+                guard.return_judged(&BTreeMap::new());
+                Err(err)
+            }
+        }
+    }
+
+    /// Render the canonical findings reported so far for injection into the
+    /// next gen-spec agent's prompt. Best-effort: a read failure yields an
+    /// empty block and the agent simply runs blind, exactly as before.
+    async fn already_reported_block(&self) -> String {
+        match self.ctx.repo.load_report_findings().await {
+            Ok(rows) => {
+                let findings: Vec<ReportedFinding> = rows
+                    .into_iter()
+                    .map(|f| ReportedFinding {
+                        id: f.id,
+                        title: f.title,
+                        root_cause: f.root_cause,
+                        primary_contract: f.primary_contract,
+                        primary_function: f.primary_function,
+                    })
+                    .collect();
+                PlannedLinkWork::render_already_reported(
+                    &findings,
+                    self.novelty_max_inventory,
+                    self.novelty_spec_chars,
+                )
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "[streamloop scheduler] could not load reported findings for the gen-spec \
+                     prompt, running this link blind: {err:#}"
+                );
+                String::new()
+            }
+        }
+    }
+
     async fn run(
         mut self,
         stream: SpecGenStream,
@@ -1153,8 +1366,24 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
             // launch would just fast-fail the pre-flight `check_cap`. In-flight
             // tasks are still drained below.
             while stats.billing_abort.is_none() && tasks.len() < self.concurrency {
+                // Judge the head of the queue before claiming from it. Done
+                // here rather than at plan time because the comparison
+                // inventory — the specifications this run has already built —
+                // only exists once links start finishing.
+                if let Err(err) = self.judge_next_batch(&stream, &mut stats).await {
+                    tracing::error!(
+                        "[streamloop scheduler] novelty pass failed, continuing unjudged: {err:#}"
+                    );
+                }
                 let work = stream.lock().await.pop_next_work();
                 let Some(work) = work else { break };
+                // Hand the agent the report as of this moment. Guidance only —
+                // it never blocks a spec, it just stops eight agents reading the
+                // same contract from all writing up its most salient defect.
+                let work = match self.inject_reviewed_findings {
+                    true => work.with_already_reported(self.already_reported_block().await),
+                    false => work,
+                };
                 let ctx = self.ctx.clone();
                 let ordinal = work.ordinal();
                 tracing::info!(
@@ -1251,6 +1480,21 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     /// and finalizes (writer + export) at the end. `None` for plain runs and
     /// for `external-validate` (which has its own reporting).
     pub(crate) report_cfg: Option<review_findings::ReportInlineCfg>,
+    /// When set, each batch of queued links is judged against the run's
+    /// already-built specifications before being claimed, and duplicates are
+    /// deferred to the stream's back lane. `None` runs every link in planner
+    /// order (the pre-scheduler behaviour).
+    pub(crate) novelty: Option<LinkNoveltyJudge>,
+    /// Characters of each specification field rendered into the post-gen-spec
+    /// novelty gate, and into the already-reported block every gen-spec agent
+    /// receives.
+    pub(crate) novelty_spec_chars: usize,
+    /// Cap on reported findings listed in either place.
+    pub(crate) novelty_max_inventory: usize,
+    /// Candidate links handed to the novelty judge per call.
+    pub(crate) novelty_batch: usize,
+    /// Whether to show gen-spec agents the run's canonical findings.
+    pub(crate) inject_reviewed_findings: bool,
 }
 
 impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
@@ -1276,6 +1520,11 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             max_inner_cycles,
             concurrency,
             report_cfg,
+            novelty,
+            novelty_spec_chars,
+            novelty_max_inventory,
+            novelty_batch,
+            inject_reviewed_findings,
         } = self;
         let concurrency = concurrency.max(1);
 
@@ -1316,6 +1565,9 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             ),
             None => None,
         };
+        // The novelty judge bills into its own scope so the cost of avoiding
+        // link pipelines stays separable from the pipelines themselves.
+        let novelty_llm = primary_llm.scope(Some("novelty".to_string()), None);
         // `language_prompt_prefix` flows into LinkContext too so the per-link
         // reflect path can prepend it to the grader system prompt without
         // re-walking the harness backend each call.
@@ -1337,6 +1589,12 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             ctx,
             concurrency,
             report,
+            novelty,
+            novelty_llm,
+            novelty_spec_chars,
+            novelty_max_inventory,
+            novelty_batch,
+            inject_reviewed_findings,
         };
         let (stats, report) = scheduler.run(stream).await?;
         if let Some(mut report) = report {
@@ -1356,6 +1614,15 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             stats.built_specs,
             stats.abandoned_links,
         );
+        if stats.novelty_judged > 0 {
+            tracing::info!(
+                "[link pipeline] novelty judge: {} candidate link(s) judged, {} deferred as \
+                 duplicates ({:.0}%) — deferred links still run once the main queue drains",
+                stats.novelty_judged,
+                stats.novelty_deferred,
+                100.0 * stats.novelty_deferred as f64 / stats.novelty_judged as f64,
+            );
+        }
         Ok(RunUsageReport {
             links: stats.link_usages,
             billing_abort: stats.billing_abort,
@@ -1384,6 +1651,10 @@ struct StreamStats {
     /// scheduler stops launching new links and drains the in-flight ones; the
     /// run then aborts with a clear error instead of silently "finishing".
     billing_abort: Option<BillingExhausted>,
+    /// Candidate links the novelty judge looked at, and how many of those it
+    /// pushed to the back lane as duplicates of an already-built spec.
+    novelty_judged: usize,
+    novelty_deferred: usize,
 }
 
 /// Minimal per-link summary returned by [`LinkContext::run_link`] —

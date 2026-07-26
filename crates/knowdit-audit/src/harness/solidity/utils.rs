@@ -49,8 +49,13 @@ pub struct FuzzOptions {
     /// In local mode this is enforced via cgroup v2 (when available);
     /// in docker mode it's plumbed through `--memory` / `--memory-swap`.
     pub forge_mem_cap_bytes: Option<u64>,
-    /// Hard timeout per forge subprocess (seconds).
+    /// Hard timeout for a `forge test` subprocess (seconds).
     pub forge_timeout_secs: u64,
+    /// Hard timeout for a `forge coverage` subprocess (seconds). Coverage now
+    /// runs after every test attempt, so this bounds what a hopeless or hung
+    /// attempt can cost; kept below `forge_timeout_secs` because coverage is
+    /// evidence, not the verdict.
+    pub forge_coverage_timeout_secs: u64,
     /// `--fuzz-runs` for the test invocation.
     pub forge_test_runs: u64,
     /// `--fuzz-runs` for the coverage invocation (usually smaller, since
@@ -386,6 +391,18 @@ pub(super) fn parse_lcov(text: &str) -> Vec<CoverageEntry> {
             let Ok(hits) = hits_str.trim().parse::<i64>() else {
                 continue;
             };
+            // lcov's `DA:` lists every *instrumented* line, scoring the ones a
+            // run never reached as `,0` — on real harnesses that is ~88% of the
+            // records. A zero says only "this particular harness didn't walk
+            // here", which no consumer wants: Gate 2 filters `hit_count > 0`
+            // itself, and so does every downstream reader. Keeping them cost
+            // ~6x the rows in `line_coverage` (623k rows encoding 5.4k distinct
+            // positions) and forced any per-file lookup to wade through them,
+            // so drop them at the parse boundary and let the table mean exactly
+            // "this line was executed".
+            if hits <= 0 {
+                continue;
+            }
             out.push(CoverageEntry {
                 relative_contract_path: file.clone(),
                 line_number: line_num,

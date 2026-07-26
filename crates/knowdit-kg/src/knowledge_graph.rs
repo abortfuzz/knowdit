@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::text::truncate_text;
 use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_link_status,
     finding_merge, project, project_category, project_finding, project_platform, project_semantic,
@@ -3023,17 +3024,6 @@ fn finding_node_color(severity: audit_finding::FindingSeverity, is_merged: bool)
             background: "#e7e5e4".to_string(),
             border: "#44403c".to_string(),
         },
-    }
-}
-
-fn truncate_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}…", truncated.trim_end())
-    } else {
-        compact
     }
 }
 
