@@ -71,6 +71,12 @@ pub struct VerdictInput {
 pub struct VerdictOutput {
     pub result: ReflectionResult,
     pub reason: String,
+    /// Reusable statement of the project fact behind a direction-closing
+    /// verdict, for [`knowdit_repo_model::ReflectionRecord::ruled_out_claim`].
+    /// `None` for every other verdict, and for a direction-closing verdict
+    /// whose grader found nothing worth replaying.
+    pub ruled_out_claim: Option<String>,
+    pub ruled_out_evidence: Option<String>,
     pub steps: usize,
 }
 
@@ -196,6 +202,8 @@ impl VerdictGrader {
         Ok(VerdictOutput {
             result: raw.classification.into(),
             reason: raw.rationale,
+            ruled_out_claim: raw.ruled_out_claim,
+            ruled_out_evidence: raw.ruled_out_evidence,
             steps,
         })
     }
@@ -266,6 +274,8 @@ impl From<GraderVerdict> for ReflectionResult {
 struct RawVerdict {
     classification: GraderVerdict,
     rationale: String,
+    ruled_out_claim: Option<String>,
+    ruled_out_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -276,13 +286,28 @@ struct EmitVerdictArgs {
     /// contract names from the counter-example or `spec.sequence`
     /// (the system prompt rejects vague rationales).
     rationale: String,
+    /// REQUIRED for `ExpectedViolation` and `OutOfScope`, omitted otherwise.
+    /// One or two sentences stating the PROJECT FACT that makes assertions of
+    /// this shape not-a-bug, written for a later agent that will never see
+    /// this run: no reference to this harness, this specification, or "the
+    /// verdict". Example: "The servicer is a trusted role authorised to post
+    /// free-form non-cash ledger corrections, so a servicer moving balances
+    /// without a matching cash event is intended behaviour."
+    #[serde(default)]
+    ruled_out_claim: Option<String>,
+    /// Where that claim can be re-checked, in whatever form THIS project
+    /// offers: a documentation line, a source comment, an access-control
+    /// modifier or `require`, a test asserting the behaviour. Omit it rather
+    /// than invent one.
+    #[serde(default)]
+    ruled_out_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 #[llmy::agent::tool(
     arguments = EmitVerdictArgs,
     invoke = invoke,
-    description = "Commit the final 5-class classification for this harness_run and end the agent run. Call EXACTLY once, AFTER gathering enough evidence via the lookup_call_graph / lookup_state_variable_xrefs / read_contract_source / read_function_source tools. Severity (for ValidFinding) is decided by a separate downstream agent — do NOT include it here.",
+    description = "Commit the final 5-class classification for this harness_run and end the agent run. Call EXACTLY once, AFTER gathering enough evidence via the lookup_call_graph / lookup_state_variable_xrefs / read_contract_source / read_function_source tools. For ExpectedViolation and OutOfScope you MUST also pass ruled_out_claim (and ruled_out_evidence when you found an anchor) so later agents inherit the conclusion instead of re-deriving it. Severity (for ValidFinding) is decided by a separate downstream agent — do NOT include it here.",
     name = "emit_verdict",
 )]
 struct EmitVerdictTool {
@@ -297,11 +322,32 @@ impl EmitVerdictTool {
         if args.rationale.trim().is_empty() {
             return Ok("error: rationale must be non-empty".to_string());
         }
+        let claim = args.ruled_out_claim.filter(|c| !c.trim().is_empty());
+        let evidence = args.ruled_out_evidence.filter(|e| !e.trim().is_empty());
+        let closes_direction = ReflectionResult::from(args.classification).rules_out_direction();
+        // Same shape as the rationale check: hand the error back so the agent
+        // retries the call rather than failing the run. The claim is what a
+        // later agent replays instead of re-arguing this ground, so a
+        // direction-closing verdict without one silently forfeits the whole
+        // point of grading it.
+        if closes_direction && claim.is_none() {
+            return Ok(format!(
+                "error: {:?} requires a non-empty ruled_out_claim — state the project fact that \
+                 makes assertions of this shape not-a-bug, phrased so an agent that never sees \
+                 this run can act on it",
+                args.classification
+            ));
+        }
         match self
             .attempt
             .try_set(RawVerdict {
                 classification: args.classification,
                 rationale: args.rationale,
+                // A claim only travels with the verdicts that can replay it;
+                // an agent that attaches one to `IncompleteStep` is describing
+                // a harness failure, which must not steer later agents.
+                ruled_out_claim: closes_direction.then_some(claim).flatten(),
+                ruled_out_evidence: closes_direction.then_some(evidence).flatten(),
             })
             .await
         {

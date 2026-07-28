@@ -33,9 +33,10 @@ use knowdit_audit::reflect::agent_loop::GraderOptions;
 use knowdit_audit::reflect::review_grader::{ReviewGrader, ReviewInput};
 use knowdit_audit::report::merge::{MergeAgent, MergeInput};
 use knowdit_audit::report::render::{DuplicateBrief, RenderFinding, render_markdown_report};
+use knowdit_audit::report::ruled_out::{ConclusionMergeInput, RuledOutMerger};
 use knowdit_repo_model::{
     FindingMergeDecision, LoadedReportFinding, RawFindingMember, RepoDatabase, ReportFindingSeed,
-    ReviewSeverity, ReviewedFinding, SourceLanguage,
+    ReviewSeverity, ReviewedFinding, RuledOutConclusion, RuledOutMergeDecision, SourceLanguage,
 };
 use llmy::client::client::LLM;
 use serde::{Deserialize, Serialize};
@@ -228,6 +229,12 @@ pub struct ReviewFindingsStats {
     pub merged_new: usize,
     pub merged_into: usize,
     pub merge_errors: usize,
+    /// Rejections placed into the ruled-out conclusion set.
+    pub ruled_out_placed: usize,
+    /// Distinct conclusions that set currently holds. The ratio between the
+    /// two is the redundancy this injection removes.
+    pub ruled_out_conclusions: usize,
+    pub ruled_out_errors: usize,
 }
 
 /// The shared Review → Merge → Write → export pipeline. Owns cheap-to-clone
@@ -314,9 +321,12 @@ pub struct ReportContext {
     concurrency: usize,
     review: Arc<ReviewGrader>,
     merge: MergeAgent,
+    ruled_out: RuledOutMerger,
     /// The merge agent's accumulating canonical set, kept in sync with the DB
     /// across drains so each new finding compares against all prior canonicals.
     canonicals: Vec<LoadedReportFinding>,
+    /// Same accumulator for the ruled-out side.
+    conclusions: Vec<RuledOutConclusion>,
     pub stats: ReviewFindingsStats,
 }
 
@@ -348,7 +358,16 @@ impl ReportContext {
             run.window_ratio,
         )
         .await?;
+        // Shares the merge agent's already-loaded project graphs.
+        let ruled_out = RuledOutMerger::new(
+            merge.project_index().clone(),
+            run.language_prompt_prefix.clone(),
+            &run.llm,
+            run.options.clone(),
+            run.window_ratio,
+        );
         let canonicals = run.repo.load_report_findings().await?;
+        let conclusions = run.repo.load_ruled_out_conclusions().await?;
         Ok(Self {
             repo: run.repo,
             llm: run.llm,
@@ -360,7 +379,9 @@ impl ReportContext {
             concurrency: run.concurrency.max(1),
             review,
             merge,
+            ruled_out,
             canonicals,
+            conclusions,
             stats: ReviewFindingsStats::default(),
         })
     }
@@ -491,6 +512,75 @@ impl ReportContext {
                 self.stamp_raw_merged_to(rid, &unique);
             }
         }
+        Ok(())
+    }
+
+    /// Fold every unplaced rejection into the ruled-out conclusion set,
+    /// serially against the accumulating in-memory conclusions. Mirrors
+    /// [`Self::merge_pending`]: a per-rejection failure leaves it unplaced for
+    /// the next drain, so nothing is lost and nothing is double-counted.
+    ///
+    /// Unlike the finding side this produces no report output — the set exists
+    /// solely to be injected into later gen-spec prompts, so that agents stop
+    /// re-establishing conclusions their peers already reached.
+    pub async fn ruled_out_pending(&mut self) -> Result<()> {
+        let pending = self.repo.load_unmerged_ruled_out().await?;
+        if pending.is_empty() {
+            self.stats.ruled_out_conclusions = self.conclusions.len();
+            return Ok(());
+        }
+        tracing::info!(
+            "[review-findings] ruled-out: {} unplaced rejection(s) against {} conclusion(s)",
+            pending.len(),
+            self.conclusions.len(),
+        );
+        for rejection in pending {
+            let input = ConclusionMergeInput::new(&rejection, &self.conclusions);
+            let choice = match self.ruled_out.decide(&input).await {
+                Ok(c) => c,
+                Err(err) => {
+                    self.stats.ruled_out_errors += 1;
+                    tracing::error!(
+                        "[review-findings] ruled-out placement failed for reflection {}: {err:#}",
+                        rejection.reflection_id
+                    );
+                    continue;
+                }
+            };
+            let decision = match choice.merge_into {
+                Some(to_reflection_id) => RuledOutMergeDecision::MergeInto { to_reflection_id },
+                None => RuledOutMergeDecision::NewConclusion,
+            };
+            let representative = self
+                .repo
+                .commit_ruled_out_merge(rejection.reflection_id, decision)
+                .await?;
+            self.stats.ruled_out_placed += 1;
+            match self
+                .conclusions
+                .iter_mut()
+                .find(|c| c.id == representative)
+            {
+                Some(existing) => existing.occurrences += 1,
+                None => self.conclusions.push(RuledOutConclusion {
+                    id: representative,
+                    claim: rejection.claim,
+                    evidence: rejection.evidence,
+                    occurrences: 1,
+                }),
+            }
+            // Keep the accumulator in the order the renderer expects
+            // (most-repeated first) so a capped block keeps the conclusions
+            // that cost the most to rediscover.
+            self.conclusions
+                .sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.id.cmp(&b.id)));
+            self.stats.ruled_out_conclusions = self.conclusions.len();
+        }
+        tracing::info!(
+            "[review-findings] ruled-out: {} rejection(s) placed into {} distinct conclusion(s)",
+            self.stats.ruled_out_placed,
+            self.conclusions.len(),
+        );
         Ok(())
     }
 

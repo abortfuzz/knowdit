@@ -40,9 +40,9 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
-    BillingExhausted, LinkKey, LinkNovelty, LinkNoveltyJudge, LinkSource, LinkSpecOutcome,
-    LinkSpecStatus, NoveltyOptions, PlannedLinkWork, ReportedFinding, SpecGenOptions,
-    SpecGenStream, SpecificationGenerator, billing_exhaustion,
+    AuditStatusSummary, BillingExhausted, LinkKey, LinkNovelty, LinkNoveltyJudge, LinkSource,
+    LinkSpecOutcome, LinkSpecStatus, NoveltyOptions, PlannedLinkWork, ReportedFinding,
+    SpecGenOptions, SpecGenStream, SpecificationGenerator, StatusRenderCaps, billing_exhaustion,
 };
 use knowdit_audit::types::AuditSpecification;
 use knowdit_kg::db::HistoricalDatabase;
@@ -209,11 +209,85 @@ pub struct StreamloopArgs {
     /// Requires `--review-findings` — that is what fills the canonical set this
     /// injects. The combination is rejected at startup rather than silently
     /// degrading to an empty block and a run that quietly loses the benefit.
-    #[arg(long = "inject-reviewed-findings", default_value_t = true)]
+    /// A bare `bool` field would compile to `SetTrue`, which silently ignores
+    /// a value and leaves a default-true flag with no way to turn it off — the
+    /// documented `=false` escape hatch above would not actually work. `Set`
+    /// plus an optional argument accepts `--flag`, `--flag false`, and
+    /// `--flag=false` alike.
+    #[arg(
+        long = "inject-reviewed-findings",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
     pub inject_reviewed_findings: bool,
+
+    /// Also show every gen-spec agent the directions this audit has already
+    /// investigated and closed, so it stops re-arguing settled ground.
+    ///
+    /// Every time the verdict grader rules a violation "expected behaviour" it
+    /// records the project fact that settled it; those facts are deduplicated
+    /// into a conclusion set as the run proceeds. On a full tare run 73% of all
+    /// verdicts were rejections of this kind, and clustering a sample showed
+    /// 240 of them asserting only 48 distinct facts — one fact was
+    /// independently re-argued 31 times, at a full pipeline each.
+    ///
+    /// Like `--inject-reviewed-findings` this changes what the gen-spec agent
+    /// *writes*, not which links run, so runs with and without it are not
+    /// spec-for-spec comparable. Requires `--review-findings`, which is what
+    /// drives the dedup drain.
+    /// Same `Set`-with-optional-value shape as `--inject-reviewed-findings`,
+    /// and for the same reason: this flag has to be switchable off to A/B it.
+    #[arg(
+        long = "inject-ruled-out",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub inject_ruled_out: bool,
+
+    #[command(flatten)]
+    pub status: StatusInjectionArgs,
 
     #[command(flatten)]
     pub review: crate::cmd::workflow::review_findings::ReviewFindingsSharedArgs,
+}
+
+/// Render limits for the audit-status block injected into every gen-spec
+/// prompt. Both sections share one budget (see [`StatusRenderCaps`]), so both
+/// caps live here rather than being borrowed from the novelty judge's knobs.
+#[derive(Args, Debug, Clone)]
+pub struct StatusInjectionArgs {
+    /// Canonical findings listed in the status block (newest kept).
+    #[arg(long, default_value_t = 200)]
+    pub status_max_reported: usize,
+
+    /// Ruled-out conclusions listed in the status block (most-repeated kept).
+    /// The block rides in every gen-spec prompt for the rest of the run, so
+    /// this is the main lever on its size.
+    #[arg(long, default_value_t = 120)]
+    pub status_max_ruled_out: usize,
+
+    /// Per-field truncation applied to both sections of the status block.
+    ///
+    /// Sized so a ruled-out claim renders whole (measured mean 372 chars, max
+    /// 475 on tare). Cutting one costs more than the space it saves: a claim's
+    /// closing clause is what narrows it, so a truncated conclusion reads as a
+    /// broader prohibition than the reviewer actually established.
+    #[arg(long, default_value_t = 700)]
+    pub status_field_chars: usize,
+}
+
+impl StatusInjectionArgs {
+    fn caps(&self) -> StatusRenderCaps {
+        StatusRenderCaps {
+            max_reported: self.status_max_reported,
+            max_ruled_out: self.status_max_ruled_out,
+            field_chars: self.status_field_chars,
+        }
+    }
 }
 
 impl StreamloopArgs {
@@ -233,6 +307,15 @@ impl StreamloopArgs {
                  that phase it would always be empty and every gen-spec agent would run blind. \
                  Add `--review-findings` (recommended), or pass \
                  `--inject-reviewed-findings=false` to run without the injection."
+            ));
+        }
+        if self.inject_ruled_out && !self.review_findings {
+            return Err(eyre!(
+                "--inject-ruled-out needs --review-findings: the ruled-out conclusion set is \
+                 deduplicated by the same inline report phase, so without it the injected block \
+                 would always be empty and every gen-spec agent would keep re-arguing settled \
+                 ground. Add `--review-findings` (recommended), or pass \
+                 `--inject-ruled-out=false` to run without the injection."
             ));
         }
         tracing::info!("[streamloop stage 1/8] preparing output folder");
@@ -469,10 +552,20 @@ impl StreamloopArgs {
         // reflect → regen pipeline) are shared with `external-validate` via
         // [`run_link_pipeline`]; only the upstream way links land in the DB
         // differs (LLM mapper here, JSON ingest there).
+        // Stage 3 wrote the profile row before we got here, so this read is the
+        // same source of truth the mapper used. It feeds both the gen-spec
+        // system prompt and the novelty judge.
+        let profile = repo.get_project_profile().await?.ok_or_else(|| {
+            eyre!(
+                "the link pipeline requires a ProjectProfile; the profile stage should have \
+                 written one for project '{spec_name}'"
+            )
+        })?;
         let gen_options = self.gen_specs.build_spec_options(
             &spec_name,
             language_prompt_prefix.clone(),
             LinkSource::Mapper,
+            Some(profile.clone()),
         );
         // When `--review-findings` is set, the link pipeline drains review +
         // merge after each completed link and finalizes (writer + export) at
@@ -489,17 +582,9 @@ impl StreamloopArgs {
         } else {
             None
         };
-        // Stage 3 wrote the profile row before we got here, so this read is
-        // the same source of truth the mapper used.
-        let novelty_profile = repo.get_project_profile().await?.ok_or_else(|| {
-            eyre!(
-                "link novelty judge requires a ProjectProfile; the profile stage should have \
-                 written one — re-run with `--stream-novelty-batch 0` to skip the pass"
-            )
-        })?;
         let novelty = (self.stream_novelty_batch > 0).then(|| {
             LinkNoveltyJudge::new(
-                &novelty_profile,
+                &profile,
                 NoveltyOptions {
                     batch_size: self.stream_novelty_batch,
                     max_inventory: self.stream_novelty_max_inventory,
@@ -527,10 +612,10 @@ impl StreamloopArgs {
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
             report_cfg,
             novelty,
-            novelty_spec_chars: self.stream_novelty_spec_chars,
-            novelty_max_inventory: self.stream_novelty_max_inventory,
             novelty_batch: self.stream_novelty_batch,
             inject_reviewed_findings: self.inject_reviewed_findings,
+            inject_ruled_out: self.inject_ruled_out,
+            status_caps: self.status.caps(),
         }
         .run()
         .await?;
@@ -1233,16 +1318,16 @@ struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
     /// LLM scope the novelty judge bills into, kept separate from the per-link
     /// scopes so its cost shows up as its own line in the usage report.
     novelty_llm: LLM,
-    /// Per-field truncation for the already-reported block handed to each
-    /// gen-spec agent.
-    novelty_spec_chars: usize,
-    /// Cap on how many reported findings that block lists.
-    novelty_max_inventory: usize,
     /// Candidate links handed to the novelty judge per call.
     novelty_batch: usize,
-    /// Whether gen-spec agents are shown the run's canonical findings at all
+    /// Whether gen-spec agents are shown the run's canonical findings
     /// (see `--inject-reviewed-findings`).
     inject_reviewed_findings: bool,
+    /// Whether they are also shown the run's ruled-out conclusions
+    /// (see `--inject-ruled-out`).
+    inject_ruled_out: bool,
+    /// Render limits for the block those two flags produce.
+    status_caps: StatusRenderCaps,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
@@ -1314,13 +1399,15 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
         }
     }
 
-    /// Render the canonical findings reported so far for injection into the
-    /// next gen-spec agent's prompt. Best-effort: a read failure yields an
-    /// empty block and the agent simply runs blind, exactly as before.
-    async fn already_reported_block(&self) -> String {
-        match self.ctx.repo.load_report_findings().await {
-            Ok(rows) => {
-                let findings: Vec<ReportedFinding> = rows
+    /// Render what this audit has settled so far for injection into the next
+    /// gen-spec agent's prompt. Best-effort per section: a read failure drops
+    /// that section and the agent runs blind on it, exactly as it did before
+    /// the injection existed — a transient DB error must not fail the link.
+    async fn status_block(&self) -> String {
+        let reported = match self.inject_reviewed_findings {
+            false => Vec::new(),
+            true => match self.ctx.repo.load_report_findings().await {
+                Ok(rows) => rows
                     .into_iter()
                     .map(|f| ReportedFinding {
                         id: f.id,
@@ -1329,21 +1416,30 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                         primary_contract: f.primary_contract,
                         primary_function: f.primary_function,
                     })
-                    .collect();
-                PlannedLinkWork::render_already_reported(
-                    &findings,
-                    self.novelty_max_inventory,
-                    self.novelty_spec_chars,
-                )
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "[streamloop scheduler] could not load reported findings for the gen-spec \
-                     prompt, running this link blind: {err:#}"
-                );
-                String::new()
-            }
-        }
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!(
+                        "[streamloop scheduler] could not load reported findings for the gen-spec \
+                         prompt; this link runs without them: {err:#}"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+        let ruled_out = match self.inject_ruled_out {
+            false => Vec::new(),
+            true => match self.ctx.repo.load_ruled_out_conclusions().await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        "[streamloop scheduler] could not load ruled-out conclusions for the \
+                         gen-spec prompt; this link runs without them: {err:#}"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+        AuditStatusSummary::new(reported, ruled_out).render(&self.status_caps)
     }
 
     async fn run(
@@ -1377,11 +1473,13 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                 }
                 let work = stream.lock().await.pop_next_work();
                 let Some(work) = work else { break };
-                // Hand the agent the report as of this moment. Guidance only —
-                // it never blocks a spec, it just stops eight agents reading the
-                // same contract from all writing up its most salient defect.
-                let work = match self.inject_reviewed_findings {
-                    true => work.with_already_reported(self.already_reported_block().await),
+                // Hand the agent the audit state as of this moment. Guidance
+                // only — it never blocks a spec, it just stops eight agents
+                // reading the same contract from all writing up its most
+                // salient defect, or from re-arguing a rejection a peer already
+                // settled.
+                let work = match self.inject_reviewed_findings || self.inject_ruled_out {
+                    true => work.with_status_summary(self.status_block().await),
                     false => work,
                 };
                 let ctx = self.ctx.clone();
@@ -1415,6 +1513,14 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                         }
                         if let Err(err) = report.merge_pending().await {
                             tracing::error!("[streamloop] inline merge drain failed: {err:#}");
+                        }
+                        // Rejections deduplicate on the same cadence, so the
+                        // next link's status block reflects what this one
+                        // settled. Skipped when nothing consumes the result.
+                        if self.inject_ruled_out
+                            && let Err(err) = report.ruled_out_pending().await
+                        {
+                            tracing::error!("[streamloop] inline ruled-out drain failed: {err:#}");
                         }
                     }
                 }
@@ -1485,16 +1591,15 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     /// deferred to the stream's back lane. `None` runs every link in planner
     /// order (the pre-scheduler behaviour).
     pub(crate) novelty: Option<LinkNoveltyJudge>,
-    /// Characters of each specification field rendered into the post-gen-spec
-    /// novelty gate, and into the already-reported block every gen-spec agent
-    /// receives.
-    pub(crate) novelty_spec_chars: usize,
-    /// Cap on reported findings listed in either place.
-    pub(crate) novelty_max_inventory: usize,
     /// Candidate links handed to the novelty judge per call.
     pub(crate) novelty_batch: usize,
     /// Whether to show gen-spec agents the run's canonical findings.
     pub(crate) inject_reviewed_findings: bool,
+    /// Whether to show them the run's ruled-out conclusions, and to run the
+    /// dedup drain that produces them.
+    pub(crate) inject_ruled_out: bool,
+    /// Render limits for the block those two flags produce.
+    pub(crate) status_caps: StatusRenderCaps,
 }
 
 impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
@@ -1521,10 +1626,10 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             concurrency,
             report_cfg,
             novelty,
-            novelty_spec_chars,
-            novelty_max_inventory,
             novelty_batch,
             inject_reviewed_findings,
+            inject_ruled_out,
+            status_caps,
         } = self;
         let concurrency = concurrency.max(1);
 
@@ -1591,10 +1696,10 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             report,
             novelty,
             novelty_llm,
-            novelty_spec_chars,
-            novelty_max_inventory,
             novelty_batch,
             inject_reviewed_findings,
+            inject_ruled_out,
+            status_caps,
         };
         let (stats, report) = scheduler.run(stream).await?;
         if let Some(mut report) = report {

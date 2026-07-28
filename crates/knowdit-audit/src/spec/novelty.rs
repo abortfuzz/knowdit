@@ -287,6 +287,20 @@ impl LinkNoveltyJudge {
                 out.insert(link.key(), novelty);
             }
         }
+        // An omitted candidate is silently treated as `New` by the caller, which
+        // is the safe direction but also invisible: a batch large enough for the
+        // model to start dropping entries would look exactly like a batch where
+        // everything was judged novel. Say so, since batch size is the knob most
+        // likely to cause it.
+        let missing = candidates.len().saturating_sub(out.len());
+        if missing > 0 {
+            tracing::warn!(
+                "link novelty judge: {} of {} candidate(s) came back without a usable verdict and \
+                 will run unjudged — the batch may be too large for one response",
+                missing,
+                candidates.len(),
+            );
+        }
         Ok(out)
     }
 }

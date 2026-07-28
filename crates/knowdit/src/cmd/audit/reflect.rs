@@ -762,6 +762,8 @@ impl ReflectionRunner {
             spec_id: run_spec_id(run, &self.code_gens),
             result: verdict.result,
             reason: verdict.reason.clone(),
+            ruled_out_claim: verdict.ruled_out_claim.clone(),
+            ruled_out_evidence: verdict.ruled_out_evidence.clone(),
         };
         let finding = severity.map(|s| ValidFindingRecord {
             severity: s.severity,

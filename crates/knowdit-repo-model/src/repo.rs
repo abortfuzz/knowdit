@@ -42,7 +42,8 @@ use crate::db::{
     interface_functions as interface_functions_model, line_coverage as line_coverage_model,
     project_metadata as project_metadata_model, project_semantic as project_semantic_model,
     project_semantic_function as project_semantic_function_model, reflection as reflection_model,
-    report_finding as report_finding_model, semantic_matched as semantic_matched_model,
+    report_finding as report_finding_model, ruled_out_merge as ruled_out_merge_model,
+    semantic_matched as semantic_matched_model,
     specification as specification_model, specification_regen as specification_regen_model,
     state_variable as state_variable_model, valid_finding as valid_finding_model,
 };
@@ -206,6 +207,9 @@ impl RepoDatabase {
             schema.create_table_from_entity(finding_review_model::Entity),
             schema.create_table_from_entity(report_finding_model::Entity),
             schema.create_table_from_entity(finding_merge_model::Entity),
+            // Self-referential dedup edge over rejections; references
+            // reflection only, so it must follow it.
+            schema.create_table_from_entity(ruled_out_merge_model::Entity),
             // Lineage tables — must come after their referenced parents
             // (specification / code_gen / reflection) to keep the FK
             // ordering happy on backends that enforce it.
@@ -229,6 +233,11 @@ impl RepoDatabase {
                 .await
                 .wrap_err("failed to create project database schema")?;
         }
+
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already
+        // has `reflection`, so columns added after that database was created
+        // have to be patched in explicitly.
+        self.add_missing_reflection_columns().await?;
 
         // Compound UNIQUE on semantic_matched (extract_id,
         // historical_id). SeaORM's `DeriveEntityModel` doesn't
@@ -382,6 +391,49 @@ impl RepoDatabase {
                     format!("failed to drop legacy table during migration: {sql}")
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// Add the nullable `ruled_out_*` columns to a `reflection` table created
+    /// before they existed. Additive and non-destructive — unlike the legacy
+    /// migrations above, no verdict is lost: pre-existing rows simply carry
+    /// `NULL` claims and are skipped by the dedup drain, which is the correct
+    /// reading of "this rejection never produced a reusable conclusion".
+    /// SQLite-only, matching the other in-place migrations here.
+    async fn add_missing_reflection_columns(&self) -> Result<()> {
+        if self.db.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+        use sea_orm::{FromQueryResult, Statement};
+        #[derive(FromQueryResult)]
+        struct ColInfo {
+            name: String,
+        }
+        let columns = ColInfo::find_by_statement(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "PRAGMA table_info(reflection)".to_string(),
+        ))
+        .all(&self.db)
+        .await
+        .wrap_err("failed to introspect reflection table before adding ruled-out columns")?;
+        // Empty means the table does not exist yet; `init_schema` creates it
+        // with the columns already present.
+        if columns.is_empty() {
+            return Ok(());
+        }
+        for column in ["ruled_out_claim", "ruled_out_evidence"] {
+            if columns.iter().any(|c| c.name == column) {
+                continue;
+            }
+            tracing::info!(
+                "adding `reflection.{column}` to an existing project database (older rows keep \
+                 NULL and are skipped by the ruled-out dedup drain)"
+            );
+            self.db
+                .execute_unprepared(&format!("ALTER TABLE reflection ADD COLUMN {column} TEXT"))
+                .await
+                .wrap_err_with(|| format!("failed to add reflection.{column}"))?;
         }
         Ok(())
     }
@@ -1445,6 +1497,42 @@ pub struct ProjectProfile {
     pub out_of_scope_notes: String,
     /// Files the profile-gen agent actually opened via `read_file`.
     pub source_files_read: Vec<String>,
+}
+
+impl ProjectProfile {
+    /// Render the profile as the Markdown block agents embed in their prompts.
+    /// Every LLM phase that wants the project's framing renders it the same
+    /// way, so an agent's notion of "what this project is" does not silently
+    /// differ from its peers'.
+    ///
+    /// `language` and `source_files_read` are deliberately omitted: the first
+    /// is already carried by each phase's language prompt prefix, and the
+    /// second is provenance for a human reading the profile row, not signal for
+    /// an agent.
+    pub fn render_for_prompt(&self) -> String {
+        let mut out = String::new();
+        out.push_str("## Project profile\n\n");
+        out.push_str(&format!(
+            "Domain summary: {}\n\n",
+            self.domain_summary.trim()
+        ));
+        out.push_str("Subsystems:\n");
+        for s in &self.subsystems {
+            out.push_str(&format!("- {} — {}\n", s.name, s.summary.trim()));
+        }
+        out.push_str("\nCore components:\n");
+        for c in &self.core_components {
+            out.push_str(&format!("- {} ({}) — {}\n", c.name, c.path, c.role.trim()));
+        }
+        let notes = self.out_of_scope_notes.trim();
+        if !notes.is_empty() {
+            out.push_str(&format!(
+                "\nWhat this project deliberately does NOT implement:\n{notes}\n"
+            ));
+        }
+        out.push('\n');
+        out
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2883,6 +2971,47 @@ pub struct ReflectionRecord {
     pub spec_id: i32,
     pub result: ReflectionResult,
     pub reason: String,
+    /// See [`crate::db::reflection::Model::ruled_out_claim`]. Set only for
+    /// verdicts that close a direction; ignored otherwise.
+    pub ruled_out_claim: Option<String>,
+    /// See [`crate::db::reflection::Model::ruled_out_evidence`].
+    pub ruled_out_evidence: Option<String>,
+}
+
+/// One rejection waiting to be placed into the ruled-out conclusion set — the
+/// dedup agent's drain queue. Carries only what the placement decision needs:
+/// the claim being placed plus the target it was argued about.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingRuledOut {
+    pub reflection_id: i32,
+    pub result: ReflectionResult,
+    pub claim: String,
+    pub evidence: String,
+}
+
+/// One deduplicated ruled-out conclusion: the representative rejection's claim
+/// plus how many rejections it now covers. `occurrences` is the measurement
+/// that makes the redundancy visible — a conclusion re-argued 31 times is 30
+/// pipelines that could have been spent elsewhere.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuledOutConclusion {
+    /// The representative `reflection.id`; also the merge target later
+    /// rejections point at.
+    pub id: i32,
+    pub claim: String,
+    pub evidence: String,
+    pub occurrences: usize,
+}
+
+/// The dedup agent's decision for one rejection, persisted by
+/// [`RepoDatabase::commit_ruled_out_merge`].
+#[derive(Debug, Clone, Copy)]
+pub enum RuledOutMergeDecision {
+    /// This rejection establishes a conclusion nothing else covers; the edge
+    /// points at itself.
+    NewConclusion,
+    /// Fold into the conclusion represented by this reflection.
+    MergeInto { to_reflection_id: i32 },
 }
 
 /// Sibling severity record for a `ValidFinding` reflection. Owned by
@@ -2979,6 +3108,19 @@ impl RepoDatabase {
             spec_id: Set(reflection.spec_id),
             result: Set(reflection.result),
             reason: Set(reflection.reason.clone()),
+            // Only the two direction-closing verdicts carry a reusable claim;
+            // dropping it elsewhere keeps the dedup drain's "has a claim"
+            // predicate honest regardless of what the grader emitted.
+            ruled_out_claim: Set(reflection
+                .result
+                .rules_out_direction()
+                .then(|| reflection.ruled_out_claim.clone())
+                .flatten()),
+            ruled_out_evidence: Set(reflection
+                .result
+                .rules_out_direction()
+                .then(|| reflection.ruled_out_evidence.clone())
+                .flatten()),
             ..Default::default()
         })
         .exec(&txn)
@@ -3291,6 +3433,126 @@ impl RepoDatabase {
             .filter(|r| !merged.contains(&r.reflection_id))
             .map(ReviewedFinding::from)
             .collect())
+    }
+
+    /// Rejections that carry a reusable claim but have not been placed into
+    /// the conclusion set yet — the ruled-out dedup agent's drain queue.
+    /// "Placed" is derived purely from edge presence, matching
+    /// [`Self::load_unmerged_finding_reviews`].
+    pub async fn load_unmerged_ruled_out(&self) -> Result<Vec<PendingRuledOut>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let placed: BTreeSet<i32> = ruled_out_merge_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load ruled_out_merge edges")?
+            .into_iter()
+            .map(|e| e.from_reflection_id)
+            .collect();
+        // Filtered in SQL rather than in Rust: this drain runs after every
+        // completed link and `reflection.reason` is a large TEXT column, so
+        // pulling the whole table each time would cost more than the placement
+        // decisions it feeds.
+        let rows = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Result.is_in([
+                ReflectionResult::ExpectedViolation,
+                ReflectionResult::OutOfScope,
+            ]))
+            .filter(reflection_model::Column::RuledOutClaim.is_not_null())
+            .order_by_asc(reflection_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load reflection rows for the ruled-out drain")?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !placed.contains(&r.id))
+            .filter_map(|r| {
+                let claim = r.ruled_out_claim.unwrap_or_default();
+                match claim.trim().is_empty() {
+                    // No claim means the grader found nothing worth replaying
+                    // (its own judgement, and the prompt prefers an empty field
+                    // to an invented one). Leaving it unplaced is correct: it
+                    // will be reconsidered for free on any later drain if a
+                    // re-grade ever fills it in.
+                    true => None,
+                    false => Some(PendingRuledOut {
+                        reflection_id: r.id,
+                        result: r.result,
+                        claim,
+                        evidence: r.ruled_out_evidence.unwrap_or_default(),
+                    }),
+                }
+            })
+            .collect())
+    }
+
+    /// The deduplicated ruled-out conclusion set: one entry per cluster, keyed
+    /// by its representative rejection, with the number of rejections that
+    /// cluster now covers. Ordered by `occurrences` descending so a caller
+    /// working under a render budget keeps the conclusions that cost the most
+    /// to rediscover.
+    pub async fn load_ruled_out_conclusions(&self) -> Result<Vec<RuledOutConclusion>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let mut occurrences: BTreeMap<i32, usize> = BTreeMap::new();
+        for edge in ruled_out_merge_model::Entity::find()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load ruled_out_merge edges")?
+        {
+            *occurrences.entry(edge.to_reflection_id).or_default() += 1;
+        }
+        if occurrences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let representatives = reflection_model::Entity::find()
+            .filter(reflection_model::Column::Id.is_in(occurrences.keys().copied()))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load representative reflections for ruled-out conclusions")?;
+        let mut out: Vec<RuledOutConclusion> = representatives
+            .into_iter()
+            .filter_map(|r| {
+                let claim = r.ruled_out_claim.unwrap_or_default();
+                match claim.trim().is_empty() {
+                    true => None,
+                    false => Some(RuledOutConclusion {
+                        id: r.id,
+                        claim,
+                        evidence: r.ruled_out_evidence.unwrap_or_default(),
+                        occurrences: occurrences.get(&r.id).copied().unwrap_or(1),
+                    }),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// Persist one placement decision. A single insert, so an interruption
+    /// leaves no edge and the next drain re-places the rejection; the
+    /// `UNIQUE(from_reflection_id)` constraint rejects a double-placement.
+    /// Returns the representative reflection this rejection now belongs to.
+    pub async fn commit_ruled_out_merge(
+        &self,
+        from_reflection_id: i32,
+        decision: RuledOutMergeDecision,
+    ) -> Result<i32> {
+        let to_reflection_id = match decision {
+            RuledOutMergeDecision::NewConclusion => from_reflection_id,
+            RuledOutMergeDecision::MergeInto { to_reflection_id } => to_reflection_id,
+        };
+        ruled_out_merge_model::Entity::insert(ruled_out_merge_model::ActiveModel {
+            from_reflection_id: Set(from_reflection_id),
+            to_reflection_id: Set(to_reflection_id),
+            ..Default::default()
+        })
+        .exec(&self.db)
+        .await
+        .wrap_err_with(|| {
+            format!("failed to insert ruled_out_merge edge for reflection {from_reflection_id}")
+        })?;
+        Ok(to_reflection_id)
     }
 
     /// All canonical `report_finding` rows, ordered by id. The Merge agent

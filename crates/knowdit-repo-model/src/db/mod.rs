@@ -27,6 +27,7 @@ pub mod project_semantic;
 pub mod project_semantic_function;
 pub mod reflection;
 pub mod report_finding;
+pub mod ruled_out_merge;
 pub mod semantic_matched;
 pub mod specification;
 pub mod specification_regen;

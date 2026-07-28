@@ -29,8 +29,9 @@ pub use repo::{
     HistoricalFindingChild, HistoricalLinkedFinding, HistoricalSemanticChild,
     HistoricalSemanticRecord, LinkResumeState, LoadedCodeGen, LoadedHarnessRun,
     LoadedReportFinding, LoadedSpecification, LoadedValidFinding, METADATA_KEY_PROFILE,
-    MatchStrength, PendingReflection, ProjectComponent, ProjectProfile, ProjectSubsystem,
-    RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats, RegenEventRecord,
-    RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding, RunKind, SemanticMatch,
-    SemanticMatchSet, ValidFindingRecord,
+    MatchStrength, PendingReflection, PendingRuledOut, ProjectComponent, ProjectProfile,
+    ProjectSubsystem, RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats,
+    RegenEventRecord, RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding,
+    RuledOutConclusion, RuledOutMergeDecision, RunKind, SemanticMatch, SemanticMatchSet,
+    ValidFindingRecord,
 };

@@ -263,6 +263,24 @@ Concrete ExpectedViolation triggers (cite the evidence):
   - Documented normal project behavior with no exploit consequence.
   - Spec that only asks to demonstrate that a benign state is reachable.
 
+# Recording a reusable conclusion (`ExpectedViolation` / `OutOfScope` only)
+
+When you rule a direction out, you have just established something about this project that stays true for every later agent. Upstream agents keep walking into the same wall because nobody wrote it down: a single project fact has been re-argued dozens of times across one audit, at the cost of a full pipeline each time. `emit_verdict` therefore takes two extra fields for exactly these two verdicts.
+
+`ruled_out_claim` (REQUIRED for both) — one or two sentences stating the PROJECT FACT, written for an agent that will never see this run:
+  - State the fact, not the judgement. "The servicer is a trusted role authorised to post free-form non-cash ledger corrections, so balances moving without a matching cash event is intended" — NOT "this run was classified ExpectedViolation".
+  - Never mention this harness, this specification, the counter-example, or any `*_id`. Those do not exist for the reader.
+  - Make it act like a rule: after reading it, an agent should be able to tell whether some DIFFERENT assertion it is considering falls under the same fact. Name the role / assumption / boundary that does the ruling-out, not just this one function call.
+  - Keep it self-contained. It will be read next to a few hundred other conclusions, with no surrounding context.
+
+`ruled_out_evidence` (fill it when you have an anchor, omit it when you do not) — where the claim can be re-checked. The form depends entirely on what this project happens to have; steps 1-3 above already surfaced whatever exists:
+  - a documentation line (threat model, spec, design note, README section) — quote `path:line`
+  - a source comment or NatSpec on the function — quote `path:line`
+  - the access-control modifier, role constant, or `require` that encodes the rule
+  - a test that asserts the behaviour is expected
+
+Most projects ship no security documentation at all. That is normal, and it is not a reason to give up on the field or to go hunting for a file you have not seen: anchor on the code you already read. If nothing anchors the claim, leave `ruled_out_evidence` out — an invented citation is worse than an absent one, because the next agent will try to follow it.
+
 ## 5. ValidFinding
 
 Methodology:
@@ -277,6 +295,7 @@ Methodology:
 
 - Call `emit_verdict` EXACTLY once. It ends your run.
 - `classification` must be one of the five `GraderVerdict` variants. Serde rejects unknown strings.
+- `ruled_out_claim` is REQUIRED when `classification` is `ExpectedViolation` or `OutOfScope`, and must be omitted otherwise — the other three verdicts mean the harness failed, not that the direction is closed, so replaying them would steer later agents away from ground nobody has actually cleared.
 - `rationale` must cite specific function or contract names from the counter-example or spec.sequence (e.g. `"PanopticPool.dispatch reverts on s_paused; spec.setup did not unpause"`). Vague phrasing is rejected by reviewers.
 - Treat any contract authored INSIDE `harness_source` (Mock*, Stub*, Fake*, Vulnerable*, Handler*, Test*) as untrusted scaffolding. `ValidFinding` requires the violation chain to traverse contracts found in the project's call graph.
 - If your other evidence still points to `IncompleteStep` BUT `prior_incomplete_step_count >= 2`, escalate to `IncompleteSpecification`.

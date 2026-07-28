@@ -512,3 +512,175 @@ async fn pending_reflections_includes_code_id_via_harness_run_join() {
     assert_eq!(by_id[&rid_a], code_a);
     assert_eq!(by_id[&rid_b], code_b);
 }
+
+// =============================================================
+// ruled-out conclusions
+// =============================================================
+
+/// Build one graded rejection through the real write path
+/// ([`RepoDatabase::insert_reflection_with_finding`]), so the test also covers
+/// the claim-gating that path applies.
+async fn insert_rejection(
+    repo: &RepoDatabase,
+    spec_id: i32,
+    ordinal: i32,
+    result: ReflectionResult,
+    claim: Option<&str>,
+) -> i32 {
+    let code_id = insert_code_gen(repo, spec_id, "", &format!("t{ordinal}")).await;
+    let run_id = insert_harness_run(repo, code_id, RunKind::Test, 0, "", None).await;
+    repo.insert_reflection_with_finding(
+        &crate::repo::ReflectionRecord {
+            run_id,
+            spec_id,
+            result,
+            reason: format!("long procedural rationale {ordinal}"),
+            ruled_out_claim: claim.map(str::to_string),
+            ruled_out_evidence: claim.map(|_| format!("Contract.sol:{ordinal}")),
+        },
+        None,
+    )
+    .await
+    .expect("reflection should insert")
+}
+
+#[tokio::test]
+async fn ruled_out_drain_skips_verdicts_that_do_not_close_a_direction() {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
+
+    let closed = insert_rejection(
+        &temp.repo,
+        spec_id,
+        1,
+        ReflectionResult::ExpectedViolation,
+        Some("the servicer may post free-form corrections"),
+    )
+    .await;
+    // A harness failure: a re-run may well succeed, so it must never enter the
+    // conclusion set even if the grader attached a claim to it.
+    insert_rejection(
+        &temp.repo,
+        spec_id,
+        2,
+        ReflectionResult::IncompleteStep,
+        Some("this should be dropped on write"),
+    )
+    .await;
+    // A closed direction whose grader found nothing worth replaying.
+    insert_rejection(&temp.repo, spec_id, 3, ReflectionResult::OutOfScope, None).await;
+
+    let pending = temp
+        .repo
+        .load_unmerged_ruled_out()
+        .await
+        .expect("drain query");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].reflection_id, closed);
+    assert_eq!(
+        pending[0].claim,
+        "the servicer may post free-form corrections"
+    );
+}
+
+#[tokio::test]
+async fn ruled_out_placement_clusters_and_counts_occurrences() {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
+
+    let first = insert_rejection(
+        &temp.repo,
+        spec_id,
+        1,
+        ReflectionResult::ExpectedViolation,
+        Some("servicer is trusted"),
+    )
+    .await;
+    let same = insert_rejection(
+        &temp.repo,
+        spec_id,
+        2,
+        ReflectionResult::ExpectedViolation,
+        Some("servicer is trusted, restated"),
+    )
+    .await;
+    let other = insert_rejection(
+        &temp.repo,
+        spec_id,
+        3,
+        ReflectionResult::ExpectedViolation,
+        Some("standard ERC-20 assumed"),
+    )
+    .await;
+
+    for (from, decision) in [
+        (first, crate::repo::RuledOutMergeDecision::NewConclusion),
+        (
+            same,
+            crate::repo::RuledOutMergeDecision::MergeInto {
+                to_reflection_id: first,
+            },
+        ),
+        (other, crate::repo::RuledOutMergeDecision::NewConclusion),
+    ] {
+        temp.repo
+            .commit_ruled_out_merge(from, decision)
+            .await
+            .expect("placement should commit");
+    }
+
+    // Everything placed: the drain is now empty, which is what makes it
+    // re-runnable after every link without redoing work.
+    assert!(
+        temp.repo
+            .load_unmerged_ruled_out()
+            .await
+            .expect("drain query")
+            .is_empty()
+    );
+
+    let conclusions = temp
+        .repo
+        .load_ruled_out_conclusions()
+        .await
+        .expect("conclusion query");
+    assert_eq!(conclusions.len(), 2);
+    // Most-repeated first, so a capped render keeps the expensive ones.
+    assert_eq!(conclusions[0].id, first);
+    assert_eq!(conclusions[0].occurrences, 2);
+    assert_eq!(conclusions[0].claim, "servicer is trusted");
+    assert_eq!(conclusions[1].id, other);
+    assert_eq!(conclusions[1].occurrences, 1);
+}
+
+#[tokio::test]
+async fn ruled_out_placement_rejects_double_placement() {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 1).await;
+    let spec_id = insert_spec(&temp.repo, 1, 1, 7, "{}").await;
+    let rid = insert_rejection(
+        &temp.repo,
+        spec_id,
+        1,
+        ReflectionResult::ExpectedViolation,
+        Some("claim"),
+    )
+    .await;
+
+    temp.repo
+        .commit_ruled_out_merge(rid, crate::repo::RuledOutMergeDecision::NewConclusion)
+        .await
+        .expect("first placement should commit");
+    assert!(
+        temp.repo
+            .commit_ruled_out_merge(rid, crate::repo::RuledOutMergeDecision::NewConclusion)
+            .await
+            .is_err(),
+        "UNIQUE(from_reflection_id) must reject a second placement of the same rejection"
+    );
+}

@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
-use knowdit_kg::text::truncate_text;
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::{
-    HistoricalSemanticRecord, RepoDatabase, SemanticMatchSet, repo::SpecificationRecord,
+    HistoricalSemanticRecord, RepoDatabase, RuledOutConclusion, SemanticMatchSet,
+    repo::SpecificationRecord,
 };
 use llmy::agent::{LLMYError, StepResult};
 use llmy::client::client::LLM;
@@ -55,6 +55,52 @@ pub struct ReportedFinding {
     pub root_cause: String,
     pub primary_contract: String,
     pub primary_function: String,
+}
+
+/// Per-section limits on the rendered audit-status block. One struct because
+/// both sections ride in the SAME prompt and therefore share one token budget:
+/// with a cap per call site, neither side knows how much of the budget it is
+/// entitled to and their sum is unbounded.
+#[derive(Debug, Clone)]
+pub struct StatusRenderCaps {
+    /// How many canonical findings to list.
+    pub max_reported: usize,
+    /// How many ruled-out conclusions to list.
+    pub max_ruled_out: usize,
+    /// Per-field truncation applied to both sections.
+    pub field_chars: usize,
+}
+
+/// What this audit has settled so far, as one agent-facing block.
+///
+/// The two halves are complementary answers to the same question — "what is
+/// already known, so I can spend this link on something else": confirmed bugs
+/// that must not be re-reported, and directions that were investigated and
+/// closed. Rendering them together (rather than at two independent injection
+/// points) is what lets one budget cover both and keeps the agent reading one
+/// coherent state of the audit instead of two stapled lists.
+pub struct AuditStatusSummary {
+    reported: Vec<ReportedFinding>,
+    ruled_out: Vec<RuledOutConclusion>,
+}
+
+impl AuditStatusSummary {
+    /// `reported` is expected in ascending id order (oldest first) — the
+    /// renderer keeps the newest under a cap, because a run reports its
+    /// coarsest findings early and its subtler ones late, and the subtle ones
+    /// are what an agent is most likely to re-derive. `ruled_out` is expected
+    /// most-repeated first, as [`RepoDatabase::load_ruled_out_conclusions`]
+    /// returns it.
+    pub fn new(reported: Vec<ReportedFinding>, ruled_out: Vec<RuledOutConclusion>) -> Self {
+        Self {
+            reported,
+            ruled_out,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reported.is_empty() && self.ruled_out.is_empty()
+    }
 }
 use prompt::{build_regen_prompt_extension, build_system_prompt, build_user_prompt};
 pub(crate) use tools::{
@@ -177,8 +223,12 @@ pub struct SpecGenOptions {
     pub regenerate: bool,
     /// Minimum mapper-emitted match strength to consider for spec
     /// generation. Links with `strength < min_strength` are dropped
-    /// up-front (before any cap). Default `Medium` skips `Low` matches
-    /// (treated as noise).
+    /// up-front (before any cap). Defaults to `High`: it is the only
+    /// graph-side property measured to predict whether a link yields a
+    /// finding (17.2% vs 10.9% for `Medium` over 5,838 links with ground
+    /// truth, and 1.2–2.0x within a fixed queue position). See
+    /// `GenSpecsSharedArgs::gen_specs_min_strength` for the full numbers and
+    /// for when `Medium` is the better setting.
     pub min_strength: knowdit_repo_model::MatchStrength,
     /// Minimum semantic↔finding link strength (from the global linker)
     /// to consider. A LinkInput fans out per `(extract, historical,
@@ -195,6 +245,12 @@ pub struct SpecGenOptions {
     /// externally-supplied reported findings to validate. Frames the gen-spec
     /// agent's system prompt; see [`LinkSource`].
     pub link_source: LinkSource,
+    /// Snapshot of the project profile, rendered into each link's system
+    /// prompt. Every other LLM phase already receives it (mapper, verdict
+    /// grader, novelty judge); gen-spec was the one that decides whether a
+    /// spec is worth writing at all and had to guess what the project is.
+    /// `None` on databases whose profile phase has not run.
+    pub project_profile: Option<knowdit_repo_model::ProjectProfile>,
 }
 
 impl Default for SpecGenOptions {
@@ -211,10 +267,11 @@ impl Default for SpecGenOptions {
             max_links_per_extract: None,
             concurrency: 1,
             regenerate: false,
-            min_strength: knowdit_repo_model::MatchStrength::Medium,
+            min_strength: knowdit_repo_model::MatchStrength::High,
             min_link_strength: knowdit_kg_model::link_strength::LinkStrength::Medium,
             language_prompt_prefix: String::new(),
             link_source: LinkSource::Mapper,
+            project_profile: None,
         }
     }
 }
@@ -454,7 +511,7 @@ impl SpecGenStream {
             link,
             project_index: self.project_index.clone(),
             options: self.options.clone(),
-            already_reported: String::new(),
+            status_summary: String::new(),
         })
     }
 }
@@ -471,63 +528,30 @@ pub struct PlannedLinkWork {
     link: LinkInput,
     project_index: Arc<ProjectIndex>,
     options: SpecGenOptions,
-    /// Pre-rendered block naming the canonical findings this run has already
-    /// reported, injected into the gen-spec agent's user prompt. Empty until
-    /// the run reports something (and whenever the caller does not supply it).
+    /// Pre-rendered block describing what this audit has settled so far,
+    /// injected into the gen-spec agent's user prompt. Empty until the run has
+    /// settled something (and whenever the caller does not supply it).
     ///
     /// Without this every gen-spec agent works blind: on the metric-* baselines
     /// each distinct project bug was independently rediscovered by ~8.5 links,
     /// because eight agents reading the same contract with no idea what their
     /// peers already found all converge on that contract's most salient defect.
-    /// Telling the agent what is already reported does not filter anything out
-    /// — it redirects the exploration it was going to do anyway toward defects
-    /// the report does not have yet, which is the one intervention that acts
-    /// on the *source* of the redundancy rather than on its symptoms.
-    already_reported: String,
+    /// The same blindness applies to the rejections — on a full tare run, 73%
+    /// of all verdicts were "expected behaviour", and one project fact was
+    /// independently re-argued 31 times. Neither half filters anything out; both
+    /// redirect the exploration the agent was going to do anyway toward ground
+    /// nobody has covered, which acts on the *source* of the redundancy rather
+    /// than on its symptoms.
+    status_summary: String,
 }
 
 impl PlannedLinkWork {
-    /// Attach the run's already-reported findings, rendered by
-    /// [`Self::render_already_reported`]. The scheduler calls this at claim
-    /// time so each agent sees the report as of the moment it starts.
-    pub fn with_already_reported(mut self, block: String) -> Self {
-        self.already_reported = block;
+    /// Attach the run's audit-status block, rendered by
+    /// [`AuditStatusSummary::render`]. The scheduler calls this at claim time
+    /// so each agent sees the audit as of the moment it starts.
+    pub fn with_status_summary(mut self, block: String) -> Self {
+        self.status_summary = block;
         self
-    }
-
-    /// Render canonical findings into the block the gen-spec prompt embeds.
-    /// Lives here (rather than at the call site) so both the wording and the
-    /// per-field truncation stay next to the prompt that consumes them.
-    ///
-    /// `max_findings` bounds how many are rendered, keeping the most recent —
-    /// the block rides in every gen-spec prompt for the rest of the run, so on
-    /// a long audit an uncapped list would grow without limit. Newest-first
-    /// because a run reports its coarsest findings early and its subtler ones
-    /// late, and the subtle ones are what an agent is most likely to re-derive.
-    pub fn render_already_reported(
-        findings: &[ReportedFinding],
-        max_findings: usize,
-        field_chars: usize,
-    ) -> String {
-        let skip = findings.len().saturating_sub(max_findings);
-        let mut out = String::with_capacity((findings.len() - skip) * field_chars);
-        for f in &findings[skip..] {
-            out.push_str(&format!(
-                "- [#{}] {}\n    where: {}.{}\n    root cause: {}\n",
-                f.id,
-                f.title.trim(),
-                f.primary_contract,
-                f.primary_function,
-                truncate_text(f.root_cause.trim(), field_chars),
-            ));
-        }
-        if skip > 0 {
-            out.push_str(&format!(
-                "- (+{skip} older reported finding(s) not listed; the report already covers more \
-                 than what you see here)\n"
-            ));
-        }
-        out
     }
 
     pub fn ordinal(&self) -> usize {
@@ -631,7 +655,7 @@ impl SpecificationGenerator {
             let mut outcomes: Vec<LinkSpecOutcome> = Vec::with_capacity(total_links);
             for (idx, link) in links.into_iter().enumerate() {
                 let work = PlannedLinkWork {
-                    already_reported: String::new(),
+                    status_summary: String::new(),
                     ordinal: idx + 1,
                     total_links,
                     link,
@@ -668,7 +692,7 @@ impl SpecificationGenerator {
                             break;
                         };
                         let work = PlannedLinkWork {
-                            already_reported: String::new(),
+                            status_summary: String::new(),
                             ordinal: idx + 1,
                             total_links,
                             link,
@@ -1067,7 +1091,7 @@ impl SpecificationGenerator {
         // the same agent loop as the streaming path. `total_links = 1` and the
         // ordinal is the cache-key serial (a regen, not a stream position).
         let work = PlannedLinkWork {
-            already_reported: String::new(),
+            status_summary: String::new(),
             ordinal: request.serial_for_cache_key,
             total_links: 1,
             link,
@@ -1248,7 +1272,11 @@ impl PlannedLinkWork {
             )
         });
 
-        let mut system_prompt = build_system_prompt(link, options.link_source);
+        let mut system_prompt = build_system_prompt(
+            link,
+            options.link_source,
+            options.project_profile.as_ref(),
+        );
         if let Some(ext) = prompt_extension {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(ext);
@@ -1271,7 +1299,7 @@ impl PlannedLinkWork {
             (llm.model.config.max_input() as f64 * DEFAULT_COMPACT_RATIO) as usize
         });
 
-        let user_prompt = build_user_prompt(link, project_index, &self.already_reported);
+        let user_prompt = build_user_prompt(link, project_index, &self.status_summary);
         let mut step_result = agent
             .step_with_user(
                 user_prompt,

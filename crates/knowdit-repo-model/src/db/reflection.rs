@@ -63,6 +63,20 @@ impl ReflectionResult {
     pub fn requires_spec_regen(&self) -> bool {
         matches!(self, Self::IncompleteSpecification)
     }
+
+    /// Whether this verdict closes the direction with a judgement about the
+    /// PROJECT rather than about the harness — the two cases whose reasoning
+    /// stays true for every later agent, and therefore the two that carry a
+    /// reusable [`Model::ruled_out_claim`].
+    ///
+    /// `IncompleteSpecification` / `IncompleteStep` / `Suspect` are execution
+    /// failures: a re-run may well succeed, so replaying them would steer later
+    /// agents away from ground that was never actually cleared. `ValidFinding`
+    /// closes the direction too, but it is already replayed to downstream
+    /// agents as a canonical report finding.
+    pub fn rules_out_direction(&self) -> bool {
+        matches!(self, Self::ExpectedViolation | Self::OutOfScope)
+    }
 }
 
 impl fmt::Display for ReflectionResult {
@@ -93,6 +107,21 @@ pub struct Model {
     pub result: ReflectionResult,
     #[sea_orm(column_type = "Text")]
     pub reason: String,
+    /// Reusable statement of the project fact that makes assertions of this
+    /// shape not-a-bug. Deliberately split from `reason`: `reason` argues THIS
+    /// run's verdict (which functions were covered, what the trace did),
+    /// whereas this field is written for a *later* agent that never sees the
+    /// run — it states the fact alone, so the same ground is not re-argued.
+    /// Populated for the two verdicts that close a direction
+    /// (`ExpectedViolation` / `OutOfScope`); `None` for the rest.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub ruled_out_claim: Option<String>,
+    /// Where the claim can be re-checked, in whatever form this project
+    /// actually offers: a documentation line, a source comment, an
+    /// access-control modifier or `require`, a test that asserts the
+    /// behaviour. `None` when the grader found no anchor worth citing.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub ruled_out_evidence: Option<String>,
 
     #[sea_orm(belongs_to, from = "run_id", to = "id")]
     pub harness_run: HasOne<super::harness_run::Entity>,

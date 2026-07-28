@@ -108,10 +108,30 @@ pub struct GenSpecsSharedArgs {
 
     /// Minimum mapper-emitted match strength to consider. Links with
     /// strength below this tier are dropped before any other capping
-    /// is applied. Default `medium` skips `Low` matches (noise) but
-    /// keeps `High` + `Medium`. Set to `low` to consider every link;
-    /// `high` to be strict.
-    #[arg(long = "gen-specs-min-strength", value_enum, default_value_t = MinStrengthArg::Medium)]
+    /// is applied. Set to `medium` to also take `Medium` matches, or
+    /// `low` to consider every link.
+    ///
+    /// Defaults to `high` because it is the one knowledge-graph property
+    /// measured to predict whether a link yields anything. Over 5,838 links
+    /// with ground truth, `High` matches produced a canonical finding 17.2% of
+    /// the time against 10.9% for `Medium`. The advantage survives controlling
+    /// for queue position (High links are scheduled earlier, so the raw gap is
+    /// partly ordering): within the same quartile of a run it is 1.20x / 1.67x
+    /// / 1.99x over the first three quarters, reversing only in the last
+    /// quarter once the `High` pool is exhausted.
+    ///
+    /// Supply is not the binding constraint: on tare the `High` tier held 3,617
+    /// candidate links while a $400 run gets through ~550, so a budgeted run
+    /// stays in the most productive part of the tier and never reaches the
+    /// reversal. Raise the budget far enough to drain it and `medium` becomes
+    /// the better setting again.
+    ///
+    /// The other graph-side properties were measured and do NOT predict yield —
+    /// link strength above the `Medium` cutoff (0.99x / 1.15x), finding
+    /// out-degree (0.90–1.10x), and historical severity, which is mildly
+    /// inverted (`Low` 17.9% vs `High` 11.6%: the severest historical bugs are
+    /// the most project-specific, hence the least reproducible elsewhere).
+    #[arg(long = "gen-specs-min-strength", value_enum, default_value_t = MinStrengthArg::High)]
     pub gen_specs_min_strength: MinStrengthArg,
 
     /// Minimum global-linker-emitted link strength on the
@@ -138,6 +158,7 @@ impl GenSpecsSharedArgs {
         project_name: &str,
         language_prompt_prefix: String,
         link_source: LinkSource,
+        project_profile: Option<knowdit_repo_model::ProjectProfile>,
     ) -> SpecGenOptions {
         SpecGenOptions {
             max_agent_steps: self.gen_specs_max_agent_steps,
@@ -160,6 +181,7 @@ impl GenSpecsSharedArgs {
             min_link_strength: self.gen_specs_min_link_strength.into(),
             language_prompt_prefix,
             link_source,
+            project_profile,
         }
     }
 }
@@ -252,37 +274,24 @@ impl GenSpecsArgs {
         language_prompt_prefix: String,
         shared: &GenSpecsSharedArgs,
     ) -> Result<SpecGenOutcome> {
-        // Profile fetch verifies the upstream pipeline produced one.
-        repo.get_project_profile().await?.ok_or_else(|| {
+        // The profile is both a precondition (the upstream pipeline must have
+        // produced one) and an input: it goes into every link's system prompt.
+        let profile = repo.get_project_profile().await?.ok_or_else(|| {
             color_eyre::eyre::eyre!(
                 "Specification Generator requires a ProjectProfile; run `knowdit agentic \
                  profile` for project '{project_name}' first (or let `workflow streamloop` \
                  run the profile phase)."
             )
         })?;
-        let cache_key = shared
-            .gen_specs_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-spec", project_name));
-        let options = SpecGenOptions {
-            max_agent_steps: shared.gen_specs_max_agent_steps,
-            max_specs_per_link: shared.gen_specs_max_specs_per_link,
-            compact_context_threshold_tokens: shared.gen_specs_compact_context_threshold_tokens,
-            cache_key,
-            debug_prefix: shared.gen_specs_debug_prefix.clone(),
-            llm_settings: None,
-            max_links: (shared.gen_specs_max_links > 0).then_some(shared.gen_specs_max_links),
-            max_findings_per_historical: (shared.gen_specs_max_findings_per_historical > 0)
-                .then_some(shared.gen_specs_max_findings_per_historical),
-            max_links_per_extract: (shared.gen_specs_max_links_per_extract > 0)
-                .then_some(shared.gen_specs_max_links_per_extract),
-            concurrency: shared.gen_specs_concurrency.unwrap_or(1).max(1),
-            regenerate: shared.gen_specs_regenerate,
-            min_strength: shared.gen_specs_min_strength.into(),
-            min_link_strength: shared.gen_specs_min_link_strength.into(),
+        let mut options = shared.build_spec_options(
+            project_name,
             language_prompt_prefix,
-            link_source: LinkSource::Mapper,
-        };
+            LinkSource::Mapper,
+            Some(profile),
+        );
+        // The only knob this standalone path reads that the shared builder
+        // does not: streamloop drives concurrency from its own scheduler.
+        options.concurrency = shared.gen_specs_concurrency.unwrap_or(1).max(1);
         SpecificationGenerator::new().run(repo, llm, &options).await
     }
 }

@@ -266,37 +266,25 @@ impl MergeAgent {
     }
 
     /// Greedily pack the candidates into chunks whose rendered token cost
-    /// stays under `window_ratio × max_input` (minus a reserve for the system
-    /// prompt + the finding framing). Token counts come from the model's
-    /// tokenizer.
+    /// stays under `window_ratio × max_input`, reserving room for the system
+    /// prompt plus the finding framing that rides along in every chunk.
     fn pack_candidate_chunks(&self, input: &MergeInput) -> Vec<Vec<MergeCandidate>> {
-        let model = &self.llm.model;
-        let tok = |s: &str| model.config.count_tokens_lossy(s);
-        let budget = (model.config.max_input() as f64 * self.window_ratio) as usize;
         let finding_only = input.with_candidates(Vec::new());
-        let reserve = tok(super::prompt::MERGE_SYSTEM_TEMPLATE)
-            + serde_json::to_string(&finding_only)
-                .map(|s| tok(&s))
-                .unwrap_or(0)
+        let reserve = super::CandidateChunker::tokens_of(
+            &self.llm,
+            super::prompt::MERGE_SYSTEM_TEMPLATE,
+        ) + serde_json::to_string(&finding_only)
+            .map(|s| super::CandidateChunker::tokens_of(&self.llm, &s))
+            .unwrap_or(0)
             + 2048;
-        let cand_budget = budget.saturating_sub(reserve).max(1024);
+        super::CandidateChunker::new(&self.llm, self.window_ratio, reserve)
+            .chunk(&input.candidates)
+    }
 
-        let mut chunks: Vec<Vec<MergeCandidate>> = Vec::new();
-        let mut cur: Vec<MergeCandidate> = Vec::new();
-        let mut cur_tok = 0usize;
-        for cand in &input.candidates {
-            let cost = serde_json::to_string(cand).map(|s| tok(&s)).unwrap_or(64);
-            if !cur.is_empty() && cur_tok + cost > cand_budget {
-                chunks.push(std::mem::take(&mut cur));
-                cur_tok = 0;
-            }
-            cur.push(cand.clone());
-            cur_tok += cost;
-        }
-        if !cur.is_empty() {
-            chunks.push(cur);
-        }
-        chunks
+    /// The project graphs this agent loaded, so a sibling dedup agent built
+    /// for the same run reuses them instead of paying a second full load.
+    pub fn project_index(&self) -> &Arc<ProjectIndex> {
+        &self.project_index
     }
 }
 

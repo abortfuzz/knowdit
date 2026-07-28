@@ -7,11 +7,14 @@
 //! regen-feedback builders are exposed (`pub(super)`); their callers stay
 //! in `super`.
 
+use knowdit_kg::text::truncate_text;
 use knowdit_kg_model::ExtractedFunction;
 use knowdit_kg_model::audit_finding::FindingSeverity;
 use knowdit_repo_model::ProjectProfile;
 
-use super::{LinkInput, LinkSource, ProjectIndex, SpecRegenMode};
+use super::{
+    AuditStatusSummary, LinkInput, LinkSource, ProjectIndex, SpecRegenMode, StatusRenderCaps,
+};
 
 pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str) -> String {
     match mode {
@@ -53,7 +56,11 @@ pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str)
     }
 }
 
-pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> String {
+pub(super) fn build_system_prompt(
+    link: &LinkInput,
+    source: LinkSource,
+    profile: Option<&ProjectProfile>,
+) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let finding = &link.finding;
@@ -71,6 +78,28 @@ pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> Strin
             "## Reported finding (validate this specific issue)",
         ),
     };
+    // The profile is what the project says it is, written before any link ran.
+    // It is the only place the agent learns the project's declared boundaries —
+    // "no interest calculation, not an AMM" — which the code cannot state and
+    // which otherwise costs a whole pipeline to discover per link.
+    //
+    // The caveat is load-bearing: without it the "does NOT implement" list reads
+    // as permission to abandon, and gen-spec's abandon rate rises sharply from
+    // the very first link (measured on tare: 51% over the first 50 links against
+    // 36% for the same links without the profile).
+    let profile_block = match profile {
+        Some(p) => format!(
+            "\n{}\nThis describes what the project IS, to save you rediscovering it. It is a \
+             framing aid, NOT a scope filter: the \"does NOT implement\" list rules out whole \
+             product areas (an AMM curve in a project that has no AMM), never a defect class. \
+             Access control, accounting, rounding, reentrancy, and upgrade/migration bugs live \
+             in every project regardless of what it declines to be, and the historical finding \
+             you were given is a topic hint to explore — not a feature that must exist here \
+             verbatim. Never `finalize(status=\"abandoned\")` on the strength of this section.\n",
+            p.render_for_prompt()
+        ),
+        None => String::new(),
+    };
     format!(
         r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
 
@@ -79,6 +108,7 @@ pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> Strin
 {task_paragraph}
 
 You operate per-link. The link below stays in your system prompt for the entire run.
+{profile_block}
 
 ## Project DeFi semantic (extracted from the current project)
 - id: {extract_id}
@@ -202,6 +232,7 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
 - In `sequence`, use exact project contract/function names from the function anchors or `lookup_call_graph` results. If the runtime object is a proxy or module-composed wallet, name the concrete module function that actually appears in source, such as `ERC4337v07.executeUserOp`, `Calls.selfExecute`, `Hooks.fallback`, or `Implementation.updateImplementation`.
 - A committed spec must be *defensible*: you can name the project functions in its sequence and the state variables in its invariants. But it does NOT need to be a verbatim reproduction of the historical finding — `related to` is enough.
 "#,
+        profile_block = profile_block,
         extract_id = link.extract_id,
         extract_category = extract.category.as_str(),
         extract_name = extract.name,
@@ -231,37 +262,142 @@ fn format_severity(s: FindingSeverity) -> &'static str {
     }
 }
 
+/// Render the audit-status block the gen-spec prompt embeds — both what has
+/// been reported and what has been ruled out, under one shared budget.
+///
+/// Lives here rather than next to the struct so the wording, the per-field
+/// truncation, and the prompt that consumes them all stay in one file.
+impl AuditStatusSummary {
+    pub fn render(&self, caps: &StatusRenderCaps) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        out.push_str(
+            "# What this audit has already settled\n\n\
+             Other agents are working this project in parallel and have covered the ground below. \
+             This is here to point your search somewhere new — it is NOT a filter, and NOT an \
+             abandon criterion. Committing a spec never requires clearing anything with this \
+             list, and no entry below is grounds for `finalize(status=\"abandoned\")`; the strict \
+             criteria in your system prompt still govern that, unchanged. If everything you \
+             happened to look at first is covered here, that means you have not looked far \
+             enough yet — widen the search, do not give up on the link.\n",
+        );
+        self.render_reported(caps, &mut out);
+        self.render_ruled_out(caps, &mut out);
+        out
+    }
+
+    /// Bugs the report already contains. Under a cap the NEWEST are kept: a run
+    /// reports its coarsest findings early and its subtler ones late, and the
+    /// subtle ones are what an agent is most likely to re-derive.
+    fn render_reported(&self, caps: &StatusRenderCaps, out: &mut String) {
+        if self.reported.is_empty() {
+            return;
+        }
+        let skipped = self.reported.len().saturating_sub(caps.max_reported);
+        out.push_str("\n## Already reported — do NOT re-report these\n\n");
+        for f in &self.reported[skipped..] {
+            out.push_str(&format!(
+                "- [#{}] {}\n    where: {}.{}\n    root cause: {}\n",
+                f.id,
+                f.title.trim(),
+                f.primary_contract,
+                f.primary_function,
+                truncate_text(f.root_cause.trim(), caps.field_chars),
+            ));
+        }
+        if skipped > 0 {
+            out.push_str(&format!(
+                "- (+{skipped} older reported finding(s) not listed; the report already covers \
+                 more than what you see here)\n"
+            ));
+        }
+        out.push_str(
+            "\nA spec that restates one of these adds nothing to this audit, however real it is. \
+             Treat them as covered ground and prefer a DIFFERENT defect, even in the same contract \
+             or the same function — a function that already has one reported bug very often has \
+             others (a missing zero check and a missing equality check in one setter are two \
+             findings, not one). Only if you find nothing else at all should you fall back to \
+             `finalize(status=\"abandoned\")`, and then say which of these already covered what \
+             you saw.\n",
+        );
+    }
+
+    /// Directions a reviewer already investigated and closed. Under a cap the
+    /// most-repeated are kept, since those are the walls agents keep hitting.
+    fn render_ruled_out(&self, caps: &StatusRenderCaps, out: &mut String) {
+        if self.ruled_out.is_empty() {
+            return;
+        }
+        let shown = self.ruled_out.len().min(caps.max_ruled_out);
+        out.push_str("\n## Already ruled out — established facts about THIS project\n\n");
+        for c in &self.ruled_out[..shown] {
+            out.push_str(&format!(
+                "- {}\n",
+                truncate_text(c.claim.trim(), caps.field_chars)
+            ));
+            let evidence = c.evidence.trim();
+            if !evidence.is_empty() {
+                out.push_str(&format!(
+                    "    basis: {}\n",
+                    truncate_text(evidence, caps.field_chars)
+                ));
+            }
+        }
+        let skipped = self.ruled_out.len().saturating_sub(shown);
+        if skipped > 0 {
+            out.push_str(&format!(
+                "- (+{skipped} further conclusion(s) not listed, each covering fewer cases than \
+                 those above)\n"
+            ));
+        }
+        out.push_str(
+            "\nEach line is a fact about this project that a reviewer established with the full \
+             code in hand, after an agent spent a whole pipeline arguing the opposite. One spec — \
+             the spec whose ONLY claim to being a bug is the thing a line here contradicts — is \
+             not worth writing. Everything else still is.\n\
+             \n\
+             Read each line as narrowly as it is written, and only against the exact claim it \
+             makes. A trusted role being allowed to do X does not make the contract it operates \
+             on safe. An accepted token assumption does not close the accounting built on top of \
+             it. A documented migration procedure does not mean every function it touches is \
+             correct. The overwhelmingly common case is that a defect near one of these facts is \
+             NOT covered by it — a different missing check, a different caller reaching the same \
+             state, an ordering the fact never speaks to. Treat these as narrow carve-outs in a \
+             search space you should still be exploring, not as a map of where the bugs aren't.\n\
+             \n\
+             A line ending in `…` was shortened for space; its qualifying clause is missing, so \
+             read it as narrower than it appears, never broader.\n\
+             \n\
+             If you believe one of these facts is simply wrong, you need evidence from the code \
+             that the reviewer did not have — say so in the spec rather than restating the claim \
+             it already rejected.\n",
+        );
+    }
+}
+
 pub(super) fn build_user_prompt(
     link: &LinkInput,
     project_index: &ProjectIndex,
-    already_reported: &str,
+    status_summary: &str,
 ) -> String {
     let contract_count = project_index.call_graph.contracts.len();
     let interface_count = project_index.call_graph.interfaces.len();
     let extract_functions = render_extracted_functions(&link.extract.functions);
     // Peers working the same contract have no other way to know what has
-    // already been reported, and left blind they all converge on that
-    // contract's most salient defect — ~8.5 links per distinct bug on the
-    // metric-* baselines. This block is guidance, not a filter: it never
-    // forbids committing a spec, it only tells the agent which ground is
-    // already covered so its exploration lands somewhere new.
-    let already_reported_block = if already_reported.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n## Already reported in this audit — do NOT re-report these\n\n{already_reported}\n\
-             These bugs are already in the report. A spec that restates one of them adds nothing \
-             to this audit, however real it is. While you explore, treat them as covered ground: \
-             prefer a DIFFERENT defect, even in the same contract or the same function (a function \
-             that already has one reported bug very often has others — a missing zero check and a \
-             missing equality check in one setter are two findings, not one). Only if you find \
-             nothing else should you fall back to `finalize(status=\"abandoned\")` and say which of \
-             these already covered what you saw.\n"
-        )
+    // already been settled, and left blind they all converge on that contract's
+    // most salient defect (~8.5 links per distinct bug on the metric-*
+    // baselines) and re-argue the same rejections (73% of all verdicts on a
+    // full tare run). Guidance, not a filter: it never forbids committing a
+    // spec, it only says which ground is already covered.
+    let status_block = match status_summary.trim().is_empty() {
+        true => String::new(),
+        false => format!("\n{status_summary}\n"),
     };
     format!(
         r#"Explore the matched project semantic for any issue *related to* the historical finding in your system prompt, then commit AuditSpecification(s) for what you find.
-{already_reported_block}
+{status_block}
 
 Project static-analysis short-term memory: {contract_count} contract entr(ies), {interface_count} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.
 
@@ -279,7 +415,7 @@ Reason briefly out loud, then start issuing tool calls. Keep `finalize` for the 
 
 Link summary: extract_id={extract}, historical_id={historical}, finding_id={finding}.
 "#,
-        already_reported_block = already_reported_block,
+        status_block = status_block,
         contract_count = contract_count,
         interface_count = interface_count,
         extract_functions = extract_functions,
@@ -330,20 +466,7 @@ pub(super) fn novelty_system(profile: &ProjectProfile, language_prompt_prefix: &
         block.push_str(prefix);
         block.push_str("\n\n");
     }
-    block.push_str("## Project profile\n");
-    block.push_str(&format!(
-        "Domain summary: {}\n\n",
-        profile.domain_summary.trim()
-    ));
-    block.push_str("Subsystems:\n");
-    for s in &profile.subsystems {
-        block.push_str(&format!("- {} — {}\n", s.name, s.summary.trim()));
-    }
-    block.push_str("\nCore components:\n");
-    for c in &profile.core_components {
-        block.push_str(&format!("- {} ({}) — {}\n", c.name, c.path, c.role.trim()));
-    }
-    block.push('\n');
+    block.push_str(&profile.render_for_prompt());
     format!("{NOVELTY_PREAMBLE}\n\n{block}{NOVELTY_RUBRIC}")
 }
 
