@@ -37,6 +37,38 @@ pub struct ProjectIndex {
     pub state_var_ids_by_name: BTreeMap<String, Vec<i32>>,
 }
 
+/// Which part of the project a link agent's signature index should cover.
+///
+/// Named rather than passed as a pair of `Option`s because the two cases are
+/// decisions, not absent arguments: an agent reading everything on demand needs
+/// the whole map, and one holding part of the source in its prompt needs only
+/// the part it does not already have.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MemoryScope<'a> {
+    WholeProject,
+    Only {
+        contracts: &'a BTreeSet<i32>,
+        interfaces: &'a BTreeSet<i32>,
+    },
+}
+
+/// One contract or interface, rendered on its own, as a unit the resident-block
+/// packer can take or leave.
+#[derive(Debug, Clone)]
+pub(crate) struct ResidentCandidate {
+    pub(crate) id: i32,
+    pub(crate) is_interface: bool,
+    pub(crate) name: String,
+    /// Repo-relative path of the defining file. Matched against the profile's
+    /// core components in preference to the name, which can repeat across
+    /// files.
+    pub(crate) relative_file_path: String,
+    /// Calls made plus calls received; the packing priority. Interfaces score 0
+    /// — they declare rather than call, and are small enough to ride along.
+    pub(crate) degree: usize,
+    pub(crate) source: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FunctionOwner {
     pub(crate) relative_file_path: String,
@@ -515,9 +547,28 @@ impl ProjectIndex {
     /// in this index, holding state-var + function-signature indexes (bodies are
     /// fetched on demand via tools). Long-term memory is empty here — the link
     /// details live in the system prompt.
-    pub(crate) fn build_link_memory(&self) -> Result<AgentMemoryContext> {
+    /// The per-contract signature index an agent navigates by.
+    ///
+    /// The index is a map for finding bodies worth fetching, so under residency
+    /// it should cover exactly the gaps in the resident block — an entry for a
+    /// body already printed in the prompt is dead weight in every call of the
+    /// conversation. [`MemoryScope`] says which gaps.
+    pub(crate) fn build_link_memory(
+        &self,
+        scope: MemoryScope<'_>,
+    ) -> Result<AgentMemoryContext> {
+        let (only_contracts, only_interfaces) = match scope {
+            MemoryScope::WholeProject => (None, None),
+            MemoryScope::Only {
+                contracts,
+                interfaces,
+            } => (Some(contracts), Some(interfaces)),
+        };
         let mut short_term: BTreeMap<String, AgentMemoryContent> = BTreeMap::new();
         for contract in self.call_graph.contracts.values() {
+            if only_contracts.is_some_and(|ids| !ids.contains(&contract.id)) {
+                continue;
+            }
             let title = format!(
                 "{}:{}:{}:{}",
                 contract.relative_file_path.display(),
@@ -543,6 +594,9 @@ impl ProjectIndex {
             );
         }
         for interface in self.call_graph.interfaces.values() {
+            if only_interfaces.is_some_and(|ids| !ids.contains(&interface.id)) {
+                continue;
+            }
             let title = format!(
                 "{}:{}:{}:{}",
                 interface.relative_file_path.display(),
@@ -572,6 +626,98 @@ impl ProjectIndex {
             long_term: BTreeMap::new(),
             short_term,
         }))
+    }
+
+    /// Append one contract's source in the form every consumer expects: a
+    /// `## contract` header naming the KG identity, then the raw body in a
+    /// fenced block. Shared by the `read_contract_source` tool and by
+    /// [`Self::resident_candidates`], so an agent that reads source on demand
+    /// and an agent that gets it resident in its prompt see byte-identical
+    /// text.
+    pub(crate) fn push_contract_source(&self, out: &mut String, contract: &Contract) {
+        out.push_str(&format!(
+            "## contract `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
+            contract.name,
+            contract.relative_file_path.display(),
+            contract.id,
+            contract.chunk.content.trim_end(),
+        ));
+    }
+
+    /// Interface counterpart of [`Self::push_contract_source`].
+    pub(crate) fn push_interface_source(&self, out: &mut String, interface: &Interface) {
+        out.push_str(&format!(
+            "## interface `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
+            interface.name,
+            interface.relative_file_path.display(),
+            interface.id,
+            interface.chunk.content.trim_end(),
+        ));
+    }
+
+    /// The project's own contracts and interfaces, each rendered on its own, in
+    /// the order a resident block should try to fit them.
+    ///
+    /// Vendored and non-production trees are dropped. The call graph carries
+    /// them — it has to, since resolving an inherited or imported symbol needs
+    /// the dependency's source — but they can outweigh the project's own code:
+    /// on a mid-sized Foundry project the vendored trees were 45% of the text,
+    /// and dropping them halved the resident block. Since that block is re-read
+    /// on every call of every link, carrying a dependency tree in it is the most
+    /// expensive thing an agent never reads. The source tools reach those trees
+    /// instead.
+    ///
+    /// Each candidate carries its call-graph degree and its path; the packing
+    /// order is
+    /// [`crate::source_access::ProjectSourceAccess::resolve`]'s decision, since
+    /// that is where the budget lives.
+    pub(crate) fn resident_candidates(&self) -> Vec<ResidentCandidate> {
+        // Degree per owning contract: every call is counted once for the caller
+        // and once for the callee, so a hub scores on both sides.
+        let mut degree: BTreeMap<i32, usize> = BTreeMap::new();
+        for contract in self.call_graph.contracts.values() {
+            for function in &contract.functions {
+                *degree.entry(contract.id).or_default() += function.calls.len();
+                for call in &function.calls {
+                    if let Some(owner) = self.function_owner.get(&call.to_id) {
+                        *degree.entry(owner.container_id).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<ResidentCandidate> = Vec::new();
+        for contract in self.call_graph.contracts.values() {
+            if knowdit_project::ProjectScope::is_vendored_path(&contract.relative_file_path) {
+                continue;
+            }
+            let mut source = String::new();
+            self.push_contract_source(&mut source, contract);
+            out.push(ResidentCandidate {
+                id: contract.id,
+                is_interface: false,
+                name: contract.name.clone(),
+                relative_file_path: contract.relative_file_path.display().to_string(),
+                degree: degree.get(&contract.id).copied().unwrap_or_default(),
+                source,
+            });
+        }
+        for interface in self.call_graph.interfaces.values() {
+            if knowdit_project::ProjectScope::is_vendored_path(&interface.relative_file_path) {
+                continue;
+            }
+            let mut source = String::new();
+            self.push_interface_source(&mut source, interface);
+            out.push(ResidentCandidate {
+                id: interface.id,
+                is_interface: true,
+                name: interface.name.clone(),
+                relative_file_path: interface.relative_file_path.display().to_string(),
+                degree: 0,
+                source,
+            });
+        }
+        out
     }
 
     fn render_contract_memory(&self, contract: &Contract) -> String {

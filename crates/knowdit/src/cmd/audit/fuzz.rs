@@ -66,7 +66,6 @@ impl FuzzArgs {
             .await?;
         let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
             repo_root: spec.root.clone(),
-            default_cache_key: format!("{}-knowdit-fuzz", spec.name),
             max_specs: self.shared.fuzz_max_specs,
             concurrency: self.shared.fuzz_concurrency.unwrap_or(1).max(1),
             regenerate: self.shared.fuzz_regenerate,

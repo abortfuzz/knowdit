@@ -22,14 +22,8 @@ use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 /// and `workflow autoloop` (in-process).
 #[derive(Args, Clone, Debug)]
 pub struct ProfileSharedArgs {
-    /// `llmy` cache key prefix. Defaults to
-    /// `{project_name}-knowdit-profile` when omitted so different
-    /// projects don't share a server-side prompt-cache namespace.
-    #[arg(long = "profile-cache-key")]
-    pub profile_cache_key: Option<String>,
-
     /// Debug-prefix forwarded to llmy for LLM-call dumps.
-    #[arg(long = "profile-debug-prefix")]
+    #[arg(long = "profile-debug-prefix", default_value = "profile")]
     pub profile_debug_prefix: Option<String>,
 
     /// Maximum agent steps per profile-gen pass before forced finalize.
@@ -75,7 +69,7 @@ impl ProfileArgs {
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
-        let profile = Self::profile(&repo, llm, &spec.name, &spec.root, &self.shared).await?;
+        let profile = Self::profile(&repo, llm, &spec.root, &self.shared).await?;
         println!(
             "Profile ready: {} subsystem(s), {} core component(s), {} source file(s) read; out_of_scope: {}",
             profile.subsystems.len(),
@@ -92,16 +86,10 @@ impl ProfileArgs {
     pub async fn profile(
         repo: &RepoDatabase,
         llm: &LLM,
-        project_name: &str,
         repo_root: &Path,
         shared: &ProfileSharedArgs,
     ) -> Result<ProjectProfile> {
-        let cache_key = shared
-            .profile_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-profile", project_name));
         let options = ProfileOptions {
-            cache_key,
             debug_prefix: shared.profile_debug_prefix.clone(),
             llm_settings: None,
             max_agent_steps: shared.profile_max_agent_steps,

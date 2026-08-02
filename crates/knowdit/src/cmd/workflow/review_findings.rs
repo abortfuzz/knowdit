@@ -57,11 +57,6 @@ pub struct ReviewFindingsSharedArgs {
     #[arg(long = "scope-file")]
     pub scope_file: Option<PathBuf>,
 
-    /// `llmy` cache-key prefix for the three report agents. Defaults to
-    /// `{project_name}-knowdit-review`.
-    #[arg(long = "review-cache-key")]
-    pub review_cache_key: Option<String>,
-
     /// Max agent steps per Review / Merge / Writer agent call.
     #[arg(long = "review-max-agent-steps", default_value_t = 40)]
     pub review_max_agent_steps: usize,
@@ -80,15 +75,10 @@ pub struct ReviewFindingsSharedArgs {
 }
 
 impl ReviewFindingsSharedArgs {
-    pub(crate) fn grader_options(&self, project_name: &str) -> GraderOptions {
+    pub(crate) fn grader_options(&self) -> GraderOptions {
         GraderOptions {
             max_agent_steps: self.review_max_agent_steps,
-            compact_context_threshold_tokens: None,
-            cache_key: self
-                .review_cache_key
-                .clone()
-                .unwrap_or_else(|| format!("{project_name}-knowdit-review")),
-            debug_prefix: None,
+            debug_prefix: Some("review".to_string()),
             llm_settings: None,
         }
     }
@@ -135,7 +125,7 @@ impl ReviewFindingsArgs {
         }
 
         let scope_override = resolve_scope_override(self.shared.scope_file.as_deref())?;
-        let options = self.shared.grader_options(&spec.name);
+        let options = self.shared.grader_options();
         let run = ReviewFindingsRun {
             repo,
             llm: llm.clone(),
@@ -556,11 +546,7 @@ impl ReportContext {
                 .commit_ruled_out_merge(rejection.reflection_id, decision)
                 .await?;
             self.stats.ruled_out_placed += 1;
-            match self
-                .conclusions
-                .iter_mut()
-                .find(|c| c.id == representative)
-            {
+            match self.conclusions.iter_mut().find(|c| c.id == representative) {
                 Some(existing) => existing.occurrences += 1,
                 None => self.conclusions.push(RuledOutConclusion {
                     id: representative,

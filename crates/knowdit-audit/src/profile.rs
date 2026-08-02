@@ -42,8 +42,6 @@ use tokio::sync::Mutex;
 /// knobs come from clap-derive in the CLI layer.
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
-    /// `llmy` cache key prefix for this run.
-    pub cache_key: String,
     /// Optional debug-prefix passed to llmy for request dumps.
     pub debug_prefix: Option<String>,
     /// Optional per-call llmy settings.
@@ -114,9 +112,8 @@ impl ProjectProfileGenerator {
              {max_files_read} read_file invocations."
         );
 
-        let cache_key = self.options.cache_key.clone();
         let debug_prefix = self.options.debug_prefix.clone();
-        let mut agent = Agent::new(system_prompt, tools, cache_key);
+        let mut agent = Agent::new(system_prompt, tools, None);
 
         let mut step = agent
             .step_with_user(
@@ -420,10 +417,21 @@ Rules for each field:
                      operation, anyone with EXECUTOR_ROLE can run it after the delay"
       Bad summary:  "handles timelock stuff"
 
-  - core_components (3-12 entries): main contracts in scope. Each entry:
-      {{name: ContractName, path: src/..., role: "1-sentence purpose"}}
-    Used by mapper to point at "where in the project this mechanism lives" when justifying a
-    High match.
+  - core_components (3-12 entries): the contracts that carry this project's own business
+    logic — the ones that get deployed and hold state or move value. Each entry:
+      {{name: ContractName, path: contracts/Foo.sol, role: "1-sentence purpose"}}
+      name: the contract identifier exactly as declared in the source.
+      path: the repo-relative path of the file that DECLARES it, exactly as you saw it via
+            read_file / find_file. Not a directory, not a guess, not an import string.
+    **List them most-central first** — entry 1 should be the contract you would read first to
+    understand what this project does.
+    Include: deployed contracts holding state, moving funds, or enforcing access.
+    Exclude: interfaces, libraries, abstract bases with no logic of their own, test doubles,
+    deploy scripts, and anything vendored under lib/ or node_modules/.
+    Two consumers: the mapper points at "where in the project this mechanism lives" when
+    justifying a High match, and the audit agents keep these contracts' full source in their
+    prompt when the budget only covers part of the project — so a wrong or missing entry here
+    costs an agent the source it most needs.
 
   - out_of_scope_notes: subdomains the project explicitly does NOT touch, written as free prose
     (NOT a list). This is often more useful than the scope itself for downstream matching.

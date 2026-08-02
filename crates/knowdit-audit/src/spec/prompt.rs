@@ -16,6 +16,44 @@ use super::{
     AuditStatusSummary, LinkInput, LinkSource, ProjectIndex, SpecRegenMode, StatusRenderCaps,
 };
 
+/// Frame the resident project source as the opening section of the gen-spec
+/// system prompt.
+///
+/// Placed ahead of every other section because it is identical for every link
+/// in the run, and because the sections below it keep their existing order —
+/// the source is added, nothing is rearranged.
+///
+/// `omitted` names the project contracts that did not fit the budget. Naming
+/// them is load-bearing: an agent that reads this section as the complete
+/// project will conclude a missing contract does not exist rather than fetching
+/// it, and abandon the link on that basis.
+pub(super) fn build_resident_source_block(source: &str, omitted: &[String]) -> String {
+    let scope = match omitted.is_empty() {
+        true => "Every contract and interface the project defines is here, whole bodies, nothing \
+                 elided."
+            .to_string(),
+        false => format!(
+            "Most of the project is here, whole bodies, nothing elided — but {} of its contracts \
+             did not fit and are NOT below: {}. Those still exist; fetch them with \
+             `read_contract_source` / `read_function_source`, and your signature-index memory \
+             covers them.",
+            omitted.len(),
+            omitted.join(", "),
+        ),
+    };
+    format!(
+        "# Project source\n\n\
+         {scope}\n\n\
+         Also NOT below: vendored dependencies (OpenZeppelin and friends), tests, scripts and \
+         deploy code. `read_contract_source` / `read_function_source` reach those too — use them \
+         for a dependency whose exact behaviour your reasoning turns on, not for anything already \
+         printed below. Use `lookup_call_graph` / `lookup_state_variable_xrefs` as before for \
+         relations the source does not spell out.\n\n\
+         {source}\n\
+         # End of project source\n\n"
+    )
+}
+
 pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str) -> String {
     match mode {
         SpecRegenMode::Patch(prior_spec) => {
@@ -56,19 +94,13 @@ pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str)
     }
 }
 
-pub(super) fn build_system_prompt(
-    link: &LinkInput,
-    source: LinkSource,
-    profile: Option<&ProjectProfile>,
-) -> String {
-    let extract = &link.extract;
-    let historical = &link.historical;
-    let finding = &link.finding;
-    let extract_functions = render_extracted_functions(&extract.functions);
-    // The task framing + finding-section header depend on where the finding came
-    // from: a Knowledge Mapper topic hint (explore for related issues) vs an
-    // externally-reported finding (validate this specific issue).
-    let (task_paragraph, finding_header) = match source {
+/// Task framing and finding-section header for one link source: a Knowledge
+/// Mapper topic hint (explore for related issues) vs an externally-reported
+/// finding (validate this specific issue). The two halves land in different
+/// messages — the framing in the system prompt, the header on the link block —
+/// so they are produced together to stay in step.
+fn link_framing(source: LinkSource) -> (&'static str, &'static str) {
+    match source {
         LinkSource::Mapper => (
             "You are given a `(project_semantic, historical_semantic, historical_finding)` link from the Knowledge Mapper. The historical finding is a *topic hint* drawn from another project — it likely will not fit the current project verbatim. **Your task is to use the historical finding as a starting point to look for any plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the historical finding (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.",
             "## Historical finding (use as topic hint, not strict template)",
@@ -77,7 +109,19 @@ pub(super) fn build_system_prompt(
             "The finding below was **reported against this exact project** (e.g. by an external audit) and localized to the project semantic below. **Your task is to emit `AuditSpecification`(s) that reproduce this specific reported issue on the current code**, encoding its reported impact as the post_attack invariant. This is a concrete claim to validate — NOT a topic hint to generalize from: stay faithful to the reported root cause and the named target functions. If, after reading the code, the issue genuinely cannot occur, `abandoned` with the reason is the correct outcome (it documents that the report does not reproduce).",
             "## Reported finding (validate this specific issue)",
         ),
-    };
+    }
+}
+
+/// The run-invariant half of the gen-spec prompt: role, task framing, project
+/// profile, and the whole methodology.
+///
+/// Deliberately carries nothing that varies per link — that lives in
+/// [`build_link_prompt`], which arrives as a conversation message instead. The
+/// split is what makes the tool definitions plus this entire prompt one stable
+/// prefix that every link in the run shares, so it is written to the model's
+/// prompt cache once rather than re-sent at full price for each of them.
+pub(super) fn build_system_prompt(source: LinkSource, profile: Option<&ProjectProfile>) -> String {
+    let (task_paragraph, _) = link_framing(source);
     // The profile is what the project says it is, written before any link ran.
     // It is the only place the agent learns the project's declared boundaries —
     // "no interest calculation, not an AMM" — which the code cannot state and
@@ -107,35 +151,8 @@ pub(super) fn build_system_prompt(
 
 {task_paragraph}
 
-You operate per-link. The link below stays in your system prompt for the entire run.
+You operate per-link. Everything in this system prompt is identical for every link in the run; the link you are actually working — the project semantic, the historical semantic it matched, and the historical finding — arrives in the messages below, together with what this audit has already settled.
 {profile_block}
-
-## Project DeFi semantic (extracted from the current project)
-- id: {extract_id}
-- category: {extract_category}
-- name: {extract_name}
-- definition: {extract_definition}
-- description: {extract_description}
-
-### Project semantic function anchors (real names from this project)
-Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
-{extract_functions}
-
-## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
-- id: {historical_id}
-- category: {historical_category}
-- name: {historical_name}
-- definition: {historical_definition}
-- description: {historical_description}
-
-{finding_header}
-- id: {finding_id}
-- title: {finding_title}
-- severity: {finding_severity}
-- root cause: {finding_root_cause}
-- description: {finding_description}
-- vulnerability patterns: {finding_patterns}
-- known exploits: {finding_exploits}
 
 # Audit-specification model
 
@@ -233,24 +250,6 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
 - A committed spec must be *defensible*: you can name the project functions in its sequence and the state variables in its invariants. But it does NOT need to be a verbatim reproduction of the historical finding — `related to` is enough.
 "#,
         profile_block = profile_block,
-        extract_id = link.extract_id,
-        extract_category = extract.category.as_str(),
-        extract_name = extract.name,
-        extract_definition = extract.definition.trim(),
-        extract_description = extract.description.trim(),
-        extract_functions = extract_functions,
-        historical_id = link.historical_id,
-        historical_category = historical.category.as_str(),
-        historical_name = historical.name,
-        historical_definition = historical.definition.trim(),
-        historical_description = link.historical_rendered_description.trim(),
-        finding_id = link.finding_id,
-        finding_title = finding.title,
-        finding_severity = format_severity(finding.severity),
-        finding_root_cause = finding.root_cause.trim(),
-        finding_description = link.finding_rendered_description.trim(),
-        finding_patterns = link.finding_rendered_patterns.trim(),
-        finding_exploits = link.finding_rendered_exploits.trim(),
     )
 }
 
@@ -377,51 +376,133 @@ impl AuditStatusSummary {
     }
 }
 
-pub(super) fn build_user_prompt(
+/// What the run has already settled, as its own conversation message.
+///
+/// Peers working the same contract have no other way to know what has already
+/// been covered, and left blind they all converge on that contract's most
+/// salient defect (~8.5 links per distinct bug on the metric-* baselines) and
+/// re-argue the same rejections (73% of all verdicts on a full tare run).
+/// Guidance, not a filter: it never forbids committing a spec, it only says
+/// which ground is already covered.
+///
+/// Separate from [`build_link_prompt`] because it changes on a different clock:
+/// the same summary is shared by every link scheduled against one snapshot,
+/// while the link block differs for all of them.
+pub(super) fn build_status_prompt(status_summary: &str) -> String {
+    match status_summary.trim().is_empty() {
+        true => "# What this audit has already settled\n\nNothing yet — you are early in the run, so no ground has been covered by a peer.\n".to_string(),
+        false => format!("{}\n", status_summary.trim_end()),
+    }
+}
+
+/// The per-link half of the gen-spec prompt: which link to work, and where to
+/// start. Sent as a conversation message rather than as part of the system
+/// prompt so that everything ahead of it — the tool definitions and the whole
+/// of [`build_system_prompt`] — stays byte-identical across the run.
+///
+/// `resident_source` selects the opening moves: with the project source in the
+/// system prompt there is no signature-index memory and no source-reading tools
+/// to suggest, so pointing at them would send the agent after tools it does not
+/// have.
+pub(super) fn build_link_prompt(
     link: &LinkInput,
+    source: LinkSource,
     project_index: &ProjectIndex,
-    status_summary: &str,
+    resident_source: bool,
+    extension: Option<&str>,
 ) -> String {
-    let contract_count = project_index.call_graph.contracts.len();
-    let interface_count = project_index.call_graph.interfaces.len();
-    let extract_functions = render_extracted_functions(&link.extract.functions);
-    // Peers working the same contract have no other way to know what has
-    // already been settled, and left blind they all converge on that contract's
-    // most salient defect (~8.5 links per distinct bug on the metric-*
-    // baselines) and re-argue the same rejections (73% of all verdicts on a
-    // full tare run). Guidance, not a filter: it never forbids committing a
-    // spec, it only says which ground is already covered.
-    let status_block = match status_summary.trim().is_empty() {
+    let extract = &link.extract;
+    let historical = &link.historical;
+    let finding = &link.finding;
+    let (_, finding_header) = link_framing(source);
+    let extract_functions = render_extracted_functions(&extract.functions);
+    let first_moves = match resident_source {
+        true => {
+            "1. Find the contracts named in \"Project semantic function anchors\" in the project source at the top of your system prompt, and read the bodies that belong to this semantic. If one of them is listed there as not fitting, fetch it with `read_contract_source`.\n\
+                 2. Follow `lookup_call_graph` edges and `lookup_state_variable_xrefs` to surface every function in or near the semantic that could share the historical finding's failure mode (same root-cause family, same kind of state corruption, same exploit class) — those relations are not spelled out by the source itself.\n\
+                 3. Commit one spec per plausibly-related issue you find. The spec only needs to be *related to* the historical finding, not a verbatim reproduction."
+        }
+        false => {
+            "1. `list_memories` to see what's available.\n\
+                  2. `read_memory` on the contracts listed in \"Project semantic function anchors\" — that is your anchor.\n\
+                  3. From there, follow `lookup_call_graph` edges and `lookup_state_variable_xrefs` to surface every function in or near the semantic that could share the historical finding's failure mode (same root-cause family, same kind of state corruption, same exploit class).\n\
+                  4. `read_function_source(contract, function)` for the bodies you actually need to reason about. Avoid loading the same big file twice — the signature index already tells you what each function calls.\n\
+                  5. Commit one spec per plausibly-related issue you find. The spec only needs to be *related to* the historical finding, not a verbatim reproduction."
+        }
+    };
+    let index_block = match resident_source {
         true => String::new(),
-        false => format!("\n{status_summary}\n"),
+        false => format!(
+            "\nProject static-analysis short-term memory: {} contract entr(ies), {} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.\n",
+            project_index.call_graph.contracts.len(),
+            project_index.call_graph.interfaces.len(),
+        ),
+    };
+    let extension_block = match extension {
+        Some(text) => format!("\n{text}\n"),
+        None => String::new(),
     };
     format!(
-        r#"Explore the matched project semantic for any issue *related to* the historical finding in your system prompt, then commit AuditSpecification(s) for what you find.
-{status_block}
+        r#"# Your link
 
-Project static-analysis short-term memory: {contract_count} contract entr(ies), {interface_count} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.
+Explore the matched project semantic for any issue *related to* the historical finding below, then commit AuditSpecification(s) for what you find.
 
-Matched semantic function anchors:
+## Project DeFi semantic (extracted from the current project)
+- id: {extract_id}
+- category: {extract_category}
+- name: {extract_name}
+- definition: {extract_definition}
+- description: {extract_description}
+
+### Project semantic function anchors (real names from this project)
+Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
 {extract_functions}
 
+## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
+- id: {historical_id}
+- category: {historical_category}
+- name: {historical_name}
+- definition: {historical_definition}
+- description: {historical_description}
+
+{finding_header}
+- id: {finding_id}
+- title: {finding_title}
+- severity: {finding_severity}
+- root cause: {finding_root_cause}
+- description: {finding_description}
+- vulnerability patterns: {finding_patterns}
+- known exploits: {finding_exploits}
+{index_block}{extension_block}
 Suggested first moves:
-1. `list_memories` to see what's available.
-2. `read_memory` on the contracts listed in "Matched semantic function anchors" — that is your anchor.
-3. From there, follow `lookup_call_graph` edges and `lookup_state_variable_xrefs` to surface every function in or near the semantic that could share the historical finding's failure mode (same root-cause family, same kind of state corruption, same exploit class).
-4. `read_function_source(contract, function)` for the bodies you actually need to reason about. Avoid loading the same big file twice — the signature index already tells you what each function calls.
-5. Commit one spec per plausibly-related issue you find. The spec only needs to be *related to* the historical finding, not a verbatim reproduction.
+{first_moves}
 
 Reason briefly out loud, then start issuing tool calls. Keep `finalize` for the very end. Per the system prompt, abandoning requires showing which functions you read and why the finding has no related issue here.
 
-Link summary: extract_id={extract}, historical_id={historical}, finding_id={finding}.
+Link summary: extract_id={extract_id}, historical_id={historical_id}, finding_id={finding_id}.
 "#,
-        status_block = status_block,
-        contract_count = contract_count,
-        interface_count = interface_count,
+        extract_id = link.extract_id,
+        extract_category = extract.category.as_str(),
+        extract_name = extract.name,
+        extract_definition = extract.definition.trim(),
+        extract_description = extract.description.trim(),
         extract_functions = extract_functions,
-        extract = link.extract_id,
-        historical = link.historical_id,
-        finding = link.finding_id,
+        historical_id = link.historical_id,
+        historical_category = historical.category.as_str(),
+        historical_name = historical.name,
+        historical_definition = historical.definition.trim(),
+        historical_description = link.historical_rendered_description.trim(),
+        finding_header = finding_header,
+        finding_id = link.finding_id,
+        finding_title = finding.title,
+        finding_severity = format_severity(finding.severity),
+        finding_root_cause = finding.root_cause.trim(),
+        finding_description = link.finding_rendered_description.trim(),
+        finding_patterns = link.finding_rendered_patterns.trim(),
+        finding_exploits = link.finding_rendered_exploits.trim(),
+        index_block = index_block,
+        extension_block = extension_block,
+        first_moves = first_moves,
     )
 }
 

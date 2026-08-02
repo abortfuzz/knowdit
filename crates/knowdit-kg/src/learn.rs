@@ -448,28 +448,12 @@ impl ProjectData {
         None
     }
 
-    fn prompt_cache_key(&self) -> String {
+    fn id_slug(&self) -> String {
         sanitize_prompt_prefix(&self.display_id())
     }
 
     fn debug_key(&self, stage: &str) -> String {
-        format!(
-            "{}-{}",
-            sanitize_prompt_prefix(stage),
-            self.prompt_cache_key()
-        )
-    }
-
-    fn merge_cache_key(&self) -> String {
-        format!("{}-merge", self.prompt_cache_key())
-    }
-
-    fn finding_cache_key(&self) -> String {
-        format!("{}-finding", self.prompt_cache_key())
-    }
-
-    fn finding_merge_cache_key(&self) -> String {
-        format!("{}-finding-merge", self.prompt_cache_key())
+        format!("{}-{}", sanitize_prompt_prefix(stage), self.id_slug())
     }
 
     // ── Private pipeline steps ──────────────────────────────────────
@@ -485,7 +469,6 @@ impl ProjectData {
         let started_at = Instant::now();
         let model = &llm.model;
         let user_suffix = prompts::CATEGORIZE_USER_SUFFIX;
-        let cache_key = sanitize_prompt_prefix(&self.display_id());
         let sys_tokens = model
             .config
             .count_tokens_lossy(prompts::GENERAL_ROLE_SYSTEM);
@@ -520,7 +503,6 @@ impl ProjectData {
             options: local_options,
             system_prompt: prompts::GENERAL_ROLE_SYSTEM.to_string(),
             user_prompt,
-            cache_key,
             label,
         };
         let record = runner.run().await?;
@@ -548,7 +530,6 @@ impl ProjectData {
         let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
         let model = &llm.model;
         let debug_key = self.debug_key("extract");
-        let cache_key_root = self.prompt_cache_key();
         let sys_tokens = model.config.count_tokens_lossy(system_prompt);
         let total_budget = get_context_budget(model, agent_options.context_window_utilization);
         let user_suffix = prompts::extract_semantics_user_suffix(categories);
@@ -586,7 +567,6 @@ impl ProjectData {
                 options: local_options,
                 system_prompt: system_prompt.to_string(),
                 user_prompt,
-                cache_key: format!("{}-chunk{}", cache_key_root, chunk_idx),
                 label: chunk_label,
             };
             let chunk_semantics = extractor.run().await?;
@@ -620,14 +600,13 @@ impl ProjectData {
             prompts::in_project_link_user_message(categories, &semantics_block, &findings_block);
 
         let debug_key = self.debug_key("in-project-link");
-        let cache_key = format!("{}-in-project-link", self.prompt_cache_key());
 
         let parsed: InProjectLinkResponse = llm
             .prompt_json_with_retry(
                 prompts::GENERAL_ROLE_SYSTEM,
                 &user_msg,
                 Some(&debug_key),
-                Some(&cache_key),
+                None,
                 None,
             )
             .await?;
@@ -695,7 +674,6 @@ impl ProjectData {
         let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
         let model = &llm.model;
         let debug_key = self.debug_key("finding-extract");
-        let cache_key_root = self.finding_cache_key();
         let sys_tokens = model.config.count_tokens_lossy(system_prompt);
         let total_budget = get_context_budget(model, agent_options.context_window_utilization);
         let user_suffix = prompts::extract_findings_user_suffix(categories);
@@ -729,7 +707,6 @@ impl ProjectData {
                 options: local_options,
                 system_prompt: system_prompt.to_string(),
                 user_prompt,
-                cache_key: format!("{}-chunk{}", cache_key_root, chunk_idx),
                 label: chunk_label,
             };
             let raw_findings = extractor.run().await?;
@@ -864,7 +841,6 @@ impl ProjectData {
             llm: llm.clone(),
             agent_options: agent_options.clone(),
             chunking: merge_chunking,
-            cache_key_root: self.merge_cache_key(),
             debug_key_root: self.debug_key("merge"),
             label_root: format!("semantic-merge-{}", self.display_id()),
         };
@@ -934,7 +910,6 @@ impl ProjectData {
             llm: llm.clone(),
             agent_options: agent_options.clone(),
             chunking: merge_chunking,
-            cache_key_root: self.finding_merge_cache_key(),
             debug_key_root: self.debug_key("finding-merge"),
             label_root: format!("finding-merge-{}", self.display_id()),
         };

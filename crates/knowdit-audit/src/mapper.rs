@@ -67,8 +67,6 @@ pub struct MapperOptions {
     /// workers (async-channel + `JoinSet`, the same idiom as the fuzz
     /// runtime). `1` keeps the old strictly-sequential behaviour.
     pub concurrency: usize,
-    /// Optional `llmy` cache key prefix.
-    pub cache_key: Option<String>,
     /// Pre-rendered Markdown block describing the project's
     /// source language; verbatim-prepended to the mapper's
     /// system prompt. See [`crate::profile::ProfileOptions::language_prompt_prefix`]
@@ -92,7 +90,6 @@ impl Default for MapperOptions {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
             concurrency: 1,
-            cache_key: Some("knowdit-mapper".to_string()),
             language_prompt_prefix: String::new(),
             extra_categories: Vec::new(),
             max_rendered_raw_children: DEFAULT_MAX_RENDERED_RAW_CHILDREN,
@@ -428,7 +425,6 @@ async fn batch_match(
     let extracted_block = Arc::new(render_extracted_block(extracts));
     let system_prompt = Arc::new(system_prompt.to_string());
     let valid_extract_ids = Arc::new(valid_extract_ids.clone());
-    let cache_key = options.cache_key.clone();
     let label_prefix = Arc::new(label_prefix.to_string());
 
     type Batch = Vec<CanonicalWithChildren<semantic_node::Model>>;
@@ -447,7 +443,6 @@ async fn batch_match(
         let extracted_block = extracted_block.clone();
         let system_prompt = system_prompt.clone();
         let valid_extract_ids = valid_extract_ids.clone();
-        let cache_key = cache_key.clone();
         let label_prefix = label_prefix.clone();
         workers.spawn(async move {
             while let Ok((batch_idx, batch)) = rx.recv().await {
@@ -459,7 +454,6 @@ async fn batch_match(
                 );
                 let res = run_one_batch(
                     &llm,
-                    cache_key.as_deref(),
                     &system_prompt,
                     &extracted_block,
                     &valid_extract_ids,
@@ -524,7 +518,6 @@ async fn batch_match(
 /// [`SemanticMatch`] rows; an `Err` aborts the whole mapping pass.
 async fn run_one_batch(
     llm: &LLM,
-    cache_key: Option<&str>,
     system_prompt: &str,
     extracted_block: &str,
     valid_extract_ids: &BTreeSet<i32>,
@@ -535,7 +528,7 @@ async fn run_one_batch(
     let user_prompt = build_user_prompt(extracted_block, batch, max_rendered_raw_children);
 
     let response: MatchResponse = llm
-        .prompt_json_with_retry(system_prompt, &user_prompt, None, cache_key, None)
+        .prompt_json_with_retry(system_prompt, &user_prompt, Some("mapper"), None, None)
         .await?;
 
     let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();

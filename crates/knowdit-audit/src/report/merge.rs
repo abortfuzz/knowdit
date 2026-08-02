@@ -270,15 +270,13 @@ impl MergeAgent {
     /// prompt plus the finding framing that rides along in every chunk.
     fn pack_candidate_chunks(&self, input: &MergeInput) -> Vec<Vec<MergeCandidate>> {
         let finding_only = input.with_candidates(Vec::new());
-        let reserve = super::CandidateChunker::tokens_of(
-            &self.llm,
-            super::prompt::MERGE_SYSTEM_TEMPLATE,
-        ) + serde_json::to_string(&finding_only)
-            .map(|s| super::CandidateChunker::tokens_of(&self.llm, &s))
-            .unwrap_or(0)
-            + 2048;
-        super::CandidateChunker::new(&self.llm, self.window_ratio, reserve)
-            .chunk(&input.candidates)
+        let reserve =
+            super::CandidateChunker::tokens_of(&self.llm, super::prompt::MERGE_SYSTEM_TEMPLATE)
+                + serde_json::to_string(&finding_only)
+                    .map(|s| super::CandidateChunker::tokens_of(&self.llm, &s))
+                    .unwrap_or(0)
+                + 2048;
+        super::CandidateChunker::new(&self.llm, self.window_ratio, reserve).chunk(&input.candidates)
     }
 
     /// The project graphs this agent loaded, so a sibling dedup agent built

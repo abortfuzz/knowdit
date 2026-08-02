@@ -12,6 +12,8 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use std::sync::OnceLock;
+
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// A repo-relative file set. The `repo_root` is canonicalized at
@@ -29,6 +31,33 @@ pub struct ProjectScope {
 }
 
 impl ProjectScope {
+    /// Whether `relative_path` lives in a tree the project loader treats as
+    /// vendored or non-production — `lib/`, `node_modules/`, `test/`, `mock/`,
+    /// `script/`, `deploy/`, `src/vendor/`, build output.
+    ///
+    /// The call-graph and storage phases deliberately ingest those trees, because
+    /// resolving an inherited or imported symbol needs the dependency's source. So
+    /// anything that reads the call graph back as *the project's own* surface has to
+    /// filter them out again, and does it here rather than by restating the list —
+    /// [`crate::data::DEFAULT_VENDORED_EXCLUDES`] stays the single definition.
+    pub fn is_vendored_path(relative_path: &Path) -> bool {
+        static EXCLUDES: OnceLock<GlobSet> = OnceLock::new();
+        // The patterns are a compile-time constant that the loader itself already
+        // compiles on every project load, so a failure here is impossible in
+        // practice; an empty set (matching nothing) is the safe reading either way.
+        EXCLUDES
+            .get_or_init(|| {
+                let mut builder = GlobSetBuilder::new();
+                for pattern in crate::data::DEFAULT_VENDORED_EXCLUDES {
+                    if let Ok(glob) = Glob::new(pattern) {
+                        builder.add(glob);
+                    }
+                }
+                builder.build().unwrap_or_else(|_| GlobSet::empty())
+            })
+            .is_match(relative_path)
+    }
+
     /// Walk `repo_root` and capture every regular file whose
     /// repo-relative path matches `include` and does not match
     /// `exclude`. Both globsets are pre-compiled; use

@@ -11,16 +11,16 @@
 //! 3. return the captured verdict.
 //!
 //! The pieces shared between the two graders live here so neither
-//! reimplements the loop, cache-key formatting, or budget bookkeeping:
+//! reimplements the loop or the budget bookkeeping:
 //!
-//! - [`GraderOptions`]: clap-fed knobs (steps / cache key / debug
-//!   prefix / compaction). Both graders take this same struct.
+//! - [`GraderOptions`]: clap-fed knobs (steps / debug prefix). Both
+//!   graders take this same struct.
 //! - [`AttemptHandle<T>`]: typed handle the `emit_*` tool writes into;
 //!   the loop polls it per step.
 //! - [`RunSummary`] / [`CoverageSummary`]: the shared shape of one
 //!   harness_run + coverage digest the agents see in their input
 //!   payload.
-//! - [`drive_agent_loop`]: the actual step / compact / step-budget
+//! - [`drive_agent_loop`]: the actual step / step-budget
 //!   loop, generic over the verdict type.
 
 use std::sync::Arc;
@@ -34,12 +34,10 @@ use llmy::harness::Agent;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::spec::{ProjectIndex, spec_memory_criteria};
+use crate::spec::{MemoryScope, ProjectIndex, spec_memory_criteria};
 
 /// 80% of the model's max input tokens — same default as
 /// `SpecificationGenerator` and `SolidityFuzzGenerator`.
-pub const DEFAULT_COMPACT_RATIO: f64 = 0.8;
-
 /// Tunables shared by both reflection agents. All fields owned, no
 /// lifetimes; constructed by the CLI layer (clap derive in
 /// `ReflectArgs`); never reads constants or env vars itself.
@@ -47,11 +45,6 @@ pub const DEFAULT_COMPACT_RATIO: f64 = 0.8;
 pub struct GraderOptions {
     /// Maximum agent steps per `grade()` call before forced finalize.
     pub max_agent_steps: usize,
-    /// Compaction threshold for in-context conversation pruning.
-    /// `None` defaults to 80% of the model's max input.
-    pub compact_context_threshold_tokens: Option<usize>,
-    /// `llmy` cache key prefix.
-    pub cache_key: String,
     /// Optional debug prefix forwarded to llmy for LLM-call dumps.
     pub debug_prefix: Option<String>,
     /// Optional per-call llmy settings (reasoning_effort, temperature, …).
@@ -155,26 +148,19 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
     options: &GraderOptions,
     system_prompt: String,
     user_prompt: String,
-    cache_key_suffix: &str,
+    debug_suffix: &str,
     tools: ToolBox,
     attempt: &AttemptHandle<T>,
 ) -> Result<usize> {
-    let memory = project_index.build_link_memory()?;
+    let memory = project_index.build_link_memory(MemoryScope::WholeProject)?;
 
-    let cache_key = format!("{}-{}", options.cache_key, cache_key_suffix);
     let debug_prefix = options
         .debug_prefix
         .as_ref()
-        .map(|p| format!("{p}-{cache_key_suffix}"));
+        .map(|p| format!("{p}-{debug_suffix}"));
 
-    let mut agent = Agent::with_memory(
-        system_prompt,
-        tools,
-        cache_key,
-        &memory,
-        &spec_memory_criteria(),
-    )
-    .await;
+    let mut agent =
+        Agent::with_memory(system_prompt, tools, None, &memory, &spec_memory_criteria()).await;
 
     let mut step = agent
         .step_with_user(
@@ -187,44 +173,19 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
         .wrap_err("reflection agent failed on initial step")?;
     let mut steps = 1usize;
 
-    let compact_threshold = options
-        .compact_context_threshold_tokens
-        .unwrap_or_else(|| (llm.model.config.max_input() as f64 * DEFAULT_COMPACT_RATIO) as usize);
-
     while !attempt.is_set().await {
         if matches!(step, StepResult::Stop(_)) {
             return Err(color_eyre::eyre::eyre!(
                 "reflection agent stopped at step {steps} without emitting a verdict \
-                 (cache_key_suffix={cache_key_suffix})"
+                 (debug_suffix={debug_suffix})"
             ));
         }
         if steps >= options.max_agent_steps {
             return Err(color_eyre::eyre::eyre!(
                 "reflection agent exhausted max_agent_steps={} without emitting a verdict \
-                 (cache_key_suffix={cache_key_suffix}); raise --grader-max-agent-steps and retry",
+                 (debug_suffix={debug_suffix}); raise --grader-max-agent-steps and retry",
                 options.max_agent_steps,
             ));
-        }
-        if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
-            && tokens >= compact_threshold
-        {
-            tracing::info!(
-                cache_key_suffix,
-                tokens,
-                compact_threshold,
-                "reflection agent compacting context"
-            );
-            agent = agent
-                .compact(
-                    llm,
-                    debug_prefix
-                        .as_ref()
-                        .map(|p| format!("{p}-compact"))
-                        .as_deref(),
-                    options.llm_settings.clone(),
-                )
-                .await
-                .wrap_err("reflection agent failed to compact context")?;
         }
         steps += 1;
         step = agent

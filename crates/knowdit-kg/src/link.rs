@@ -183,7 +183,7 @@ struct FindingLinkContext {
     prompt_prefix_tokens: usize,
     candidate_token_count: usize,
     candidate_map: HashMap<String, i32>,
-    cache_key: String,
+    slug: String,
 }
 
 #[derive(Debug, Clone)]
@@ -285,7 +285,7 @@ impl FindingLinkContextKey {
         }
     }
 
-    fn cache_key(&self) -> String {
+    fn context_slug(&self) -> String {
         format!("finding-link-{}", self.slug())
     }
 
@@ -342,7 +342,7 @@ impl FindingLinkContext {
             prompt_prefix,
             candidate_token_count,
             candidate_map,
-            cache_key: context_key.cache_key(),
+            slug: context_key.context_slug(),
         }
     }
 }
@@ -572,7 +572,7 @@ impl FindingLinkBudgets {
         if effective == 0 {
             return Err(KgError::other(format!(
                 "Finding link context '{}' leaves no room for batched findings under input budget {}",
-                context.cache_key, self.input_token_budget
+                context.slug, self.input_token_budget
             )));
         }
 
@@ -1857,13 +1857,11 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             for entry in &still_missing {
                 user_prompt.push_str(&entry.prompt_body);
             }
-            let cache_key = format!("{}-attempt{:02}", self.context.cache_key, attempt);
             let label = format!("finding-link-{}-attempt{:02}", self.batch, attempt);
             let target_finding_count = still_missing.len();
             let agent_decisions = self
                 .run_one_attempt(
                     user_prompt,
-                    cache_key,
                     label.clone(),
                     valid_finding_ids,
                     valid_semantic_ids.clone(),
@@ -1962,7 +1960,6 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
     async fn run_one_attempt(
         &self,
         user_prompt: String,
-        cache_key: String,
         label: String,
         valid_finding_ids: Arc<HashSet<String>>,
         valid_semantic_ids: Arc<HashSet<String>>,
@@ -1996,7 +1993,6 @@ impl<'a> FindingLinkBatchAgentRunner<'a> {
             tools,
             system_prompt: prompts::GENERAL_ROLE_SYSTEM.to_string(),
             user_prompt,
-            cache_key,
             label,
         };
         let _outcome = runner.run().await?;

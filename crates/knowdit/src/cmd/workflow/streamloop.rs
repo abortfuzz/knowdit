@@ -134,12 +134,6 @@ pub struct StreamloopArgs {
     #[arg(short = 'd', long)]
     pub default_concurrency: Option<usize>,
 
-    /// llmy cache-key prefix used when each link runs its own
-    /// `fuzz_one_existing_spec`. Defaults to
-    /// `{project_name}-knowdit-fuzz` (same convention as `agentic fuzz`).
-    #[arg(long)]
-    pub stream_fuzz_cache_key: Option<String>,
-
     /// Candidate links judged per novelty call. Before claiming work the
     /// scheduler asks one cheap JSON call whether each queued link would
     /// rediscover a canonical finding this run already reported; duplicates
@@ -361,9 +355,7 @@ impl StreamloopArgs {
         // `profile` is the first scoped global phase; `extract` / `mapper` are
         // scoped inside the backend runners, per-link scopes under root.
         let profile_llm = primary_llm.scope(Some("profile".to_string()), None);
-        let profile =
-            ProfileArgs::profile(&repo, &profile_llm, &spec_name, &repo_root, &self.profile)
-                .await?;
+        let profile = ProfileArgs::profile(&repo, &profile_llm, &repo_root, &self.profile).await?;
         tracing::info!(
             "[streamloop stage 3/8] profile ready: language={:?}, {} subsystem(s), {} core component(s)",
             profile.language,
@@ -383,10 +375,6 @@ impl StreamloopArgs {
             SourceLanguage::Solidity => {
                 let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
                     repo_root: repo_root.clone(),
-                    default_cache_key: self
-                        .stream_fuzz_cache_key
-                        .clone()
-                        .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name)),
                     max_specs: 0,
                     concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
                     regenerate: self.fuzz.fuzz_regenerate,
@@ -562,7 +550,6 @@ impl StreamloopArgs {
             )
         })?;
         let gen_options = self.gen_specs.build_spec_options(
-            &spec_name,
             language_prompt_prefix.clone(),
             LinkSource::Mapper,
             Some(profile.clone()),
@@ -575,7 +562,7 @@ impl StreamloopArgs {
                 scope_override: review_findings::resolve_scope_override(
                     self.review.scope_file.as_deref(),
                 )?,
-                options: self.review.grader_options(&spec_name),
+                options: self.review.grader_options(),
                 window_ratio: self.review.review_context_window_ratio,
                 concurrency: self.review.review_concurrency.unwrap_or(1).max(1),
             })
@@ -590,7 +577,6 @@ impl StreamloopArgs {
                     max_inventory: self.stream_novelty_max_inventory,
                     finding_field_chars: self.stream_novelty_finding_chars,
                     spec_summary_chars: self.stream_novelty_spec_chars,
-                    cache_key: Some(format!("{spec_name}-knowdit-novelty")),
                     language_prompt_prefix: language_prompt_prefix.clone(),
                 },
             )
@@ -698,8 +684,8 @@ impl StreamloopArgs {
 /// Immutable per-run context shared by every link pipeline. Built once
 /// at the bottom of `StreamloopArgs::run` and cloned via `Arc` into each
 /// worker. Everything a single link needs to drive itself end-to-end —
-/// repo handle, both LLMs, harness backend, the four phase arg-sets, and
-/// the resolved `fuzz_cache_key` — lives here.
+/// repo handle, both LLMs, harness backend and the four phase arg-sets
+/// — lives here.
 ///
 /// Generic over `B: HarnessBackend` so the same per-link orchestration
 /// drives both Solidity (`SolidityHarness`) and Sui Move
@@ -767,11 +753,10 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         // per-link agent failure comes back as an `Abandoned` outcome.
         let outcome = work.run(&self.repo, &scopes.spec).await?;
         tracing::info!(
-            "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) usable, {} step(s), {} compaction(s) ({})",
+            "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) usable, {} step(s) ({})",
             snapshot_status(outcome.status),
             outcome.specification_ids.len(),
             outcome.steps,
-            outcome.compact_count,
             humantime::format_duration(gen_specs_started.elapsed()),
         );
 
@@ -1005,7 +990,6 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let stats = ReflectArgs::reflect_code_gens(
             &self.repo,
             reflect_llm,
-            &self.spec_name,
             &self.repo_root,
             self.language_prompt_prefix.clone(),
             &self.reflect,
@@ -1057,7 +1041,6 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             &self.harness_backend,
             &self.repo,
             regen_llm,
-            &self.spec_name,
             &self.harness,
             &self.regen,
             active_spec_ids,
@@ -1129,7 +1112,6 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             code_gen_ids: code_gen_ids.to_vec(),
             abort_reason: outcome.abort_reason.clone(),
             steps: outcome.steps,
-            compact_count: outcome.compact_count,
             drain: drain.clone(),
             usage: usage.clone(),
         };
@@ -1794,7 +1776,6 @@ struct LinkSnapshot {
     code_gen_ids: Vec<i32>,
     abort_reason: Option<String>,
     steps: usize,
-    compact_count: usize,
     drain: LinkDrainCounts,
     /// Per-phase token + USD spend for this link (llmy 0.16 scopes).
     usage: LinkUsageReport,

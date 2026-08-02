@@ -25,9 +25,8 @@ use crate::cli::{DatabaseArgs, HistoricalDatabaseArgs, LoadedRepoDatabase, Proje
 
 /// Knobs for the map-semantics phase. Long-flag names carry a
 /// `--map-*` prefix so flattening this alongside other phase
-/// `SharedArgs` (gen-specs, reflect — all of which also have a
-/// `--cache-key`) in the autoloop doesn't trip clap's duplicate-arg
-/// check.
+/// `SharedArgs` (gen-specs, reflect) in the autoloop doesn't trip
+/// clap's duplicate-arg check.
 #[derive(Args, Clone, Debug)]
 pub struct MapSemanticsSharedArgs {
     /// Number of historical semantics presented to the LLM in a
@@ -41,12 +40,6 @@ pub struct MapSemanticsSharedArgs {
     /// tokens; `0` suppresses the examples block entirely.
     #[arg(long = "map-max-raw-children", default_value_t = 5)]
     pub map_max_raw_children: usize,
-
-    /// `llmy` cache key prefix. Defaults to
-    /// `{project_name}-knowdit-mapper` when omitted so different
-    /// projects don't share a cache namespace.
-    #[arg(long = "map-cache-key")]
-    pub map_cache_key: Option<String>,
 
     /// Max historical batches the mapper matches concurrently (each
     /// batch is one LLM call). Defaults to 8 when unset. `workflow
@@ -172,14 +165,9 @@ impl MapSemanticsArgs {
                  project '{project_name}' first (or let `workflow autoloop` run the profile phase)"
             )
         })?;
-        let cache_key = shared
-            .map_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-mapper", project_name));
         let options = MapperOptions {
             batch_size: shared.map_batch_size.max(1),
             concurrency: shared.map_concurrency.unwrap_or(8).max(1),
-            cache_key: Some(cache_key),
             language_prompt_prefix: language_prompt_prefix.clone(),
             extra_categories: shared.extra_categories()?,
             max_rendered_raw_children: shared.map_max_raw_children,

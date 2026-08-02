@@ -122,14 +122,6 @@ pub struct SolidityCallGraphArgs {
     /// Maximum llmy steps for each per-callable callgraph agent.
     #[arg(long, default_value_t = 64)]
     pub max_agent_steps: usize,
-
-    /// Compact per-callable agent context when it reaches this approximate token count.
-    #[arg(long)]
-    pub compact_context_threshold_tokens: Option<usize>,
-
-    /// llmy prompt cache key prefix for callgraph analysis.
-    #[arg(long, default_value = "knowdit-sol-cg")]
-    pub cache_key: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -152,10 +144,6 @@ pub struct SolidityStorageGraphArgs {
     /// Maximum llmy steps per contract.
     #[arg(long, default_value_t = 32)]
     pub max_agent_steps: usize,
-
-    /// llmy prompt cache key prefix for storage analysis.
-    #[arg(long, default_value = "knowdit-sol-storage")]
-    pub cache_key: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -275,8 +263,6 @@ impl SolidityCallGraphArgs {
             extraction_config,
             self.max_agent_steps,
             3,
-            self.compact_context_threshold_tokens,
-            self.cache_key.clone(),
             Some("llm-sol-cg".to_string()),
             Some(self.llm.settings()),
         );
@@ -319,7 +305,6 @@ impl SolidityStorageGraphArgs {
         let config = StorageAgentConfig::new(
             extraction_config,
             self.max_agent_steps,
-            self.cache_key.clone(),
             Some("llm-sol-storage".to_string()),
             Some(self.llm.settings()),
         );

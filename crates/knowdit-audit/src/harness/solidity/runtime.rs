@@ -45,7 +45,7 @@ use super::utils::{
 use super::{HarnessKind, harness as handler_mode, poc as poc_mode};
 use crate::harness::forge::{ForgeBackend, ForgeRunner, ForgeTimeouts};
 use crate::spec::{
-    LinkInput, LookupCallGraphTool, LookupStateVariableXrefsTool, ProjectIndex,
+    LinkInput, LookupCallGraphTool, LookupStateVariableXrefsTool, MemoryScope, ProjectIndex,
     ReadContractSourceTool, ReadFunctionSourceTool, spec_memory_criteria,
 };
 use crate::types::AuditSpecification;
@@ -317,14 +317,13 @@ struct AgentLoopState {
     per_spec_dir: PathBuf,
     scoped_runner: ForgeRunner,
     match_path_glob: String,
-    // Pre-built immutable prompt + cache bundle used unchanged across
-    // every restart inside `drive`. Only the restart bootstrap
+    // Pre-built immutable prompt bundle used unchanged across every
+    // restart inside `drive`. Only the restart bootstrap
     // (composed on the fly by `compose_system_prompt`) changes per
     // attempt.
     base_system_prompt: String,
     user_prompt: String,
     prior_feedback: Option<String>,
-    cache_key_base: String,
     debug_prefix: Option<String>,
     memory: AgentMemoryContext,
     memory_criteria: AgentMemorySystemPromptCriteria,
@@ -355,9 +354,8 @@ impl AgentLoopState {
             coverage_via_ir_unsupported,
         );
         let user_prompt = kind.build_user_prompt(spec_id);
-        let memory = project_index.build_link_memory()?;
+        let memory = project_index.build_link_memory(MemoryScope::WholeProject)?;
         let memory_criteria = spec_memory_criteria();
-        let cache_key_base = format!("{}-spec{}", options.cache_key, spec_id);
         let debug_prefix = options
             .debug_prefix
             .as_ref()
@@ -377,7 +375,6 @@ impl AgentLoopState {
             base_system_prompt,
             user_prompt,
             prior_feedback: prior_feedback.map(String::from),
-            cache_key_base,
             debug_prefix,
             memory,
             memory_criteria,
@@ -456,16 +453,6 @@ impl AgentLoopState {
         sys
     }
 
-    /// Cache key for one agent spawn. Suffix by restart_count so
-    /// llmy's cache doesn't fold separate attempts together.
-    fn cache_key_for(&self, restart_count: usize) -> String {
-        if restart_count == 0 {
-            self.cache_key_base.clone()
-        } else {
-            format!("{}-restart{restart_count}", self.cache_key_base)
-        }
-    }
-
     /// Run the agent until violation observed, step / restart budget
     /// exhausted, or hard agent error. Consumes `self` because the
     /// final `LinkFuzzOutcome` only needs the accumulated
@@ -497,7 +484,7 @@ impl AgentLoopState {
             let mut agent = Agent::with_memory(
                 sys,
                 self.build_toolbox(),
-                self.cache_key_for(snap.restart_count),
+                None,
                 &self.memory,
                 &self.memory_criteria,
             )

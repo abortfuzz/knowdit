@@ -257,7 +257,7 @@ impl<T> AgentChunkBuffer<T> {
 /// without memory and pumps it until the buffer is finalized, the agent
 /// stops on its own, or `max_agent_steps` is exhausted.
 ///
-/// `LLM` is `Clone`, `AgentRunOptions` is `Clone`, and prompts/keys are
+/// `LLM` is `Clone`, `AgentRunOptions` is `Clone`, and the prompts are
 /// already owned `String`s — no lifetimes needed.
 pub struct AgentChunkRunner<T> {
     pub llm: LLM,
@@ -266,7 +266,6 @@ pub struct AgentChunkRunner<T> {
     pub tools: ToolBox,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
 }
 
@@ -279,7 +278,6 @@ impl<T> AgentChunkRunner<T> {
             tools,
             system_prompt,
             user_prompt,
-            cache_key,
             label,
         } = self;
 
@@ -291,7 +289,7 @@ impl<T> AgentChunkRunner<T> {
         let mut agent = Agent::new_with_config(
             system_prompt,
             tools,
-            cache_key,
+            None,
             AgentConfig::default().sequential_toolcall(),
         );
 

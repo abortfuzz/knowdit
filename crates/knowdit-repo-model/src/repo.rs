@@ -43,9 +43,9 @@ use crate::db::{
     project_metadata as project_metadata_model, project_semantic as project_semantic_model,
     project_semantic_function as project_semantic_function_model, reflection as reflection_model,
     report_finding as report_finding_model, ruled_out_merge as ruled_out_merge_model,
-    semantic_matched as semantic_matched_model,
-    specification as specification_model, specification_regen as specification_regen_model,
-    state_variable as state_variable_model, valid_finding as valid_finding_model,
+    semantic_matched as semantic_matched_model, specification as specification_model,
+    specification_regen as specification_regen_model, state_variable as state_variable_model,
+    valid_finding as valid_finding_model,
 };
 use crate::inheritance::{ContractInherit, InheritanceGraph};
 use crate::move_lang::{

@@ -223,13 +223,12 @@ impl RuledOutMerger {
 
     fn pack_candidate_chunks(&self, input: &ConclusionMergeInput) -> Vec<Vec<ConclusionCandidate>> {
         let rejection_only = input.with_candidates(Vec::new());
-        let reserve = CandidateChunker::tokens_of(
-            &self.llm,
-            super::prompt::RULED_OUT_SYSTEM_TEMPLATE,
-        ) + serde_json::to_string(&rejection_only)
-            .map(|s| CandidateChunker::tokens_of(&self.llm, &s))
-            .unwrap_or(0)
-            + 2048;
+        let reserve =
+            CandidateChunker::tokens_of(&self.llm, super::prompt::RULED_OUT_SYSTEM_TEMPLATE)
+                + serde_json::to_string(&rejection_only)
+                    .map(|s| CandidateChunker::tokens_of(&self.llm, &s))
+                    .unwrap_or(0)
+                + 2048;
         CandidateChunker::new(&self.llm, self.window_ratio, reserve).chunk(&input.candidates)
     }
 }

@@ -95,7 +95,7 @@ pub fn default_memory_prompt_criteria() -> AgentMemorySystemPromptCriteria {
                 .to_string(),
         )
         .append_short_term_memory_trigger(
-            "When the analysis spans many files or context compaction may be needed".to_string(),
+            "When the analysis spans many files".to_string(),
         )
         .build()
 }

@@ -165,7 +165,6 @@ impl AutoloopArgs {
         // phase per cycle.
         let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
             repo_root: repo_root.clone(),
-            default_cache_key: format!("{}-knowdit-fuzz", spec_name),
             max_specs: self.fuzz.fuzz_max_specs,
             concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
             regenerate: self.fuzz.fuzz_regenerate,
@@ -225,8 +224,7 @@ impl AutoloopArgs {
         // and map. Resume-safe via `get_project_profile()` inside the
         // generator — if a profile is already cached, this is a cheap
         // DB read.
-        let profile =
-            ProfileArgs::profile(&repo, primary_llm, &spec_name, &repo_root, &self.profile).await?;
+        let profile = ProfileArgs::profile(&repo, primary_llm, &repo_root, &self.profile).await?;
         tracing::info!(
             "Profile ready: {} subsystem(s), {} core component(s)",
             profile.subsystems.len(),
@@ -301,7 +299,6 @@ impl AutoloopArgs {
                 &harness_backend,
                 &repo,
                 primary_llm,
-                &spec_name,
                 &self.harness,
                 &self.regen,
             )

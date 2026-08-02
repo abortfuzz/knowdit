@@ -70,8 +70,6 @@ pub struct FuzzOptions {
     /// When true, clear `code_gen` / `harness_run` / `line_coverage` and
     /// reprocess every spec from scratch.
     pub regenerate: bool,
-    /// `llmy` cache key prefix.
-    pub cache_key: String,
     /// Optional debug-prefix forwarded to `llmy` for LLM-call dumps.
     pub debug_prefix: Option<String>,
     /// Optional override for the `LLMSettings` (mostly to forward

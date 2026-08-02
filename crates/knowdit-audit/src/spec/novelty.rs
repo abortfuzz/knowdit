@@ -74,7 +74,6 @@ pub struct NoveltyOptions {
     /// Characters of each canonical finding field rendered into the inventory.
     pub spec_summary_chars: usize,
     /// `llmy` cache key prefix.
-    pub cache_key: Option<String>,
     /// Verbatim per-language block prepended to the system prompt, same
     /// convention as the mapper and the reflection graders.
     pub language_prompt_prefix: String,
@@ -232,8 +231,8 @@ impl LinkNoveltyJudge {
             .prompt_json_with_retry(
                 &self.system_prompt,
                 &user_prompt,
+                Some("novelty"),
                 None,
-                self.options.cache_key.as_deref(),
                 None,
             )
             .await

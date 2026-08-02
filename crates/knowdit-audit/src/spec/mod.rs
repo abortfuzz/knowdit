@@ -42,6 +42,7 @@ mod prompt;
 mod tools;
 pub use backend::SpecBackend;
 pub use index::ProjectIndex;
+pub(crate) use index::{MemoryScope, ResidentCandidate};
 pub use novelty::{
     LinkNovelty, LinkNoveltyJudge, NoveltyCandidate, NoveltyOptions, ReportedFindingDigest,
 };
@@ -102,7 +103,14 @@ impl AuditStatusSummary {
         self.reported.is_empty() && self.ruled_out.is_empty()
     }
 }
-use prompt::{build_regen_prompt_extension, build_system_prompt, build_user_prompt};
+use prompt::{
+    build_link_prompt, build_regen_prompt_extension, build_resident_source_block,
+    build_status_prompt, build_system_prompt,
+};
+
+use std::sync::OnceLock;
+
+use crate::source_access::ProjectSourceAccess;
 pub(crate) use tools::{
     LookupCallGraphTool, LookupStateVariableXrefsTool, ReadContractSourceTool,
     ReadFunctionSourceTool,
@@ -188,11 +196,6 @@ pub struct SpecGenOptions {
     /// Soft cap on how many `AuditSpecification`s the agent may commit for
     /// one link. The agent is free to commit fewer.
     pub max_specs_per_link: usize,
-    /// Compact the conversation when the rendered context exceeds this many
-    /// approximate tokens. `None` defaults to 80% of the model's max input.
-    pub compact_context_threshold_tokens: Option<usize>,
-    /// `llmy` cache key prefix (per-project, set by the CLI).
-    pub cache_key: String,
     /// Optional debug prefix passed to llmy.
     pub debug_prefix: Option<String>,
     /// Optional per-call llmy settings.
@@ -251,6 +254,15 @@ pub struct SpecGenOptions {
     /// spec is worth writing at all and had to guess what the project is.
     /// `None` on databases whose profile phase has not run.
     pub project_profile: Option<knowdit_repo_model::ProjectProfile>,
+    /// Fraction of the model's input window the resident project source may
+    /// occupy. `0.0` disables residency, which is the pipeline's original
+    /// behaviour. See [`crate::source_access::ProjectSourceAccess`].
+    pub resident_source_window_ratio: f64,
+    /// Residency decision for this run, made on the first link that needs it
+    /// (the deciding inputs — project index and model — only meet there) and
+    /// then shared by every later link, so prompt, tool box and memory can
+    /// never disagree with one another.
+    pub source_access: Arc<OnceLock<ProjectSourceAccess>>,
 }
 
 impl Default for SpecGenOptions {
@@ -258,8 +270,6 @@ impl Default for SpecGenOptions {
         Self {
             max_agent_steps: 60,
             max_specs_per_link: 4,
-            compact_context_threshold_tokens: None,
-            cache_key: "knowdit-spec".to_string(),
             debug_prefix: None,
             llm_settings: None,
             max_links: None,
@@ -272,6 +282,8 @@ impl Default for SpecGenOptions {
             language_prompt_prefix: String::new(),
             link_source: LinkSource::Mapper,
             project_profile: None,
+            resident_source_window_ratio: 0.0,
+            source_access: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -302,8 +314,6 @@ pub struct LinkSpecOutcome {
     pub final_summary: Option<String>,
     /// Number of agent steps consumed (counts initial step too).
     pub steps: usize,
-    /// Number of context-compaction passes triggered.
-    pub compact_count: usize,
 }
 
 impl LinkSpecOutcome {
@@ -602,7 +612,6 @@ impl PlannedLinkWork {
                     "resumed from existing spec rows; gen-spec agent skipped".to_string(),
                 ),
                 steps: 0,
-                compact_count: 0,
             });
         }
         let mut outcome = self.process(llm).await?;
@@ -1089,10 +1098,10 @@ impl SpecificationGenerator {
         let prompt_extension = build_regen_prompt_extension(&request.mode, &request.prior_feedback);
         // Wrap the single regen link in a `PlannedLinkWork` so it goes through
         // the same agent loop as the streaming path. `total_links = 1` and the
-        // ordinal is the cache-key serial (a regen, not a stream position).
+        // ordinal is the regen serial, not a stream position.
         let work = PlannedLinkWork {
             status_summary: String::new(),
-            ordinal: request.serial_for_cache_key,
+            ordinal: request.serial,
             total_links: 1,
             link,
             project_index: runtime.project_index.clone(),
@@ -1154,10 +1163,9 @@ pub struct SpecRegenRequest {
     pub finding_id: i32,
     pub mode: SpecRegenMode,
     pub prior_feedback: String,
-    /// Used by the cache key to namespace LLM calls per regen
-    /// attempt. Pass the triggering `reflection.id` so a re-run hits
-    /// cache.
-    pub serial_for_cache_key: usize,
+    /// Distinguishes one regen attempt from another in logs and debug
+    /// dumps. Pass the triggering `reflection.id`.
+    pub serial: usize,
 }
 
 /// Patch vs from-scratch. Patch mode
@@ -1236,8 +1244,6 @@ pub(crate) fn interleave_by_extract(links: Vec<LinkInput>) -> Vec<LinkInput> {
 // Per-link agent runner
 // ---------------------------------------------------------------------------
 
-const DEFAULT_COMPACT_RATIO: f64 = 0.8;
-
 /// The per-link gen-spec agent loop, owned by [`PlannedLinkWork`] — the struct
 /// that already carries the link plus everything needed to run it (its grounding
 /// [`ProjectIndex`] and [`SpecGenOptions`]). The `llm` and the optional regen
@@ -1257,14 +1263,18 @@ impl PlannedLinkWork {
         let project_index = &self.project_index;
         let options = &self.options;
         let link_serial = self.ordinal;
-        let memory = project_index.build_link_memory()?;
+        let source_access = options.source_access.get_or_init(|| {
+            ProjectSourceAccess::resolve(
+                project_index,
+                llm,
+                options.resident_source_window_ratio,
+                options.project_profile.as_ref(),
+            )
+        });
+        let memory = source_access.link_memory(project_index)?;
         let draft = tools::DraftHandle::new();
         let tool_box = draft.build_tool_box(project_index, options.max_specs_per_link);
 
-        let cache_key = format!(
-            "{}-link{:04}-e{}-h{}-f{}",
-            options.cache_key, link_serial, link.extract_id, link.historical_id, link.finding_id
-        );
         let debug_prefix = options.debug_prefix.as_ref().map(|prefix| {
             format!(
                 "{}-link{:04}-e{}-h{}-f{}",
@@ -1272,15 +1282,18 @@ impl PlannedLinkWork {
             )
         });
 
-        let mut system_prompt = build_system_prompt(
-            link,
+        // Nothing here varies between links: the resident source (when enabled)
+        // leads, then the role / methodology. That makes the tool definitions
+        // plus this whole message one prefix the entire run shares, which the
+        // breakpoint below turns into a single cache entry.
+        let mut system_prompt = match source_access.resident_source() {
+            Some(source) => build_resident_source_block(source, source_access.omitted()),
+            None => String::new(),
+        };
+        system_prompt.push_str(&build_system_prompt(
             options.link_source,
             options.project_profile.as_ref(),
-        );
-        if let Some(ext) = prompt_extension {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(ext);
-        }
+        ));
         // Sequential tool calls: the spec builder exposes `update_* / add_* /
         // set_* … commit / finalize` tools. A same-turn parallel `commit`
         // racing a builder mutation can serialize a stale spec (the mutation
@@ -1288,21 +1301,33 @@ impl PlannedLinkWork {
         let mut agent = Agent::with_memory_config(
             system_prompt,
             tool_box,
-            cache_key,
+            None,
             &memory,
             &spec_memory_criteria(),
             AgentConfig::default().sequential_toolcall(),
         )
         .await;
+        agent.toggle_system_breakpoint(true);
 
-        let compact_threshold = options.compact_context_threshold_tokens.unwrap_or_else(|| {
-            (llm.model.config.max_input() as f64 * DEFAULT_COMPACT_RATIO) as usize
-        });
+        // Two messages, two cache entries. The status summary is shared by
+        // every link scheduled against one snapshot of the run, so it gets its
+        // own breakpoint; only the link block past it is genuinely per-link and
+        // paid for at full price.
+        agent.push_user_message(build_status_prompt(&self.status_summary));
+        if let Some(status) = agent.context_mut().last_mut() {
+            status.breakpoint();
+        }
 
-        let user_prompt = build_user_prompt(link, project_index, &self.status_summary);
+        let link_prompt = build_link_prompt(
+            link,
+            options.link_source,
+            project_index,
+            source_access.resident_source().is_some(),
+            prompt_extension,
+        );
         let mut step_result = agent
             .step_with_user(
-                user_prompt,
+                link_prompt,
                 llm,
                 debug_prefix.as_deref(),
                 options.llm_settings.clone(),
@@ -1311,7 +1336,6 @@ impl PlannedLinkWork {
             .wrap_err("spec generator agent failed on initial step")?;
 
         let mut steps = 1usize;
-        let mut compact_count = 0usize;
 
         while {
             let snapshot = draft.snapshot().await;
@@ -1339,26 +1363,6 @@ impl PlannedLinkWork {
                 break;
             }
 
-            if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
-                && tokens >= compact_threshold
-            {
-                tracing::info!(
-                    "Spec generator compacting agent context (tokens={tokens}, threshold={compact_threshold})"
-                );
-                agent = agent
-                    .compact(
-                        llm,
-                        debug_prefix
-                            .as_ref()
-                            .map(|prefix| format!("{prefix}-compact"))
-                            .as_deref(),
-                        options.llm_settings.clone(),
-                    )
-                    .await
-                    .wrap_err("spec generator agent failed to compact context")?;
-                compact_count += 1;
-            }
-
             steps += 1;
             step_result = agent
                 .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
@@ -1379,7 +1383,6 @@ impl PlannedLinkWork {
             abort_reason: snapshot.abort_reason.clone(),
             final_summary: snapshot.final_summary.clone(),
             steps,
-            compact_count,
         })
     }
 
@@ -1404,10 +1407,9 @@ impl PlannedLinkWork {
                     LinkSpecStatus::Abandoned => "abandoned",
                 };
                 tracing::info!(
-                    "{label}: {kind} ({} spec(s), {} step(s), {} compaction(s)){}",
+                    "{label}: {kind} ({} spec(s), {} step(s)){}",
                     outcome.specifications.len(),
                     outcome.steps,
-                    outcome.compact_count,
                     outcome
                         .abort_reason
                         .as_ref()
@@ -1435,7 +1437,6 @@ impl PlannedLinkWork {
                     abort_reason: Some(format!("agent error: {err:#}")),
                     final_summary: None,
                     steps: 0,
-                    compact_count: 0,
                 })
             }
         }
@@ -1482,7 +1483,6 @@ pub struct LinkSpecSummary {
     pub abort_reason: Option<String>,
     pub final_summary: Option<String>,
     pub steps: usize,
-    pub compact_count: usize,
 }
 
 impl From<&LinkSpecOutcome> for LinkSpecSummary {
@@ -1496,7 +1496,6 @@ impl From<&LinkSpecOutcome> for LinkSpecSummary {
             abort_reason: outcome.abort_reason.clone(),
             final_summary: outcome.final_summary.clone(),
             steps: outcome.steps,
-            compact_count: outcome.compact_count,
         }
     }
 }

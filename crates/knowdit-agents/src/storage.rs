@@ -35,7 +35,6 @@ use crate::storage_prompt::{
 pub struct StorageAgentConfig {
     pub extraction: SolidityExtractionConfig,
     pub max_agent_steps: usize,
-    pub cache_key: String,
     pub debug_prefix: Option<String>,
     pub llm_settings: Option<LLMSettings>,
 }
@@ -44,14 +43,12 @@ impl StorageAgentConfig {
     pub fn new(
         extraction: SolidityExtractionConfig,
         max_agent_steps: usize,
-        cache_key: impl Into<String>,
         debug_prefix: Option<String>,
         llm_settings: Option<LLMSettings>,
     ) -> Self {
         Self {
             extraction,
             max_agent_steps,
-            cache_key: cache_key.into(),
             debug_prefix,
             llm_settings,
         }
@@ -261,8 +258,7 @@ impl StorageRunner {
                 store.clone(),
             ));
 
-            let cache_key = format!("{}-c{}", config.cache_key, contract.id);
-            let mut agent = Agent::new(storage_agent_system_prompt(), tools, cache_key);
+            let mut agent = Agent::new(storage_agent_system_prompt(), tools, None);
             let user = storage_agent_user_prompt(prompt_input);
             let mut steps = 1;
             let mut step_result = agent

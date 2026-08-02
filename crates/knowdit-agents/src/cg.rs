@@ -41,10 +41,6 @@ pub struct CallGraphAgentConfig {
     pub max_agent_steps: usize,
     /// Maximum times a known non-terminal leaf may be re-analyzed before failing completion.
     pub max_leaf_completion_attempts: usize,
-    /// Compact when the rendered conversation exceeds this many approximate tokens.
-    pub compact_context_threshold_tokens: Option<usize>,
-    /// llmy prompt cache key prefix.
-    pub cache_key: String,
     /// Optional debug prefix passed to llmy.
     pub debug_prefix: Option<String>,
     /// Optional per-call llmy settings.
@@ -58,8 +54,6 @@ impl CallGraphAgentConfig {
         extraction: SolidityExtractionConfig,
         max_agent_steps: usize,
         max_leaf_completion_attempts: usize,
-        compact_context_threshold_tokens: Option<usize>,
-        cache_key: impl Into<String>,
         debug_prefix: Option<String>,
         llm_settings: Option<LLMSettings>,
     ) -> Self {
@@ -67,8 +61,6 @@ impl CallGraphAgentConfig {
             extraction,
             max_agent_steps,
             max_leaf_completion_attempts,
-            compact_context_threshold_tokens,
-            cache_key: cache_key.into(),
             debug_prefix,
             llm_settings,
             memory_prompt_criteria: prompt::default_memory_prompt_criteria(),
@@ -84,7 +76,6 @@ pub struct CallGraphAgentResult {
     /// Plain-text summaries returned by per-callable agents.
     pub final_response: String,
     pub steps: usize,
-    pub compact_count: usize,
     pub memory: AgentMemoryContext,
 }
 
@@ -108,9 +99,6 @@ pub async fn analyze_repo_call_graph(
     let extraction = extract_repo_contracts_functions(&config.extraction).await?;
 
     let memory = build_agent_memory(semantics, &extraction.contracts).await?;
-    let compact_threshold = config
-        .compact_context_threshold_tokens
-        .unwrap_or_else(|| (llm.model.config.max_input() as f64 * 0.8) as usize);
     let mut runner = FunctionAgentRunner::new(
         config,
         extraction.repo_root,
@@ -118,7 +106,6 @@ pub async fn analyze_repo_call_graph(
         extraction.analysis_source_files,
         extraction.contracts,
         semantics.len(),
-        compact_threshold,
     );
     let run = runner.run(llm, &memory).await?;
 
@@ -127,7 +114,6 @@ pub async fn analyze_repo_call_graph(
         terminal_nodes: run.terminal_nodes,
         final_response: run.final_response,
         steps: run.steps,
-        compact_count: run.compact_count,
         memory,
     })
 }
@@ -211,7 +197,6 @@ async fn build_agent_memory(
 struct FunctionAgentRunResult {
     summary: String,
     steps: usize,
-    compact_count: usize,
 }
 
 struct FunctionAgentRunnerResult {
@@ -219,7 +204,6 @@ struct FunctionAgentRunnerResult {
     terminal_nodes: Vec<CallGraphTerminalNode>,
     final_response: String,
     steps: usize,
-    compact_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -233,7 +217,6 @@ struct FunctionAgentRunner {
     terminal_store: SharedTerminalNodes,
     source_manifest: String,
     semantics_count: usize,
-    compact_threshold: usize,
     root_function_ids: BTreeSet<i32>,
     analyzed_function_ids: BTreeSet<i32>,
     queued_function_ids: BTreeSet<i32>,
@@ -241,7 +224,6 @@ struct FunctionAgentRunner {
     queue: VecDeque<i32>,
     summaries: Vec<String>,
     total_steps: usize,
-    compact_count: usize,
 }
 
 impl FunctionAgentRunner {
@@ -252,7 +234,6 @@ impl FunctionAgentRunner {
         analysis_source_files: Vec<PathBuf>,
         extracted_contracts: Vec<ExtractedContract>,
         semantics_count: usize,
-        compact_threshold: usize,
     ) -> Self {
         let index = Arc::new(CallGraphIndex::new(
             &extracted_contracts,
@@ -279,7 +260,6 @@ impl FunctionAgentRunner {
             terminal_store,
             source_manifest,
             semantics_count,
-            compact_threshold,
             root_function_ids,
             analyzed_function_ids: BTreeSet::new(),
             queued_function_ids,
@@ -287,7 +267,6 @@ impl FunctionAgentRunner {
             queue,
             summaries: Vec::new(),
             total_steps: 0,
-            compact_count: 0,
         }
     }
 
@@ -336,7 +315,6 @@ impl FunctionAgentRunner {
                     .await?;
 
                 self.total_steps += run.steps;
-                self.compact_count += run.compact_count;
                 self.summaries.push(run.summary);
                 self.analyzed_function_ids.insert(function_id);
                 self.queue_non_terminal_leaves().await?;
@@ -360,7 +338,6 @@ impl FunctionAgentRunner {
             terminal_nodes,
             final_response: self.summaries.join("\n\n"),
             steps: self.total_steps,
-            compact_count: self.compact_count,
         })
     }
 
@@ -463,10 +440,6 @@ impl FunctionAgentRunner {
             self.terminal_store.clone(),
         ));
 
-        let cache_key = format!(
-            "{}-{}-{}",
-            self.config.cache_key, contract.name, function.key.name
-        );
         let debug_prefix = self.config.debug_prefix.clone();
         tracing::info!(
             contract = %contract,
@@ -481,7 +454,7 @@ impl FunctionAgentRunner {
         let mut agent = Agent::with_memory(
             prompt::function_agent_system_prompt(),
             tools,
-            cache_key,
+            None,
             memory,
             &self.config.memory_prompt_criteria,
         )
@@ -504,7 +477,6 @@ impl FunctionAgentRunner {
         });
 
         let mut steps = 1;
-        let mut compact_count = 0;
         let function_str = function.to_string();
         let mut step_result = agent
             .step_with_user(
@@ -526,7 +498,6 @@ impl FunctionAgentRunner {
                 return Ok(FunctionAgentRunResult {
                     summary: format!("{}\n{}", function_str, summary.trim()),
                     steps,
-                    compact_count,
                 });
             }
 
@@ -536,29 +507,6 @@ impl FunctionAgentRunner {
                 self.config.max_agent_steps,
                 function_str
             );
-
-            if let Some(tokens) = agent.approx_context_tokens(&llm.model.config)
-                && tokens >= self.compact_threshold
-            {
-                tracing::info!("We are going to compact our agent...");
-                agent = agent
-                    .compact(
-                        llm,
-                        debug_prefix
-                            .clone()
-                            .map(|v| format!("{}-compact", v))
-                            .as_deref(),
-                        self.config.llm_settings.clone(),
-                    )
-                    .await
-                    .wrap_err_with(|| {
-                        format!(
-                            "callgraph agent failed to compact context for {}",
-                            function_str
-                        )
-                    })?;
-                compact_count += 1;
-            }
 
             steps += 1;
             step_result = agent

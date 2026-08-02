@@ -237,7 +237,6 @@ async fn run_merge_import(
             llm: llm.clone(),
             agent_options: opts.merge_agent.clone(),
             chunking: opts.merge_chunking,
-            cache_key_root: "merge-kg-semantic".to_string(),
             debug_key_root: "merge-kg-semantic".to_string(),
             label_root: "merge-kg-semantic".to_string(),
         }
@@ -296,7 +295,6 @@ async fn run_merge_import(
             llm: llm.clone(),
             agent_options: opts.merge_agent.clone(),
             chunking: opts.merge_chunking,
-            cache_key_root: "merge-kg-finding".to_string(),
             debug_key_root: "merge-kg-finding".to_string(),
             label_root: "merge-kg-finding".to_string(),
         }

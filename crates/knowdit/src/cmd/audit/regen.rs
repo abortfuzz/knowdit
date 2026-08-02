@@ -120,7 +120,6 @@ impl RegenArgs {
             .await?;
         let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
             repo_root: spec.root.clone(),
-            default_cache_key: format!("{}-knowdit-regen", spec.name),
             max_specs: 0,
             concurrency: self.shared.regen_concurrency.unwrap_or(1).max(1),
             regenerate: false,
@@ -132,15 +131,7 @@ impl RegenArgs {
             .preflight(&spec.root)
             .await
             .wrap_err("forge environment preflight failed")?;
-        let stats = Self::regen(
-            &harness_backend,
-            &repo,
-            llm,
-            &spec.name,
-            &self.harness,
-            &self.shared,
-        )
-        .await?;
+        let stats = Self::regen(&harness_backend, &repo, llm, &self.harness, &self.shared).await?;
         println!(
             "Regen finished: examined={} codegen_regen={} spec_regen={} escalated_chain_depth={} skipped_no_pair={} skipped_abandoned_spec={} errors={}",
             stats.examined,
@@ -163,14 +154,12 @@ impl RegenArgs {
         harness_backend: &B,
         repo: &RepoDatabase,
         llm: &LLM,
-        project_name: &str,
         harness: &HarnessSharedArgs,
         shared: &RegenSharedArgs,
     ) -> Result<RegenStats> {
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
-            cache_key: format!("{}-knowdit-spec-regen", project_name),
             debug_prefix: harness.harness_debug_prefix.clone(),
             language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
@@ -199,7 +188,6 @@ impl RegenArgs {
         harness_backend: &B,
         repo: &RepoDatabase,
         llm: &LLM,
-        project_name: &str,
         harness: &HarnessSharedArgs,
         shared: &RegenSharedArgs,
         spec_ids: &[i32],
@@ -210,7 +198,6 @@ impl RegenArgs {
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
-            cache_key: format!("{}-knowdit-spec-regen", project_name),
             debug_prefix: harness.harness_debug_prefix.clone(),
             language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
@@ -569,7 +556,7 @@ impl<B: HarnessBackend + 'static> RegenRunner<B> {
             finding_id,
             mode,
             prior_feedback: feedback.clone(),
-            serial_for_cache_key: r.reflection_id as usize,
+            serial: r.reflection_id as usize,
         };
         let spec_outcome: SpecRegenInMemory = SpecificationGenerator::regen_one_link(
             &self.repo,

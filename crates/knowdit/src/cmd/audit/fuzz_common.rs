@@ -49,14 +49,8 @@ impl From<HarnessModeCli> for HarnessKind {
 /// can co-exist in one `clap::Args` parse tree.
 #[derive(Args, Clone, Debug)]
 pub struct HarnessSharedArgs {
-    /// `llmy` cache key prefix. When unset, each subcommand falls
-    /// back to a per-subcommand default
-    /// (`{project}-knowdit-fuzz` / `{project}-knowdit-regen`).
-    #[arg(long = "harness-cache-key")]
-    pub harness_cache_key: Option<String>,
-
     /// Debug-prefix forwarded to llmy for LLM-call dumps.
-    #[arg(long = "harness-debug-prefix")]
+    #[arg(long = "harness-debug-prefix", default_value = "harness")]
     pub harness_debug_prefix: Option<String>,
 
     /// Path to a local `forge` binary. When set, knowdit runs forge
@@ -162,15 +156,12 @@ pub struct HarnessSharedArgs {
 }
 
 /// Per-subcommand fields [`HarnessSharedArgs`] doesn't know about
-/// (project root, fuzz-only caps, default cache key, project viaIR
-/// state). The caller fills this in;
+/// (project root, fuzz-only caps, project viaIR state). The caller
+/// fills this in;
 /// [`HarnessSharedArgs::to_fuzz_options`] consumes it.
 #[derive(Debug, Clone)]
 pub struct FuzzOptionsBuild {
     pub repo_root: PathBuf,
-    /// Used when `HarnessSharedArgs::cache_key` is `None`. Subcommands
-    /// pass `{project}-knowdit-fuzz` or `{project}-knowdit-regen`.
-    pub default_cache_key: String,
     pub max_specs: usize,
     pub concurrency: usize,
     pub regenerate: bool,
@@ -224,7 +215,6 @@ impl HarnessSharedArgs {
         // `resolve_harness_dir` only reads `harness_dir` + `repo_root`.
         let opts = self.to_fuzz_options(FuzzOptionsBuild {
             repo_root: repo_root.to_path_buf(),
-            default_cache_key: String::new(),
             max_specs: 0,
             concurrency: 1,
             regenerate: false,
@@ -278,10 +268,6 @@ impl HarnessSharedArgs {
     /// pieces in `build`. Single source of truth for forge-runtime
     /// config — no caller spells `FuzzOptions { ... }` directly.
     pub fn to_fuzz_options(&self, build: FuzzOptionsBuild) -> FuzzOptions {
-        let cache_key = self
-            .harness_cache_key
-            .clone()
-            .unwrap_or(build.default_cache_key);
         let forge_mem_cap_bytes =
             (self.forge_mem_cap_gb > 0).then(|| self.forge_mem_cap_gb * 1024 * 1024 * 1024);
         FuzzOptions {
@@ -298,7 +284,6 @@ impl HarnessSharedArgs {
             max_specs: build.max_specs,
             concurrency: build.concurrency.max(1),
             regenerate: build.regenerate,
-            cache_key,
             debug_prefix: self.harness_debug_prefix.clone(),
             llm_settings: None,
             window_restart_threshold_tokens: self.harness_window_restart_threshold_tokens,

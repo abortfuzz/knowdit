@@ -55,17 +55,10 @@ impl From<MinStrengthArg> for LinkStrength {
 
 /// Knobs for the gen-specs phase. Long-flag names carry a
 /// `--gen-specs-*` prefix to disambiguate from other phases'
-/// equivalents (`cache_key`, `concurrency`, `regenerate`,
-/// `max_agent_steps`, `compact_context_threshold_tokens`,
+/// equivalents (`concurrency`, `regenerate`, `max_agent_steps`,
 /// `debug_prefix`).
 #[derive(Args, Clone, Debug)]
 pub struct GenSpecsSharedArgs {
-    /// `llmy` cache key prefix. Defaults to
-    /// `{project_name}-knowdit-spec` so different projects don't
-    /// share a cache namespace.
-    #[arg(long = "gen-specs-cache-key")]
-    pub gen_specs_cache_key: Option<String>,
-
     /// Maximum agent steps per link before forced abandonment.
     #[arg(long = "gen-specs-max-agent-steps", default_value_t = 60)]
     pub gen_specs_max_agent_steps: usize,
@@ -88,11 +81,6 @@ pub struct GenSpecsSharedArgs {
     /// `0` means no cap.
     #[arg(long = "gen-specs-max-links-per-extract", default_value_t = 0)]
     pub gen_specs_max_links_per_extract: usize,
-
-    /// Compaction threshold in approximate tokens. Default ~80% of
-    /// model max.
-    #[arg(long = "gen-specs-compact-context-threshold-tokens")]
-    pub gen_specs_compact_context_threshold_tokens: Option<usize>,
 
     /// Number of links processed in parallel. Defaults to `1`
     /// (strict serial) when omitted. Typed `Option` so streamloop's
@@ -134,6 +122,25 @@ pub struct GenSpecsSharedArgs {
     #[arg(long = "gen-specs-min-strength", value_enum, default_value_t = MinStrengthArg::High)]
     pub gen_specs_min_strength: MinStrengthArg,
 
+    /// Fraction of the model's input window that the whole in-scope project
+    /// source may occupy when kept resident in the gen-spec system prompt.
+    ///
+    /// When the rendered source fits the budget, every contract and interface
+    /// body is placed at the top of the system prompt and the
+    /// `read_contract_source` / `read_function_source` tools and the
+    /// signature-index memory are withheld — they could only return text the
+    /// agent already holds. When it does not fit, the agent reads on demand
+    /// exactly as before. The call-graph and cross-reference tools stay in both
+    /// modes (they return derived relations, not source), as do the repository
+    /// file tools (tests, docs and vendored trees are outside the block).
+    ///
+    /// This is an economic budget, not a fit check: the block is re-billed at
+    /// the cached input rate on every call the stage makes, so a source tree
+    /// big enough to outweigh the reads it replaces costs more than it saves
+    /// even when it fits the window comfortably. `0` disables residency.
+    #[arg(long = "gen-specs-resident-source-window-ratio", default_value_t = 0.0)]
+    pub gen_specs_resident_source_window_ratio: f64,
+
     /// Minimum global-linker-emitted link strength on the
     /// `(historical, finding)` edge. Independent axis from
     /// `--gen-specs-min-strength`: this rejects findings the linker
@@ -144,18 +151,16 @@ pub struct GenSpecsSharedArgs {
     pub gen_specs_min_link_strength: MinStrengthArg,
 
     /// Debug prefix passed to llmy.
-    #[arg(long = "gen-specs-debug-prefix")]
+    #[arg(long = "gen-specs-debug-prefix", default_value = "spec")]
     pub gen_specs_debug_prefix: Option<String>,
 }
 
 impl GenSpecsSharedArgs {
     /// Build the [`SpecGenOptions`] for one Specification Generator pass from
-    /// these CLI knobs. The cache key defaults to `{project_name}-knowdit-spec`;
-    /// `link_source` frames the gen-spec agent (mapper topic-hint vs external
-    /// reported finding).
+    /// these CLI knobs. `link_source` frames the gen-spec agent (mapper
+    /// topic-hint vs external reported finding).
     pub(crate) fn build_spec_options(
         &self,
-        project_name: &str,
         language_prompt_prefix: String,
         link_source: LinkSource,
         project_profile: Option<knowdit_repo_model::ProjectProfile>,
@@ -163,11 +168,6 @@ impl GenSpecsSharedArgs {
         SpecGenOptions {
             max_agent_steps: self.gen_specs_max_agent_steps,
             max_specs_per_link: self.gen_specs_max_specs_per_link,
-            compact_context_threshold_tokens: self.gen_specs_compact_context_threshold_tokens,
-            cache_key: self
-                .gen_specs_cache_key
-                .clone()
-                .unwrap_or_else(|| format!("{}-knowdit-spec", project_name)),
             debug_prefix: self.gen_specs_debug_prefix.clone(),
             llm_settings: None,
             max_links: (self.gen_specs_max_links > 0).then_some(self.gen_specs_max_links),
@@ -182,6 +182,8 @@ impl GenSpecsSharedArgs {
             language_prompt_prefix,
             link_source,
             project_profile,
+            resident_source_window_ratio: self.gen_specs_resident_source_window_ratio,
+            source_access: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -283,12 +285,8 @@ impl GenSpecsArgs {
                  run the profile phase)."
             )
         })?;
-        let mut options = shared.build_spec_options(
-            project_name,
-            language_prompt_prefix,
-            LinkSource::Mapper,
-            Some(profile),
-        );
+        let mut options =
+            shared.build_spec_options(language_prompt_prefix, LinkSource::Mapper, Some(profile));
         // The only knob this standalone path reads that the shared builder
         // does not: streamloop drives concurrency from its own scheduler.
         options.concurrency = shared.gen_specs_concurrency.unwrap_or(1).max(1);

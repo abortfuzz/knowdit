@@ -136,7 +136,6 @@ pub struct CategorizeRunner {
     pub options: AgentRunOptions,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
 }
 
@@ -160,7 +159,6 @@ impl CategorizeRunner {
             tools,
             system_prompt: self.system_prompt,
             user_prompt: self.user_prompt,
-            cache_key: self.cache_key,
             label: self.label,
         };
 
@@ -231,7 +229,6 @@ pub struct SemanticChunkExtractor {
     pub options: AgentRunOptions,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
 }
 
@@ -254,7 +251,6 @@ impl SemanticChunkExtractor {
             tools,
             system_prompt: self.system_prompt,
             user_prompt: self.user_prompt,
-            cache_key: self.cache_key,
             label: self.label,
         };
         let _outcome = runner.run().await?;
@@ -314,7 +310,6 @@ pub struct FindingChunkExtractor {
     pub options: AgentRunOptions,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
 }
 
@@ -337,7 +332,6 @@ impl FindingChunkExtractor {
             tools,
             system_prompt: self.system_prompt,
             user_prompt: self.user_prompt,
-            cache_key: self.cache_key,
             label: self.label,
         };
         let _outcome = runner.run().await?;
@@ -708,7 +702,6 @@ pub struct SemanticMergeChunkRunner {
     pub options: AgentRunOptions,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
     pub valid_names: Arc<HashSet<String>>,
     pub valid_target_ids: Arc<HashSet<i32>>,
@@ -739,7 +732,6 @@ impl SemanticMergeChunkRunner {
             tools,
             system_prompt: self.system_prompt,
             user_prompt: self.user_prompt,
-            cache_key: self.cache_key,
             label: self.label,
         };
         let _outcome = runner.run().await?;
@@ -763,8 +755,6 @@ pub struct SemanticMerger {
     /// Base agent run options (each chunk gets a `scoped` subprefix).
     pub agent_options: AgentRunOptions,
     pub chunking: MergeChunkingOptions,
-    /// Cache key root (each chunk appends its index).
-    pub cache_key_root: String,
     /// Debug key root (each chunk appends its index).
     pub debug_key_root: String,
     /// Human label root (used in tracing).
@@ -869,7 +859,6 @@ impl SemanticMerger {
             &Self::render_candidate_chunk(chunk),
             new_semantics_block,
         );
-        let cache_key = format!("{}-chunk{idx:04}", self.cache_key_root);
         let debug_scope = format!("{}-chunk{idx:04}", self.debug_key_root);
         let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
         let valid_target_ids: Arc<HashSet<i32>> =
@@ -885,7 +874,6 @@ impl SemanticMerger {
             options: self.agent_options.scoped(&debug_scope),
             system_prompt: crate::prompts::GENERAL_ROLE_SYSTEM.to_string(),
             user_prompt,
-            cache_key,
             label,
             valid_names,
             valid_target_ids,
@@ -1349,7 +1337,6 @@ pub struct FindingMergeChunkRunner {
     pub options: AgentRunOptions,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub cache_key: String,
     pub label: String,
     pub valid_titles: Arc<HashSet<String>>,
     pub valid_target_ids: Arc<HashSet<i32>>,
@@ -1380,7 +1367,6 @@ impl FindingMergeChunkRunner {
             tools,
             system_prompt: self.system_prompt,
             user_prompt: self.user_prompt,
-            cache_key: self.cache_key,
             label: self.label,
         };
         let _outcome = runner.run().await?;
@@ -1404,7 +1390,6 @@ pub struct FindingMerger {
     pub llm: LLM,
     pub agent_options: AgentRunOptions,
     pub chunking: MergeChunkingOptions,
-    pub cache_key_root: String,
     pub debug_key_root: String,
     pub label_root: String,
 }
@@ -1567,7 +1552,6 @@ impl FindingMerger {
             &Self::render_candidate_chunk(chunk),
             new_findings_block,
         );
-        let cache_key = format!("{}-chunk{idx:04}", self.cache_key_root);
         let debug_scope = format!("{}-chunk{idx:04}", self.debug_key_root);
         let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
         let valid_target_ids: Arc<HashSet<i32>> =
@@ -1592,7 +1576,6 @@ impl FindingMerger {
             options: self.agent_options.scoped(&debug_scope),
             system_prompt: crate::prompts::GENERAL_ROLE_SYSTEM.to_string(),
             user_prompt,
-            cache_key,
             label,
             valid_titles,
             valid_target_ids,

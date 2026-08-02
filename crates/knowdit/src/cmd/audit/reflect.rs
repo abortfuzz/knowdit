@@ -52,13 +52,8 @@ pub struct ReflectSharedArgs {
     #[arg(long = "reflect-skip-grader", default_value_t = false)]
     pub reflect_skip_grader: bool,
 
-    /// `llmy` cache key prefix. Defaults to
-    /// `{project_name}-knowdit-grader`.
-    #[arg(long = "reflect-cache-key")]
-    pub reflect_cache_key: Option<String>,
-
     /// Debug-prefix forwarded to llmy for LLM-call dumps.
-    #[arg(long = "reflect-debug-prefix")]
+    #[arg(long = "reflect-debug-prefix", default_value = "reflect")]
     pub reflect_debug_prefix: Option<String>,
 
     /// Cap on number of violated runs reflected in this invocation.
@@ -72,11 +67,6 @@ pub struct ReflectSharedArgs {
     /// grader's budget only applies when verdict is `ValidFinding`.
     #[arg(long = "grader-max-agent-steps", default_value_t = 40)]
     pub grader_max_agent_steps: usize,
-
-    /// Compaction threshold for grader agent context, in approximate
-    /// tokens. Defaults to ~80% of the model's max input.
-    #[arg(long = "grader-compact-context-threshold-tokens")]
-    pub grader_compact_context_threshold_tokens: Option<usize>,
 
     /// **Destructive**: at the start of the run, wipe every existing
     /// `reflection` + `valid_finding` row in the project DB so every
@@ -185,11 +175,6 @@ impl ReflectArgs {
         }
         let grader_options = GraderOptions {
             max_agent_steps: shared.grader_max_agent_steps,
-            compact_context_threshold_tokens: shared.grader_compact_context_threshold_tokens,
-            cache_key: shared
-                .reflect_cache_key
-                .clone()
-                .unwrap_or_else(|| format!("{}-knowdit-grader", project_name)),
             debug_prefix: shared.reflect_debug_prefix.clone(),
             llm_settings: None,
         };
@@ -214,7 +199,6 @@ impl ReflectArgs {
     pub async fn reflect_code_gens(
         repo: &RepoDatabase,
         llm: &LLM,
-        project_name: &str,
         repo_root: &Path,
         language_prompt_prefix: String,
         shared: &ReflectSharedArgs,
@@ -225,11 +209,6 @@ impl ReflectArgs {
         }
         let grader_options = GraderOptions {
             max_agent_steps: shared.grader_max_agent_steps,
-            compact_context_threshold_tokens: shared.grader_compact_context_threshold_tokens,
-            cache_key: shared
-                .reflect_cache_key
-                .clone()
-                .unwrap_or_else(|| format!("{}-knowdit-grader", project_name)),
             debug_prefix: shared.reflect_debug_prefix.clone(),
             llm_settings: None,
         };

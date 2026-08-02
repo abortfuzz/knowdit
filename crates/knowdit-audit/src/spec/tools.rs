@@ -179,6 +179,8 @@ impl DraftHandle {
         tools.add_tool(LookupStateVariableXrefsTool {
             project: project_index.clone(),
         });
+        // The source readers are only registered when the agent does not
+        // already carry the source in its prompt.
         tools.add_tool(ReadContractSourceTool {
             project: project_index.clone(),
         });
@@ -784,24 +786,12 @@ impl ReadContractSourceTool {
         let mut out = String::new();
         for id in contract_ids {
             if let Some(contract) = self.project.contract(id) {
-                out.push_str(&format!(
-                    "## contract `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
-                    contract.name,
-                    contract.relative_file_path.display(),
-                    contract.id,
-                    contract.chunk.content.trim_end(),
-                ));
+                self.project.push_contract_source(&mut out, contract);
             }
         }
         for id in interface_ids {
             if let Some(interface) = self.project.interface(id) {
-                out.push_str(&format!(
-                    "## interface `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
-                    interface.name,
-                    interface.relative_file_path.display(),
-                    interface.id,
-                    interface.chunk.content.trim_end(),
-                ));
+                self.project.push_interface_source(&mut out, interface);
             }
         }
         Ok(out)
