@@ -73,6 +73,11 @@ pub enum WorkflowCommands {
     /// across all three phases.
     Learn(cmd::workflow::learn::WorkflowLearnArgs),
 
+    /// Validate externally-supplied findings: ingest findings JSON in place
+    /// of discovery, then run gen-specs → fuzz → reflect (→ regen).
+    /// Solidity-only.
+    ExternalValidate(cmd::workflow::external_validate::ExternalValidateArgs),
+
     /// Merge another historical KG into this one with semantic dedup:
     /// dedup canonical semantics/findings against this KG, flatten the
     /// duplicates one level, carry the source's finding↔semantic links
@@ -312,6 +317,7 @@ impl WorkflowCommand {
             WorkflowCommands::Streamloop(args) => args.run(&llm).await?,
             WorkflowCommands::ReviewFindings(args) => args.run(&llm).await?,
             WorkflowCommands::Learn(args) => args.run(&llm).await?,
+            WorkflowCommands::ExternalValidate(args) => args.run(&llm).await?,
             WorkflowCommands::MergeKg(args) => args.run(&llm).await?,
         }
         Ok(())

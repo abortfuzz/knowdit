@@ -34,6 +34,7 @@ use knowdit_audit::reflect::review_grader::{ReviewGrader, ReviewInput};
 use knowdit_audit::report::merge::{MergeAgent, MergeInput};
 use knowdit_audit::report::render::{DuplicateBrief, RenderFinding, render_markdown_report};
 use knowdit_audit::report::ruled_out::{ConclusionMergeInput, RuledOutMerger};
+use knowdit_audit::spec::is_billing_exhausted;
 use knowdit_repo_model::{
     FindingMergeDecision, LoadedReportFinding, RawFindingMember, RepoDatabase, ReportFindingSeed,
     ReviewSeverity, ReviewedFinding, RuledOutConclusion, RuledOutMergeDecision, SourceLanguage,
@@ -416,6 +417,12 @@ impl ReportContext {
                     }
                 }
                 Ok(Err(err)) => {
+                    if is_billing_exhausted(&err) {
+                        tasks.abort_all();
+                        return Err(err).wrap_err(
+                            "review-findings stopped because the LLM billing cap was exhausted",
+                        );
+                    }
                     self.stats.review_errors += 1;
                     tracing::error!("[review-findings] review failed for a finding: {err:#}");
                 }

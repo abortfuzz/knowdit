@@ -3412,6 +3412,30 @@ impl RepoDatabase {
         Ok(())
     }
 
+    /// Load the structured reviews for the requested raw finding reflections.
+    ///
+    /// Returned rows are ordered by `reflection_id` for deterministic JSON
+    /// output. Unknown ids are ignored.
+    pub async fn load_finding_reviews_by_reflection_ids(
+        &self,
+        reflection_ids: &[i32],
+    ) -> Result<Vec<ReviewedFinding>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        if reflection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(finding_review_model::Entity::find()
+            .filter(finding_review_model::Column::ReflectionId.is_in(reflection_ids.to_vec()))
+            .order_by_asc(finding_review_model::Column::ReflectionId)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load finding_review rows by reflection ids")?
+            .into_iter()
+            .map(ReviewedFinding::from)
+            .collect())
+    }
+
     /// Reviewed raw findings that have NOT been folded into a canonical yet
     /// (no `finding_merge` edge) — the Merge agent's drain queue. "Merged"
     /// is derived purely from edge presence; there is no boolean flag.
