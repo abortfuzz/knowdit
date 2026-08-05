@@ -122,23 +122,34 @@ pub struct GenSpecsSharedArgs {
     #[arg(long = "gen-specs-min-strength", value_enum, default_value_t = MinStrengthArg::High)]
     pub gen_specs_min_strength: MinStrengthArg,
 
-    /// Fraction of the model's input window that the whole in-scope project
-    /// source may occupy when kept resident in the gen-spec system prompt.
+    /// Ceiling on the resident project source, as a fraction of the model's
+    /// input window.
     ///
-    /// When the rendered source fits the budget, every contract and interface
-    /// body is placed at the top of the system prompt and the
-    /// `read_contract_source` / `read_function_source` tools and the
-    /// signature-index memory are withheld — they could only return text the
-    /// agent already holds. When it does not fit, the agent reads on demand
-    /// exactly as before. The call-graph and cross-reference tools stay in both
-    /// modes (they return derived relations, not source), as do the repository
-    /// file tools (tests, docs and vendored trees are outside the block).
+    /// The block is filled up to this budget, contracts the project profile
+    /// calls core first; whatever does not fit stays on demand behind
+    /// `read_contract_source` / `read_function_source` and keeps its
+    /// signature-index entry. So this is a spending limit rather than a
+    /// threshold — a project larger than the budget still gets its core
+    /// resident instead of falling back to reading everything. `0` disables
+    /// residency entirely.
     ///
-    /// This is an economic budget, not a fit check: the block is re-billed at
-    /// the cached input rate on every call the stage makes, so a source tree
-    /// big enough to outweigh the reads it replaces costs more than it saves
-    /// even when it fits the window comfortably. `0` disables residency.
-    #[arg(long = "gen-specs-resident-source-window-ratio", default_value_t = 0.0)]
+    /// It has to be a ceiling because the block is re-billed at the cached
+    /// input rate on *every* call the stage makes. At the measured ~6 calls per
+    /// link, one resident token costs about 60% of what one uncached token
+    /// costs, so a block big enough to outweigh the reads it replaces loses
+    /// money even when it fits the window comfortably.
+    ///
+    /// The default admits ~92k tokens. Residency itself is well supported —
+    /// across 21 full-budget audit runs, every run with a resident block
+    /// out-produced every run without one, with no overlap. The exact ceiling
+    /// is not: the runs that measured it were on a project whose whole source
+    /// was 55k tokens, so every setting at or above ~0.06 behaved identically
+    /// there. 0.1 is chosen from the cost model — it covers a project of that
+    /// size whole, covers the core of a much larger one, and caps the
+    /// worst-case carry at roughly half of what the stage currently spends per
+    /// link. Projects with a source tree far past the budget are where this
+    /// number should be revisited.
+    #[arg(long = "gen-specs-resident-source-window-ratio", default_value_t = 0.1)]
     pub gen_specs_resident_source_window_ratio: f64,
 
     /// Minimum global-linker-emitted link strength on the
