@@ -39,23 +39,36 @@ impl ProjectScope {
     /// resolving an inherited or imported symbol needs the dependency's source. So
     /// anything that reads the call graph back as *the project's own* surface has to
     /// filter them out again, and does it here rather than by restating the list —
-    /// [`crate::data::DEFAULT_VENDORED_EXCLUDES`] stays the single definition.
-    pub fn is_vendored_path(relative_path: &Path) -> bool {
+    /// [`crate::data::vendored_excludes`] stays the single definition.
+    ///
+    /// `include_lib` must carry the project's `--include-lib-sources` setting, the
+    /// same one the loader was given. A caller that hardcodes `false` on a project
+    /// whose implementation lives under `lib/` classifies that implementation as a
+    /// third-party dependency, and everything downstream of this call then treats
+    /// the code under audit as something to skip.
+    pub fn is_vendored_path(relative_path: &Path, include_lib: bool) -> bool {
+        // One compiled set per variant: this is called once per call-graph entity
+        // per link, and both variants are stable for a whole run.
         static EXCLUDES: OnceLock<GlobSet> = OnceLock::new();
-        // The patterns are a compile-time constant that the loader itself already
-        // compiles on every project load, so a failure here is impossible in
-        // practice; an empty set (matching nothing) is the safe reading either way.
-        EXCLUDES
-            .get_or_init(|| {
-                let mut builder = GlobSetBuilder::new();
-                for pattern in crate::data::DEFAULT_VENDORED_EXCLUDES {
-                    if let Ok(glob) = Glob::new(pattern) {
-                        builder.add(glob);
-                    }
+        static EXCLUDES_WITH_LIB: OnceLock<GlobSet> = OnceLock::new();
+        let build = || {
+            let mut builder = GlobSetBuilder::new();
+            for pattern in crate::data::vendored_excludes(include_lib) {
+                // The patterns are a compile-time constant that the loader itself
+                // already compiles on every project load, so a failure here is
+                // impossible in practice; skipping the pattern (and, below, an
+                // empty set matching nothing) is the safe reading either way.
+                if let Ok(glob) = Glob::new(pattern) {
+                    builder.add(glob);
                 }
-                builder.build().unwrap_or_else(|_| GlobSet::empty())
-            })
-            .is_match(relative_path)
+            }
+            builder.build().unwrap_or_else(|_| GlobSet::empty())
+        };
+        match include_lib {
+            true => EXCLUDES_WITH_LIB.get_or_init(build),
+            false => EXCLUDES.get_or_init(build),
+        }
+        .is_match(relative_path)
     }
 
     /// Walk `repo_root` and capture every regular file whose
@@ -480,5 +493,25 @@ mod tests {
         let file = &content.files()[0];
         assert_eq!(file.relative_path, PathBuf::from("a.sol"));
         assert_eq!(file.content, "contract A {}");
+    }
+
+    #[test]
+    fn include_lib_flips_only_the_lib_trees() {
+        let lib = Path::new("lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol");
+        assert!(ProjectScope::is_vendored_path(lib, false));
+        assert!(!ProjectScope::is_vendored_path(lib, true));
+
+        // Everything else the loader excludes stays excluded either way — the
+        // flag is about `lib/` alone, not about auditing test or build trees.
+        for other in ["test/Vault.t.sol", "node_modules/x/y.sol", "cache/a.sol"] {
+            assert!(ProjectScope::is_vendored_path(Path::new(other), false));
+            assert!(ProjectScope::is_vendored_path(Path::new(other), true));
+        }
+
+        // ...and project source is never vendored under either setting.
+        for own in ["src/Vault.sol", "contracts/Loans.sol"] {
+            assert!(!ProjectScope::is_vendored_path(Path::new(own), false));
+            assert!(!ProjectScope::is_vendored_path(Path::new(own), true));
+        }
     }
 }

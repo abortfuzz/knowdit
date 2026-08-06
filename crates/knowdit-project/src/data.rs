@@ -157,12 +157,8 @@ impl ProjectData {
         root_dir: &Path,
         platform_id: Option<&str>,
     ) -> Result<Self> {
-        let excludes: Vec<&str> = DEFAULT_VENDORED_EXCLUDES
-            .iter()
-            .copied()
-            .filter(|pattern| !matches!(*pattern, "lib" | "lib/**" | "**/lib" | "**/lib/**"))
-            .collect();
-        Self::from_source_dir_with_excludes(name, root_dir, platform_id, &excludes).await
+        Self::from_source_dir_with_excludes(name, root_dir, platform_id, &vendored_excludes(true))
+            .await
     }
 
     async fn from_source_dir_with_excludes(
@@ -278,6 +274,26 @@ impl ProjectData {
             content,
         })
     }
+}
+
+/// The `lib/` subset of [`DEFAULT_VENDORED_EXCLUDES`], named separately
+/// because it is the one group a project can legitimately own: most Foundry
+/// repositories put their dependencies there, a few put their implementation
+/// there. [`vendored_excludes`] is the only thing that should drop it.
+pub(crate) const LIB_EXCLUDES: [&str; 4] = ["lib", "lib/**", "**/lib", "**/lib/**"];
+
+/// The exclude patterns for one project, honouring `--include-lib-sources`.
+///
+/// Every consumer that has to answer "is this path the project's own source?"
+/// goes through here, so the scanner and the prompt-rendering layers cannot
+/// reach opposite conclusions about the same file — which is exactly what
+/// happens when one of them reads the raw constant instead.
+pub(crate) fn vendored_excludes(include_lib: bool) -> Vec<&'static str> {
+    DEFAULT_VENDORED_EXCLUDES
+        .iter()
+        .copied()
+        .filter(|pattern| !include_lib || !LIB_EXCLUDES.contains(pattern))
+        .collect()
 }
 
 /// Default vendored-dir excludes shared by every project loader.

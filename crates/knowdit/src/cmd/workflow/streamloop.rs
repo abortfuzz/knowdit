@@ -592,6 +592,7 @@ impl StreamloopArgs {
             language_prompt_prefix.clone(),
             LinkSource::Mapper,
             Some(profile.clone()),
+            self.project.include_lib_sources,
         );
         // When `--review-findings` is set, the link pipeline drains review +
         // merge after each completed link and finalizes (writer + export) at

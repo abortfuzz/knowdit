@@ -203,6 +203,7 @@ impl ExternalValidateArgs {
             language_prompt_prefix.clone(),
             LinkSource::External,
             Some(profile.clone()),
+            self.project.include_lib_sources,
         );
         // Resolve review inputs before starting costly validation work so a
         // missing/invalid criteria file fails fast.

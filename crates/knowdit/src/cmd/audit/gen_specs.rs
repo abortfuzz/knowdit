@@ -170,11 +170,17 @@ impl GenSpecsSharedArgs {
     /// Build the [`SpecGenOptions`] for one Specification Generator pass from
     /// these CLI knobs. `link_source` frames the gen-spec agent (mapper
     /// topic-hint vs external reported finding).
+    ///
+    /// `include_lib_sources` comes from [`crate::cli::ProjectArgs`] and has to
+    /// be the same value the project was loaded with — it decides whether the
+    /// resident source block treats `lib/` as the project's implementation or
+    /// as its dependencies.
     pub(crate) fn build_spec_options(
         &self,
         language_prompt_prefix: String,
         link_source: LinkSource,
         project_profile: Option<knowdit_repo_model::ProjectProfile>,
+        include_lib_sources: bool,
     ) -> SpecGenOptions {
         SpecGenOptions {
             max_agent_steps: self.gen_specs_max_agent_steps,
@@ -194,6 +200,7 @@ impl GenSpecsSharedArgs {
             link_source,
             project_profile,
             resident_source_window_ratio: self.gen_specs_resident_source_window_ratio,
+            include_lib_sources,
             source_access: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -244,6 +251,7 @@ impl GenSpecsArgs {
             &spec.name,
             SolidityHarness::PROMPT_PREFIX.to_string(),
             &self.shared,
+            self.project.include_lib_sources,
         )
         .await?;
         println!(
@@ -286,6 +294,7 @@ impl GenSpecsArgs {
         project_name: &str,
         language_prompt_prefix: String,
         shared: &GenSpecsSharedArgs,
+        include_lib_sources: bool,
     ) -> Result<SpecGenOutcome> {
         // The profile is both a precondition (the upstream pipeline must have
         // produced one) and an input: it goes into every link's system prompt.
@@ -296,8 +305,12 @@ impl GenSpecsArgs {
                  run the profile phase)."
             )
         })?;
-        let mut options =
-            shared.build_spec_options(language_prompt_prefix, LinkSource::Mapper, Some(profile));
+        let mut options = shared.build_spec_options(
+            language_prompt_prefix,
+            LinkSource::Mapper,
+            Some(profile),
+            include_lib_sources,
+        );
         // The only knob this standalone path reads that the shared builder
         // does not: streamloop drives concurrency from its own scheduler.
         options.concurrency = shared.gen_specs_concurrency.unwrap_or(1).max(1);

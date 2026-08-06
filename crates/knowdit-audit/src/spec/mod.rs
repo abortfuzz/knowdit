@@ -258,6 +258,11 @@ pub struct SpecGenOptions {
     /// occupy. `0.0` disables residency, which is the pipeline's original
     /// behaviour. See [`crate::source_access::ProjectSourceAccess`].
     pub resident_source_window_ratio: f64,
+    /// The project's `--include-lib-sources` setting, so the resident block and
+    /// the signature index classify `lib/` the same way the project loader did.
+    /// Must match what the loader was given: disagreement means the audited
+    /// source is silently absent from both.
+    pub include_lib_sources: bool,
     /// Residency decision for this run, made on the first link that needs it
     /// (the deciding inputs — project index and model — only meet there) and
     /// then shared by every later link, so prompt, tool box and memory can
@@ -283,6 +288,7 @@ impl Default for SpecGenOptions {
             link_source: LinkSource::Mapper,
             project_profile: None,
             resident_source_window_ratio: 0.0,
+            include_lib_sources: false,
             source_access: Arc::new(OnceLock::new()),
         }
     }
@@ -1269,6 +1275,7 @@ impl PlannedLinkWork {
                 llm,
                 options.resident_source_window_ratio,
                 options.project_profile.as_ref(),
+                options.include_lib_sources,
             )
         });
         let memory = source_access.link_memory(project_index)?;

@@ -667,11 +667,17 @@ impl ProjectIndex {
     /// expensive thing an agent never reads. The source tools reach those trees
     /// instead.
     ///
+    /// `include_lib` carries the project's `--include-lib-sources` setting: with
+    /// it set, `lib/` holds the project's own implementation rather than its
+    /// dependencies, and dropping it here would leave the audited code out of
+    /// both the resident block and the signature index that covers what the
+    /// block omits.
+    ///
     /// Each candidate carries its call-graph degree and its path; the packing
     /// order is
     /// [`crate::source_access::ProjectSourceAccess::resolve`]'s decision, since
     /// that is where the budget lives.
-    pub(crate) fn resident_candidates(&self) -> Vec<ResidentCandidate> {
+    pub(crate) fn resident_candidates(&self, include_lib: bool) -> Vec<ResidentCandidate> {
         // Degree per owning contract: every call is counted once for the caller
         // and once for the callee, so a hub scores on both sides.
         let mut degree: BTreeMap<i32, usize> = BTreeMap::new();
@@ -688,7 +694,7 @@ impl ProjectIndex {
 
         let mut out: Vec<ResidentCandidate> = Vec::new();
         for contract in self.call_graph.contracts.values() {
-            if knowdit_project::ProjectScope::is_vendored_path(&contract.relative_file_path) {
+            if knowdit_project::ProjectScope::is_vendored_path(&contract.relative_file_path, include_lib) {
                 continue;
             }
             let mut source = String::new();
@@ -703,7 +709,7 @@ impl ProjectIndex {
             });
         }
         for interface in self.call_graph.interfaces.values() {
-            if knowdit_project::ProjectScope::is_vendored_path(&interface.relative_file_path) {
+            if knowdit_project::ProjectScope::is_vendored_path(&interface.relative_file_path, include_lib) {
                 continue;
             }
             let mut source = String::new();

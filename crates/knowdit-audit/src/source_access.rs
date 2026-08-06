@@ -109,6 +109,10 @@ impl ProjectSourceAccess {
     /// the periphery and defers the core. It reached 26 of 65 at the same
     /// budget.
     ///
+    /// `include_lib` carries the project's `--include-lib-sources` setting
+    /// through to the candidate filter; see
+    /// [`ProjectIndex::resident_candidates`].
+    ///
     /// Every term is run-invariant, so each link packs the same prefix — without
     /// that the block cannot sit inside a cached prompt prefix.
     pub fn resolve(
@@ -116,6 +120,7 @@ impl ProjectSourceAccess {
         llm: &LLM,
         window_ratio: f64,
         profile: Option<&ProjectProfile>,
+        include_lib: bool,
     ) -> Self {
         let mut access = Self {
             source: String::new(),
@@ -145,7 +150,7 @@ impl ProjectSourceAccess {
                 .unwrap_or(usize::MAX)
         };
 
-        let mut candidates = index.resident_candidates();
+        let mut candidates = index.resident_candidates(include_lib);
         candidates.sort_by(|a, b| {
             core_rank(a)
                 .cmp(&core_rank(b))

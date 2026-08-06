@@ -264,6 +264,7 @@ impl AutoloopArgs {
                 &spec_name,
                 language_prompt_prefix.clone(),
                 &self.gen_specs,
+                self.project.include_lib_sources,
             )
             .await?;
             tracing::info!(
