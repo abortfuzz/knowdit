@@ -247,6 +247,12 @@ pub struct StreamloopArgs {
     /// `<output_folder>/specifications`, but forge preflight, harness
     /// generation, fuzzing, reflection, regeneration, and report review are
     /// skipped.
+    ///
+    /// Implies `--inject-reviewed-findings=false --inject-ruled-out=false`:
+    /// both are filled by the review phase this mode skips. Agents then cannot
+    /// see what the run has already specified, so expect the same defect to be
+    /// specified over and over — see `--inject-reviewed-findings` for the size
+    /// of that effect.
     #[arg(long, default_value_t = false)]
     pub only_spec: bool,
 
@@ -298,6 +304,20 @@ impl StreamloopArgs {
             return Err(eyre!(
                 "--only-spec cannot be combined with --review-findings"
             ));
+        }
+        // `--only-spec` excludes `--review-findings`, and both injections below
+        // hard-require it — so leaving them at their default `true` would make
+        // every `--only-spec` run abort on a flag the user never set. Turn them
+        // off here rather than making the caller repeat two `=false` opt-outs.
+        // Nothing is lost: with no review phase there is no canonical set and no
+        // ruled-out set to inject.
+        if self.only_spec && (self.inject_reviewed_findings || self.inject_ruled_out) {
+            tracing::info!(
+                "[streamloop] --only-spec: disabling --inject-reviewed-findings / \
+                 --inject-ruled-out (both are filled by the review phase, which this mode skips)"
+            );
+            self.inject_reviewed_findings = false;
+            self.inject_ruled_out = false;
         }
         self.apply_default_concurrency();
         // Validate --mapper-extra-categories up front so a typo aborts before
