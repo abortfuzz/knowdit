@@ -126,13 +126,37 @@ pub use knowdit_repo_model::{LinkInput, LinkKey};
 // Billing-cap exhaustion
 // ---------------------------------------------------------------------------
 
-/// Details of a billing-cap exhaustion ([`LLMYError::Billing`]) lifted out of
-/// an eyre error chain. A billing exhaustion is **run-fatal**, not a per-link
-/// failure: `llmy` fails fast on the pre-flight `check_cap` before every
-/// request, so once the cap is hit *every* later LLM call fails the same way.
-/// Orchestrators surface this (which cap, how much spent) and abort the whole
-/// run instead of silently abandoning the rest of the queue one wasted link at
-/// a time.
+/// The llmy error inside an eyre report, if there is one.
+///
+/// The one bridge between the two error worlds. Everything an orchestrator
+/// wants to know about a failure — was it the billing cap, was it the provider
+/// turning the prompt away — is already a method on [`LLMYError`]; the only
+/// thing knowdit has to do is find it, because by the time a caller sees the
+/// failure it is several `wrap_err` layers down inside a report.
+fn llmy_error(err: &color_eyre::eyre::Report) -> Option<&LLMYError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<LLMYError>())
+}
+
+/// Details of a billing-cap exhaustion, if that is what `err` is.
+///
+/// A billing exhaustion is **run-fatal**, not a per-link failure: `llmy` fails
+/// fast on the pre-flight `check_cap` before every request, so once the cap is
+/// hit *every* later LLM call fails the same way. Orchestrators surface this
+/// (which cap, how much spent) and abort the whole run instead of silently
+/// abandoning the rest of the queue one wasted link at a time.
+/// Details of a billing-cap exhaustion.
+///
+/// A billing exhaustion is **run-fatal**, not a per-link failure: `llmy` fails
+/// fast on the pre-flight `check_cap` before every request, so once the cap is
+/// hit *every* later LLM call fails the same way. Orchestrators surface this
+/// (which cap, how much spent) and abort the whole run instead of silently
+/// abandoning the rest of the queue one wasted link at a time.
+///
+/// A local mirror of llmy's struct only because the 0.20.0 facade re-exports
+/// `LLMYError` but not this payload. Nothing is re-derived — the fields are
+/// copied straight off `LLMYError::billing_exhaustion()`. Delete in favour of
+/// llmy's own once the facade exports it.
 #[derive(Debug, Clone, Serialize)]
 pub struct BillingExhausted {
     pub cap: Decimal,
@@ -143,30 +167,31 @@ pub struct BillingExhausted {
     pub node: u64,
 }
 
-/// If `err`'s cause chain contains an [`LLMYError::Billing`], return its
-/// details. Walks the full chain because [`PlannedLinkWork::run_agent`] / the graders
-/// `wrap_err` the raw `LLMYError` into an eyre report before it reaches a caller.
 pub fn billing_exhaustion(err: &color_eyre::eyre::Report) -> Option<BillingExhausted> {
-    err.chain()
-        .find_map(|cause| match cause.downcast_ref::<LLMYError>() {
-            Some(LLMYError::Billing {
-                cap,
-                current,
-                node,
-                scope,
-            }) => Some(BillingExhausted {
-                cap: *cap,
-                current: *current,
-                scope: scope.clone(),
-                node: *node,
-            }),
-            _ => None,
-        })
+    let e = llmy_error(err)?.billing_exhaustion()?;
+    Some(BillingExhausted {
+        cap: e.cap,
+        current: e.current,
+        scope: e.scope,
+        node: e.node,
+    })
 }
 
 /// Convenience predicate over [`billing_exhaustion`].
 pub fn is_billing_exhausted(err: &color_eyre::eyre::Report) -> bool {
     billing_exhaustion(err).is_some()
+}
+
+/// Whether the provider turned this request away rather than failing it.
+///
+/// Worth telling apart from every other agent failure because it is the one
+/// that is *not* about this link: the same bytes are accepted or refused
+/// depending on when they are sent. Measured over the 423 requests one full run
+/// could never get through — each having burned its 30 retries a second apart —
+/// a later attempt succeeded for 93.4% of them, and a single spaced retry would
+/// have recovered 67.8%. Retrying immediately recovers nothing.
+pub fn is_content_filtered(err: &color_eyre::eyre::Report) -> bool {
+    llmy_error(err).and_then(LLMYError::filtered).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +341,11 @@ pub struct LinkSpecOutcome {
     pub specification_ids: Vec<i32>,
     /// Reason the agent reported for abandoning, when `status == Abandoned`.
     pub abort_reason: Option<String>,
+    /// The abandonment was the provider refusing the request on content
+    /// grounds, not a judgement about this link. Set so a scheduler can send
+    /// the link round again later instead of writing it off — see
+    /// [`is_content_filtered`].
+    pub content_filtered: bool,
     /// Free-form summary from the agent's final tool call.
     pub final_summary: Option<String>,
     /// Number of agent steps consumed (counts initial step too).
@@ -433,6 +463,25 @@ impl SpecGenStream {
     /// How many links the novelty judge has pushed to the back lane so far.
     pub fn deferred_links(&self) -> usize {
         self.deferred_links
+    }
+
+    /// Put a link back on the tail of the back lane after it has already run.
+    ///
+    /// For a link whose gen-spec pass died to a provider content refusal: the
+    /// refusal is a property of when the request was sent, not of the link, so
+    /// writing it off spends a candidate on nothing. The back lane drains only
+    /// once the main queue is empty, which puts hours between the two attempts
+    /// — and hours is the right scale, since the refusal rate moves in spikes
+    /// of ten to sixty minutes.
+    ///
+    /// `processed_links` is deliberately left alone: the caller already
+    /// counted this link when it claimed it, and counting it twice would make
+    /// the ordinal stream lie about how much work the run has done.
+    pub fn requeue_deferred(&mut self, link: LinkInput) {
+        // Deliberately does not touch `deferred_links`: that counter feeds the
+        // novelty judge's own "deferred as duplicates" line, and a refusal is
+        // not a duplicate. The scheduler counts these separately.
+        self.deferred.push_back(link);
     }
 
     /// Whether the front of the queue has already been judged, so the caller
@@ -578,6 +627,13 @@ impl PlannedLinkWork {
         self.total_links
     }
 
+    /// The link this work covers, for a caller that needs to hand it back to
+    /// the stream (see [`SpecGenStream::requeue_deferred`]) after `run` has
+    /// consumed the work itself.
+    pub fn link(&self) -> &LinkInput {
+        &self.link
+    }
+
     pub fn link_key(&self) -> LinkKey {
         self.link.key()
     }
@@ -614,6 +670,7 @@ impl PlannedLinkWork {
                 specifications: Vec::new(),
                 specification_ids: self.link.pre_committed_spec_ids.clone(),
                 abort_reason: None,
+                content_filtered: false,
                 final_summary: Some(
                     "resumed from existing spec rows; gen-spec agent skipped".to_string(),
                 ),
@@ -1343,6 +1400,9 @@ impl PlannedLinkWork {
             .wrap_err("spec generator agent failed on initial step")?;
 
         let mut steps = 1usize;
+        // Set when a step ends the loop because the provider refused the
+        // request rather than because anything about this link.
+        let mut filtered = false;
 
         while {
             let snapshot = draft.snapshot().await;
@@ -1371,10 +1431,47 @@ impl PlannedLinkWork {
             }
 
             steps += 1;
-            step_result = agent
+            // Matched on `LLMYError` directly: `step` hands one back typed, so
+            // wrapping it into a report here only to downcast it out again
+            // would be a round trip for nothing. The step number goes into the
+            // context at the point it is actually needed.
+            step_result = match agent
                 .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
                 .await
-                .wrap_err_with(|| format!("spec generator agent failed at step {steps}"))?;
+            {
+                Ok(result) => result,
+                // A dead billing cap kills every later call too, so it has to
+                // reach the orchestrator.
+                Err(err) if err.billing_exhaustion().is_some() => {
+                    return Err(err)
+                        .wrap_err_with(|| format!("spec generator agent failed at step {steps}"));
+                }
+                // Anything else ends this link, but harvest the draft instead
+                // of dropping it: propagating here reported the link as
+                // `0 spec(s), 0 step(s)`, which reads as "the agent never ran"
+                // and hides both the real step count and the cause.
+                //
+                // It rarely rescues an actual specification, and that is worth
+                // stating so nobody counts on it: agents commit at the very end
+                // of the conversation (measured over 46 runs, the first commit
+                // landed at message 31-46 of 33-48), while the failures this
+                // catches — the provider refusing a request outright once its
+                // retries are exhausted — hit around message 12-16. The value
+                // here is an honest outcome record, not salvaged work.
+                Err(err) => {
+                    filtered = err.filtered().is_some();
+                    let mut guard = draft.0.lock().await;
+                    let salvaged = match guard.completed.is_empty() {
+                        true => LinkSpecStatus::Abandoned,
+                        false => LinkSpecStatus::Built,
+                    };
+                    guard.final_status.get_or_insert(salvaged);
+                    guard
+                        .abort_reason
+                        .get_or_insert_with(|| format!("agent error at step {steps}: {err:#}"));
+                    break;
+                }
+            };
         }
 
         let snapshot = draft.snapshot().await;
@@ -1388,6 +1485,7 @@ impl PlannedLinkWork {
             specifications: snapshot.completed.clone(),
             specification_ids: Vec::new(),
             abort_reason: snapshot.abort_reason.clone(),
+            content_filtered: filtered,
             final_summary: snapshot.final_summary.clone(),
             steps,
         })
@@ -1442,6 +1540,7 @@ impl PlannedLinkWork {
                     specifications: Vec::new(),
                     specification_ids: Vec::new(),
                     abort_reason: Some(format!("agent error: {err:#}")),
+                    content_filtered: is_content_filtered(&err),
                     final_summary: None,
                     steps: 0,
                 })

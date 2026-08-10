@@ -40,8 +40,8 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
-    AuditStatusSummary, BillingExhausted, LinkKey, LinkNovelty, LinkNoveltyJudge, LinkSource,
-    LinkSpecOutcome, LinkSpecStatus, NoveltyOptions, PlannedLinkWork, ReportedFinding,
+    AuditStatusSummary, BillingExhausted, LinkInput, LinkKey, LinkNovelty, LinkNoveltyJudge,
+    LinkSource, LinkSpecOutcome, LinkSpecStatus, NoveltyOptions, PlannedLinkWork, ReportedFinding,
     SpecGenOptions, SpecGenStream, SpecificationGenerator, StatusRenderCaps, billing_exhaustion,
 };
 use knowdit_audit::types::AuditSpecification;
@@ -775,6 +775,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
     /// the JoinSet boundary.
     async fn run_link(self: Arc<Self>, work: PlannedLinkWork) -> Result<LinkTally> {
         let key = work.link_key();
+        // Kept before `work` is consumed below, so a content refusal can hand
+        // the link back to the stream instead of losing it.
+        let link_for_requeue = work.link().clone();
         let ordinal = work.ordinal();
         let total = work.total_links();
 
@@ -867,6 +870,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         Ok(LinkTally {
             specs: outcome.specification_ids.len(),
             abandoned: matches!(outcome.status, LinkSpecStatus::Abandoned),
+            requeue: outcome.content_filtered.then_some(link_for_requeue),
             usage_row: LinkUsageRow {
                 ordinal,
                 extract_id: key.extract_id,
@@ -1537,6 +1541,10 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
         let mut tasks: JoinSet<Result<LinkTally>> = JoinSet::new();
         let mut stats = StreamStats::default();
         let mut launched = 0usize;
+        // Link keys already sent round once after a content refusal, so a link
+        // the provider consistently rejects cannot ping-pong through the back
+        // lane for the rest of the run.
+        let mut requeued: BTreeSet<LinkKey> = BTreeSet::new();
 
         loop {
             // Stop claiming new links once a billing cap has been hit — every
@@ -1582,6 +1590,29 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                     stats.built_specs += tally.specs;
                     if tally.abandoned {
                         stats.abandoned_links += 1;
+                    }
+                    // A content refusal is about when the request went out, not
+                    // about the link, so give it one more turn at the back of
+                    // the queue. Once only: `requeued` is the guard that keeps a
+                    // link the provider will never accept from cycling forever,
+                    // and one spaced retry is where the measured recovery is —
+                    // 67.8% of refused links came back on the next attempt,
+                    // against 0% for the 30 immediate retries they had already
+                    // burned.
+                    if let Some(link) = tally.requeue {
+                        let k = link.key();
+                        if requeued.insert(k) {
+                            stats.requeued_links += 1;
+                            stream.lock().await.requeue_deferred(link);
+                            tracing::info!(
+                                "[streamloop scheduler] link {}/{}/{} refused by the provider — \
+                                 requeued to the back lane (run total requeued={})",
+                                k.extract_id,
+                                k.historical_id,
+                                k.finding_id,
+                                stats.requeued_links,
+                            );
+                        }
                     }
                     stats.link_usages.push(tally.usage_row);
                     // Drain review + merge for whatever findings this link
@@ -1804,6 +1835,15 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             stats.built_specs,
             stats.abandoned_links,
         );
+        if stats.requeued_links > 0 {
+            tracing::info!(
+                "[link pipeline] provider content refusals: {} link(s) requeued once to the back \
+                 lane ({:.1}% of processed). One that is refused again on its second pass is \
+                 counted in abandoned_links above.",
+                stats.requeued_links,
+                100.0 * stats.requeued_links as f64 / stats.processed_links.max(1) as f64,
+            );
+        }
         if stats.novelty_judged > 0 {
             tracing::info!(
                 "[link pipeline] novelty judge: {} candidate link(s) judged, {} deferred as \
@@ -1835,6 +1875,9 @@ struct StreamStats {
     built_specs: usize,
     abandoned_links: usize,
     errors: usize,
+    /// Links sent round again after the provider refused their gen-spec
+    /// request on content grounds.
+    requeued_links: usize,
     /// Per-link token/USD rows collected for the centralized usage report.
     link_usages: Vec<LinkUsageRow>,
     /// Set when a link pipeline failed with a billing-cap exhaustion. The
@@ -1855,6 +1898,10 @@ struct LinkTally {
     specs: usize,
     abandoned: bool,
     usage_row: LinkUsageRow,
+    /// Set when gen-spec died to a provider content refusal rather than to
+    /// anything about this link, so the scheduler can send it round again once
+    /// the main queue has drained. `None` for every other outcome.
+    requeue: Option<LinkInput>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

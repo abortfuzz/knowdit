@@ -553,10 +553,7 @@ impl ProjectIndex {
     /// it should cover exactly the gaps in the resident block — an entry for a
     /// body already printed in the prompt is dead weight in every call of the
     /// conversation. [`MemoryScope`] says which gaps.
-    pub(crate) fn build_link_memory(
-        &self,
-        scope: MemoryScope<'_>,
-    ) -> Result<AgentMemoryContext> {
+    pub(crate) fn build_link_memory(&self, scope: MemoryScope<'_>) -> Result<AgentMemoryContext> {
         let (only_contracts, only_interfaces) = match scope {
             MemoryScope::WholeProject => (None, None),
             MemoryScope::Only {
@@ -694,7 +691,10 @@ impl ProjectIndex {
 
         let mut out: Vec<ResidentCandidate> = Vec::new();
         for contract in self.call_graph.contracts.values() {
-            if knowdit_project::ProjectScope::is_vendored_path(&contract.relative_file_path, include_lib) {
+            if knowdit_project::ProjectScope::is_vendored_path(
+                &contract.relative_file_path,
+                include_lib,
+            ) {
                 continue;
             }
             let mut source = String::new();
@@ -709,7 +709,10 @@ impl ProjectIndex {
             });
         }
         for interface in self.call_graph.interfaces.values() {
-            if knowdit_project::ProjectScope::is_vendored_path(&interface.relative_file_path, include_lib) {
+            if knowdit_project::ProjectScope::is_vendored_path(
+                &interface.relative_file_path,
+                include_lib,
+            ) {
                 continue;
             }
             let mut source = String::new();

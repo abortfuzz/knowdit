@@ -359,7 +359,6 @@ pub(crate) const DEFAULT_VENDORED_EXCLUDES: [&str; 42] = [
     "target/**",
 ];
 
-
 // ---------------------------------------------------------------------------
 // Spec parsing (shared by from_source_dir_spec / from_path_spec).
 // ---------------------------------------------------------------------------

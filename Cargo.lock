@@ -2172,7 +2172,7 @@ dependencies = [
  "dyn-clone",
  "foundry-compilers-artifacts",
  "foundry-compilers-core",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "path-slash",
  "rayon",
  "semver 1.0.27",
@@ -3259,7 +3259,7 @@ dependencies = [
  "foundry-compilers-artifacts",
  "globset",
  "humantime",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-agents",
  "knowdit-audit",
  "knowdit-cg-static",
@@ -3303,7 +3303,7 @@ dependencies = [
  "alloy-serde",
  "async-channel",
  "color-eyre",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg",
  "knowdit-kg-model",
  "knowdit-project",
@@ -3335,7 +3335,7 @@ version = "1.0.1"
 dependencies = [
  "async-channel",
  "color-eyre",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg-model",
  "knowdit-project",
  "llmy",
@@ -3388,7 +3388,7 @@ version = "1.0.1"
 dependencies = [
  "color-eyre",
  "glob",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "knowdit-kg-model",
  "ropey",
  "sea-orm",
@@ -3570,9 +3570,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llmy"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f25a8ba2f6b83296b41dbf7f1bdd6b6b973f11098e38a8964aa2d06d25b08cca"
+checksum = "181eb92eca08efbf9fd4fc8f902c12aa971ba2afd0c81350ac2b438cac728489"
 dependencies = [
  "async-openai",
  "llmy-agent",
@@ -3587,9 +3587,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "505c223f18ba59507f896a7cd97d1a72079c214bc47bb0827f548953c1856cc3"
+checksum = "25284d9c37cdf8f9f75e4b841ce87919e080efaa8905aec188a3b65eb5846fb1"
 dependencies = [
  "axum",
  "dyn-clone",
@@ -3606,9 +3606,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-derive"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75408e0411ef753fdab0b2a5d96a5d789e9186002c8f8b8d98f5e72b493a5c3e"
+checksum = "b6331c5fc621824c16498b90b16f4d254b0622c0a1be70205e9a330439afff63"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -3619,9 +3619,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-agent-tools"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16877e6ff01620a8a8cc923e1b7c9595bf4286987ed95b185fb4862545f6fe1c"
+checksum = "9101841f0d017be288c75480be6db4f7a04072215995f4bdd85c84cbe26a114c"
 dependencies = [
  "color-eyre",
  "const_format",
@@ -3644,9 +3644,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-clap"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b31dcf069e2d94522b2b01b0c82c3d81045dbb40de2d66e7b6a768a5872c965"
+checksum = "1c2458dc2f820d07768f9c0deb33f01332708a8dc2ad2261b9ce8dc3b70e35ee"
 dependencies = [
  "clap",
  "color-eyre",
@@ -3657,9 +3657,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-client"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c993aab34f43fa17da921fa73c8f669914fd9961a8a0a245c3439d7a1c0aeca"
+checksum = "d4e900975e1dac871ce4e6c92a19b30da0f6bcafb3a36461d1a0525d8d225bd4"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -3679,9 +3679,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-harness"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb4fe8d0f4d86d878019836b5e22f7cff4d581872ae91d305e313a33d58a2acc"
+checksum = "480a6798700235b61d15dffe4efe332db4c815794f7b5ff0f8ef506076b77117"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -3695,9 +3695,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-tokenizer"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7259fcb01d8fa0798d7e705ec9b860da332233f8cecdbbc98636de178d5edc9"
+checksum = "da3f1f571b97dc94a4f388cb8b41e5bca5aca0f13688f52282884faf985dad51"
 dependencies = [
  "base64 0.22.1",
  "rust_decimal",
@@ -3708,9 +3708,9 @@ dependencies = [
 
 [[package]]
 name = "llmy-types"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62649564bd554758e581e0a9af73b87052aad30b8b2a27966e1cbeeb4885fec4"
+checksum = "887c83dc12166ac4dc29af46c575f43da5b1e882d8ba6894b76dd0c3de430bbf"
 dependencies = [
  "async-openai",
  "color-eyre",
@@ -6090,7 +6090,7 @@ dependencies = [
  "derive_more",
  "dunce",
  "inturn",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "itoa",
  "normalize-path",
  "once_map",
@@ -6126,7 +6126,7 @@ dependencies = [
  "alloy-primitives",
  "bitflags",
  "bumpalo",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "memchr",
  "num-bigint",
  "num-rational",
