@@ -94,6 +94,18 @@ pub struct HarnessSharedArgs {
     #[arg(long = "forge-coverage-timeout-secs", default_value_t = 300)]
     pub forge_coverage_timeout_secs: u64,
 
+    /// Hard timeout for the one-off preflight `forge test` (seconds).
+    /// Independent of `--forge-timeout-secs` because preflight runs a
+    /// single trivial test — but the compile it triggers is not always
+    /// trivial: on a `via_ir = true` project the preflight file is a
+    /// fresh compilation unit that drags forge-std through the IR
+    /// pipeline every time, which no artifact cache can shortcut
+    /// (measured: ~61s per invocation on solc 0.8.13). Raise this for
+    /// such projects instead of losing them to a false "environment is
+    /// broken" verdict.
+    #[arg(long = "forge-preflight-timeout-secs", default_value_t = 60)]
+    pub forge_preflight_timeout_secs: u64,
+
     /// `--fuzz-runs` for the `forge test` invocation.
     #[arg(long = "forge-test-runs", default_value_t = 100_000)]
     pub forge_test_runs: u64,
@@ -123,6 +135,15 @@ pub struct HarnessSharedArgs {
     /// scratch.
     #[arg(long = "harness-max-restarts", default_value_t = 3)]
     pub harness_max_restarts: usize,
+
+    /// Maximum number of *content-filter* restarts per spec, budgeted
+    /// separately from `--harness-max-restarts`: a provider refusal never
+    /// reached the model, so it shouldn't spend the agent's ordinary
+    /// restart allowance. The fresh conversation re-reads the on-disk
+    /// harness file, dropping the accumulated narration the filter
+    /// objected to.
+    #[arg(long = "harness-max-filter-restarts", default_value_t = 3)]
+    pub harness_max_filter_restarts: usize,
 
     /// Gate 2 fidelity threshold for the inline coverage gate. The
     /// agent gets `[GATE 2 FAILED — coverage]` in its `run_forge`
@@ -233,16 +254,22 @@ impl HarnessSharedArgs {
         } else {
             harness_dir.clone()
         };
-        // Preflight harness is one trivial test; 60s is generous even
-        // for slow docker pulls. Independent of `forge_timeout_secs`
-        // (which the agent uses for real fuzz runs). Preflight never
-        // invokes coverage, so both deadlines are the same 60s here.
+        // Preflight harness is one trivial test, so the default 60s is
+        // generous even for slow docker pulls — but a `via_ir = true`
+        // project recompiles forge-std through the IR pipeline for the
+        // fresh preflight compilation unit on every invocation, which
+        // can exceed it on its own. `--forge-preflight-timeout-secs`
+        // exists for those projects. Independent of
+        // `forge_timeout_secs` (which the agent uses for real fuzz
+        // runs). Preflight never invokes coverage, so both deadlines
+        // are the same here.
+        let preflight_timeout = Duration::from_secs(self.forge_preflight_timeout_secs);
         let runner = ForgeRunner::new(
             backend.clone(),
             forge_work_dir,
             ForgeTimeouts {
-                test: Duration::from_secs(60),
-                coverage: Duration::from_secs(60),
+                test: preflight_timeout,
+                coverage: preflight_timeout,
             },
         );
         runner.preflight(&harness_dir).await
@@ -277,6 +304,7 @@ impl HarnessSharedArgs {
             docker_image: self.docker_image.clone(),
             forge_mem_cap_bytes,
             forge_timeout_secs: self.forge_timeout_secs,
+            forge_preflight_timeout_secs: self.forge_preflight_timeout_secs,
             forge_coverage_timeout_secs: self.forge_coverage_timeout_secs,
             forge_test_runs: self.forge_test_runs,
             forge_coverage_runs: self.forge_coverage_runs,
@@ -288,6 +316,7 @@ impl HarnessSharedArgs {
             llm_settings: None,
             window_restart_threshold_tokens: self.harness_window_restart_threshold_tokens,
             max_restarts: self.harness_max_restarts,
+            max_filter_restarts: self.harness_max_filter_restarts,
             gate2_fidelity_threshold: self.gate2_fidelity_threshold,
             via_ir: build.via_ir,
             list_test_files_max_depth: self.harness_list_test_files_max_depth,

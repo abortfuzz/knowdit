@@ -1403,6 +1403,14 @@ impl PlannedLinkWork {
         // Set when a step ends the loop because the provider refused the
         // request rather than because anything about this link.
         let mut filtered = false;
+        // One in-place repair per link: neutralize the conversation's
+        // offensive-register vocabulary and retry the refused step. The
+        // refusal is about the accumulated register, not the link (see
+        // `crate::sanitize`); a second refusal in the same conversation
+        // falls through to the salvage break below and the link-level
+        // requeue decides.
+        let neutralizer = crate::sanitize::Neutralizer::new();
+        let mut neutralized = false;
 
         while {
             let snapshot = draft.snapshot().await;
@@ -1435,9 +1443,27 @@ impl PlannedLinkWork {
             // wrapping it into a report here only to downcast it out again
             // would be a round trip for nothing. The step number goes into the
             // context at the point it is actually needed.
-            step_result = match agent
+            let next_step = agent
                 .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
-                .await
+                .await;
+            // In-place repair path for the provider's content refusal: rewrite
+            // and retry the same step once before giving up on the link.
+            let next_step = match next_step {
+                Err(err) if err.filtered().is_some() && !neutralized => {
+                    neutralized = true;
+                    let touched = neutralizer.neutralize_agent_context(&mut agent);
+                    tracing::info!(
+                        "spec-link{}: step {steps} refused by the provider's content filter; \
+                         neutralized {touched} message(s) in place, retrying the step",
+                        link_serial
+                    );
+                    agent
+                        .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
+                        .await
+                }
+                other => other,
+            };
+            step_result = match next_step
             {
                 Ok(result) => result,
                 // A dead billing cap kills every later call too, so it has to

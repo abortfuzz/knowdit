@@ -29,7 +29,7 @@ use knowdit_repo_model::{
     CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, HarnessRunRecord,
     HistoricalSemanticRecord, RepoDatabase, SemanticMatchSet,
 };
-use llmy::agent::StepResult;
+use llmy::agent::{LLMYError, StepResult};
 use llmy::agent::tool::ToolBox;
 use llmy::agent::tools::memory::AgentMemoryContext;
 use llmy::client::client::LLM;
@@ -256,6 +256,7 @@ impl HarnessKind {
         last_calls: u64,
         last_gate_passed: bool,
         attempt_seq: usize,
+        refused: bool,
     ) -> String {
         match self {
             Self::Handler => handler_mode::build_restart_bootstrap(
@@ -263,12 +264,14 @@ impl HarnessKind {
                 last_calls,
                 last_gate_passed,
                 attempt_seq,
+                refused,
             ),
             Self::Poc => poc_mode::build_restart_bootstrap(
                 last_filename,
                 last_calls,
                 last_gate_passed,
                 attempt_seq,
+                refused,
             ),
         }
     }
@@ -285,6 +288,12 @@ enum AttemptOutcome {
     StepsExhausted,
     AgentError(String),
     NeedsRestart,
+    /// A provider content refusal ended the attempt. Distinct from
+    /// `NeedsRestart` so the outer loop can bill it against its own budget:
+    /// the refusal is not the agent's work going wrong, and billing it as an
+    /// ordinary restart would let a filter spike eat the entire restart
+    /// budget without the agent ever having mis-stepped.
+    FilteredRestart,
 }
 
 /// Fields snapshotted out of the shared `HarnessAttempt` mutex between
@@ -327,6 +336,9 @@ struct AgentLoopState {
     debug_prefix: Option<String>,
     memory: AgentMemoryContext,
     memory_criteria: AgentMemorySystemPromptCriteria,
+    /// Shared vocabulary neutralizer for content-refusal repair (cheap to
+    /// construct once per spec loop; the regex table is the whole cost).
+    neutralizer: crate::sanitize::Neutralizer,
 }
 
 impl AgentLoopState {
@@ -378,6 +390,7 @@ impl AgentLoopState {
             debug_prefix,
             memory,
             memory_criteria,
+            neutralizer: crate::sanitize::Neutralizer::new(),
         })
     }
 
@@ -432,6 +445,7 @@ impl AgentLoopState {
         last_filename: Option<&str>,
         last_calls: u64,
         last_gate_passed: bool,
+        refused: bool,
     ) -> String {
         let mut sys = self.base_system_prompt.clone();
         if let Some(feedback) = self.prior_feedback.as_deref() {
@@ -442,12 +456,13 @@ impl AgentLoopState {
                  read the project source and model the deployment topology faithfully.",
             );
         }
-        if restart_count > 0 {
+        if restart_count > 0 || refused {
             sys.push_str(&self.kind.build_restart_bootstrap(
                 last_filename,
                 last_calls,
                 last_gate_passed,
-                restart_count - 1,
+                restart_count.saturating_sub(1),
+                refused,
             ));
         }
         sys
@@ -473,13 +488,25 @@ impl AgentLoopState {
         llm: &LLM,
         total_steps: &mut usize,
     ) -> (LoopOutcome, Option<String>) {
+        // Content-refusal restarts run on their own budget: a refusal says
+        // nothing about the agent's work (the request never reached the
+        // model), so it shouldn't spend the ordinary restart allowance — but
+        // a spec whose data sits permanently on the wrong side of the filter
+        // must not loop forever either.
+        let mut filter_restarts = 0usize;
+        let mut last_was_filtered = false;
         loop {
             let snap = self.snapshot_restart_state().await;
+            // The bootstrap's "restart #N" should count refusals too — they
+            // are restarts from the model's point of view — even though they
+            // draw on their own budget.
+            let attempt_no = snap.restart_count + filter_restarts;
             let sys = self.compose_system_prompt(
-                snap.restart_count,
+                attempt_no,
                 snap.last_filename.as_deref(),
                 snap.last_calls,
                 snap.last_gate_passed,
+                last_was_filtered,
             );
             let mut agent = Agent::with_memory(
                 sys,
@@ -491,13 +518,33 @@ impl AgentLoopState {
             .await;
 
             match self
-                .run_one_attempt(llm, &mut agent, snap.restart_count, total_steps)
+                .run_one_attempt(llm, &mut agent, attempt_no, total_steps)
                 .await
             {
                 AttemptOutcome::Violation => return (LoopOutcome::Violation, None),
                 AttemptOutcome::StepsExhausted => return (LoopOutcome::StepsExhausted, None),
                 AttemptOutcome::AgentError(e) => return (LoopOutcome::AgentError, Some(e)),
+                AttemptOutcome::FilteredRestart => {
+                    filter_restarts += 1;
+                    last_was_filtered = true;
+                    if filter_restarts > self.options.max_filter_restarts {
+                        tracing::warn!(
+                            "spec {}: content-filter restart budget ({}) exhausted; \
+                             giving up on this spec",
+                            self.spec_id,
+                            self.options.max_filter_restarts
+                        );
+                        return (
+                            LoopOutcome::AgentError,
+                            Some(format!(
+                                "provider content filter refused the request across \
+                                 {filter_restarts} fresh-conversation restart(s)"
+                            )),
+                        );
+                    }
+                }
                 AttemptOutcome::NeedsRestart => {
+                    last_was_filtered = false;
                     let mut st = self.attempt.0.lock().await;
                     st.restarts += 1;
                     if st.restarts > self.options.max_restarts {
@@ -520,6 +567,52 @@ impl AgentLoopState {
         }
     }
 
+    /// Handle one content-filter refusal of `agent`'s current step: rewrite
+    /// the accumulated conversation into the neutral register and retry the
+    /// step once. `neutralized` latches so a conversation only gets one
+    /// repair; a refusal after it returns [`AttemptOutcome::FilteredRestart`]
+    /// for a clean-slate retry instead.
+    async fn repair_refused_step_once(
+        &self,
+        err: LLMYError,
+        agent: &mut Agent,
+        llm: &LLM,
+        neutralized: &mut bool,
+        step_no: usize,
+    ) -> std::result::Result<StepResult, AttemptOutcome> {
+        if *neutralized {
+            tracing::info!(
+                "spec {}: step {step_no} refused again after neutralization; \
+                 restarting with a fresh conversation",
+                self.spec_id
+            );
+            return Err(AttemptOutcome::FilteredRestart);
+        }
+        *neutralized = true;
+        let touched = self.neutralizer.neutralize_agent_context(agent);
+        tracing::info!(
+            "spec {}: step {step_no} refused by the provider's content filter \
+             ({err}); neutralized {touched} message(s) in place, retrying the step",
+            self.spec_id
+        );
+        agent
+            .step(
+                llm,
+                self.debug_prefix.as_deref(),
+                self.options.llm_settings.clone(),
+            )
+            .await
+            .map_err(|e| {
+                if e.filtered().is_some() {
+                    AttemptOutcome::FilteredRestart
+                } else {
+                    AttemptOutcome::AgentError(format!(
+                        "step {step_no} after neutralization: {e}"
+                    ))
+                }
+            })
+    }
+
     /// Inner loop: drive the agent forward one step at a time until it
     /// hits one of the four terminal conditions encoded in
     /// [`AttemptOutcome`]. `total_steps` is the cumulative step counter
@@ -532,6 +625,12 @@ impl AgentLoopState {
         restart_count: usize,
         total_steps: &mut usize,
     ) -> AttemptOutcome {
+        // One in-place repair per conversation: neutralize the accumulated
+        // offensive-register vocabulary and retry the refused step once.
+        // A second refusal falls through to a fresh-conversation restart —
+        // after a full rewrite there is nothing left to repair, and the
+        // refusal is the spike-or-content lottery again.
+        let mut neutralized = false;
         let step_res = agent
             .step_with_user(
                 self.user_prompt.clone(),
@@ -542,6 +641,20 @@ impl AgentLoopState {
             .await;
         let mut step = match step_res {
             Ok(s) => s,
+            // A content refusal is a verdict on the conversation, not on the
+            // spec: the same bytes pass or fail depending on when they are
+            // sent, and the conversation only gets more offensive-looking to
+            // the filter as exploit-shaped tool output accumulates. Repair in
+            // place first (keeps the work); a fresh attempt re-reads the
+            // harness file from disk and drops the narration entirely.
+            Err(e) if e.filtered().is_some() => {
+                match self.repair_refused_step_once(e, agent, llm, &mut neutralized, *total_steps)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(outcome) => return outcome,
+                }
+            }
             Err(e) => {
                 return AttemptOutcome::AgentError(format!(
                     "initial step (restart {restart_count}): {e}"
@@ -590,6 +703,17 @@ impl AgentLoopState {
                 .await;
             step = match next {
                 Ok(s) => s,
+                // Content refusal mid-conversation: repair in place once,
+                // then fall back to a clean restart — see the initial-step
+                // arm for why.
+                Err(e) if e.filtered().is_some() => {
+                    match self.repair_refused_step_once(e, agent, llm, &mut neutralized, *total_steps)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(outcome) => return outcome,
+                    }
+                }
                 Err(e) => {
                     return AttemptOutcome::AgentError(format!("step {}: {e}", *total_steps));
                 }

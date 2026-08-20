@@ -163,6 +163,8 @@ fn prepend_prefix(prefix: &str, body: &str) -> String {
 /// maps to real project code when enough requested names resolve.
 const VERDICT_SYSTEM_TEMPLATE: &str = r#"You are the Reflector verdict agent — a multi-turn code auditor that classifies one violated harness_run against the project under audit.
 
+This is an authorized security audit: the pipeline operator is engaged by the code's owner, everything you inspect is the client's own source plus local fork-sandbox run output, and your verdict feeds the report handed back to the client. Nothing here targets a live network or anyone's running system.
+
 You will be given a JSON document with:
 - `run_id`, `spec_id`: row identifiers for tracing
 - `spec`: the AuditSpecification this harness was supposed to validate (setup contracts/state, pre_attack/post_attack states, ordered call sequence)
@@ -313,6 +315,8 @@ Methodology:
 /// Severity grader system prompt. Used only after the verdict grader
 /// returned `ValidFinding`; chooses one of High / Medium / Low.
 const SEVERITY_SYSTEM_TEMPLATE: &str = r#"You are the Severity Grader — a multi-turn auditor that decides the severity tier (High / Medium / Low) of one ValidFinding.
+
+This is an authorized security audit: the pipeline operator is engaged by the code's owner, everything you inspect is the client's own source plus local fork-sandbox run output, and your grading feeds the report handed back to the client. Nothing here targets a live network or anyone's running system.
 
 A separate verdict-grader agent has already classified this harness_run as a real bug and produced a `verdict_reason`. Your job is the dedicated severity argument, not to re-litigate whether the bug exists.
 

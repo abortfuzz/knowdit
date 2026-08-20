@@ -4,6 +4,7 @@ pub mod mapper;
 pub mod profile;
 pub mod reflect;
 pub mod report;
+pub mod sanitize;
 pub mod source_access;
 pub mod spec;
 pub mod types;

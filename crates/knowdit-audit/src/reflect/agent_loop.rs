@@ -172,6 +172,12 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
         .await
         .wrap_err("reflection agent failed on initial step")?;
     let mut steps = 1usize;
+    // One in-place repair per reflection: the verdict/severity prompts grade
+    // exploit-shaped harness output, which is exactly the text the provider's
+    // content filter refuses mid-conversation. Neutralize the accumulated
+    // register once and retry the step before failing the grading.
+    let neutralizer = crate::sanitize::Neutralizer::new();
+    let mut neutralized = false;
 
     while !attempt.is_set().await {
         if matches!(step, StepResult::Stop(_)) {
@@ -188,10 +194,26 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
             ));
         }
         steps += 1;
-        step = agent
+        let next_step = agent
             .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
-            .await
-            .wrap_err_with(|| format!("reflection agent failed at step {steps}"))?;
+            .await;
+        step = match next_step {
+            Err(err) if err.filtered().is_some() && !neutralized => {
+                neutralized = true;
+                let touched = neutralizer.neutralize_agent_context(&mut agent);
+                tracing::info!(
+                    "reflect({debug_suffix}): step {steps} refused by the provider's content \
+                     filter; neutralized {touched} message(s) in place, retrying the step"
+                );
+                agent
+                    .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
+                    .await
+                    .wrap_err_with(|| {
+                        format!("reflection agent failed at step {steps} after neutralization")
+                    })?
+            }
+            other => other.wrap_err_with(|| format!("reflection agent failed at step {steps}"))?,
+        };
     }
 
     Ok(steps)

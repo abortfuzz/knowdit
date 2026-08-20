@@ -133,15 +133,20 @@ impl HarnessBackend for SolidityHarness {
         } else {
             harness_dir.clone()
         };
-        // Preflight is one trivial test; 60s is generous even on slow
-        // docker pulls. Independent of the user's `forge_timeout_secs`,
-        // which the per-spec agent uses for real fuzz runs.
+        // Preflight is one trivial test, so the 60s default is generous
+        // even on slow docker pulls — but a `via_ir = true` project
+        // recompiles forge-std through the IR pipeline for the fresh
+        // preflight compilation unit every time, which can exceed it on
+        // its own; `--forge-preflight-timeout-secs` is the escape hatch.
+        // Independent of the user's `forge_timeout_secs`, which the
+        // per-spec agent uses for real fuzz runs.
+        let preflight_timeout = Duration::from_secs(self.options.forge_preflight_timeout_secs);
         let runner = ForgeRunner::new(
             self.forge_backend.clone(),
             forge_work_dir,
             ForgeTimeouts {
-                test: Duration::from_secs(60),
-                coverage: Duration::from_secs(60),
+                test: preflight_timeout,
+                coverage: preflight_timeout,
             },
         );
         runner.preflight(&harness_dir).await

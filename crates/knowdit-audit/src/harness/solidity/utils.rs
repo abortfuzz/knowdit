@@ -56,6 +56,12 @@ pub struct FuzzOptions {
     /// attempt can cost; kept below `forge_timeout_secs` because coverage is
     /// evidence, not the verdict.
     pub forge_coverage_timeout_secs: u64,
+    /// Hard timeout for the one-off environment preflight (seconds).
+    /// Separate from `forge_timeout_secs`: preflight runs one trivial
+    /// test, but on a `via_ir = true` project its fresh compilation
+    /// unit pulls forge-std through the IR pipeline every invocation
+    /// and no artifact cache shortcuts it.
+    pub forge_preflight_timeout_secs: u64,
     /// `--fuzz-runs` for the test invocation.
     pub forge_test_runs: u64,
     /// `--fuzz-runs` for the coverage invocation (usually smaller, since
@@ -83,6 +89,12 @@ pub struct FuzzOptions {
     /// Maximum number of agent restarts per spec. Once exhausted the
     /// spec is abandoned even if the step budget still has room.
     pub max_restarts: usize,
+    /// Maximum number of *content-filter* restarts per spec, budgeted
+    /// separately from `max_restarts` because a provider refusal is not the
+    /// agent's work going wrong — the request never reached the model. The
+    /// cap exists so a spec whose data sits permanently on the wrong side of
+    /// the filter still terminates.
+    pub max_filter_restarts: usize,
     /// Gate 2 fidelity threshold passed to the inline coverage gate that
     /// runs inside `run_forge`. Same semantic as `agentic reflect`'s
     /// `--gate2-fidelity-threshold`. Defaults to 0.5 in the CLI layer.

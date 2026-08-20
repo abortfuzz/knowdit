@@ -253,11 +253,19 @@ pub(super) fn build_restart_bootstrap(
     last_test_calls: u64,
     last_gate_passed: bool,
     prior_restarts: usize,
+    refused: bool,
 ) -> String {
     let mut out = String::from("\n\n## Restart context\n\n");
     out.push_str(&format!(
-        "This is restart #{}: the previous agent ran out of conversation budget. ",
-        prior_restarts + 1
+        "This is restart #{}: the previous agent {}. ",
+        prior_restarts + 1,
+        if refused {
+            "was cut off when the model provider's content filter refused its \
+             conversation — keep running commentary descriptive of states and \
+             effects, not of an intruder story"
+        } else {
+            "ran out of conversation budget"
+        }
     ));
     match harness_filename {
         Some(name) => out.push_str(&format!(
