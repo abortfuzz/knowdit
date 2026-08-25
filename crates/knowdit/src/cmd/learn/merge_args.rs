@@ -10,6 +10,12 @@ use knowdit_kg::agents::{MergeChunkingOptions, MergeFieldGuard};
 
 #[derive(Args, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeCliArgs {
+    /// Remove saved extraction chunks when their source or model no longer
+    /// matches this run. Without this flag, the run stops and preserves the
+    /// pending chunks for inspection or a corrected retry.
+    #[arg(long)]
+    pub force_remove_pending_chunks: bool,
+
     /// Hard cap on agent steps for a single per-chunk learn-pipeline
     /// agent (categorize, extract semantics, extract findings, semantic
     /// merge, finding merge). Each `emit_*` tool call counts as one step.

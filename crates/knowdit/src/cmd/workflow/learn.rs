@@ -115,7 +115,13 @@ impl WorkflowLearnArgs {
             let agent_options = self.merge.to_agent_options();
             let chunking = self.merge.to_chunking_options();
             let extract = project
-                .categorize_and_extract(primary_llm, &agent_options, None)
+                .categorize_and_extract(
+                    primary_llm,
+                    &agent_options,
+                    None,
+                    Some(&kg),
+                    self.merge.force_remove_pending_chunks,
+                )
                 .await?;
 
             // Compose Phase 1c admission + pending_semantic enqueue
@@ -134,6 +140,8 @@ impl WorkflowLearnArgs {
                 .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)
                 .await?;
             txn.commit().await?;
+            kg.clear_extraction_chunks_for_project(&project.display_id())
+                .await?;
             tracing::info!(
                 "Phase 1: enqueued {} new canonical semantic(s) for Phase 2 retro-link \
                  (of {} newly introduced)",

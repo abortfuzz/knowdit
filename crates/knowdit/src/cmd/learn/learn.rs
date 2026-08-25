@@ -148,6 +148,7 @@ impl LearnArgs {
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
+            self.merge.force_remove_pending_chunks,
         )
         .await
     }
@@ -202,6 +203,7 @@ impl LearnC4Args {
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
+            self.merge.force_remove_pending_chunks,
         )
         .await?;
         db.record_operation(OperationType::C4Learn, merge_args)
@@ -281,6 +283,7 @@ impl LearnMovesArgs {
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
+            self.merge.force_remove_pending_chunks,
         )
         .await
     }
@@ -385,6 +388,7 @@ impl LearnSherlockArgs {
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
+            self.merge.force_remove_pending_chunks,
         )
         .await?;
         db.record_operation(OperationType::SherlockLearn, merge_args)
@@ -404,6 +408,7 @@ async fn run_pipeline(
     agent_options: knowdit_kg::agent_runner::AgentRunOptions,
     merge_chunking: knowdit_kg::agents::MergeChunkingOptions,
     link_options: FindingLinkOptions,
+    force_remove_pending_chunks: bool,
 ) -> Result<()> {
     if all_projects.is_empty() {
         tracing::warn!("No projects to process.");
@@ -440,7 +445,13 @@ async fn run_pipeline(
     if concurrency <= 1 {
         for project in pending {
             match project
-                .categorize_and_extract(llm, &agent_options, None)
+                .categorize_and_extract(
+                    llm,
+                    &agent_options,
+                    None,
+                    Some(db),
+                    force_remove_pending_chunks,
+                )
                 .await
             {
                 Ok(extract) => {
@@ -475,10 +486,18 @@ async fn run_pipeline(
             let out = out_tx.clone();
             let llm = llm.clone();
             let extract_opts = agent_options.clone();
+            let task_db = db.clone();
+            let force_remove_pending_chunks = force_remove_pending_chunks;
             handles.spawn(async move {
                 while let Ok(project) = rx.recv().await {
                     let res = project
-                        .categorize_and_extract(&llm, &extract_opts, None)
+                        .categorize_and_extract(
+                            &llm,
+                            &extract_opts,
+                            None,
+                            Some(&task_db),
+                            force_remove_pending_chunks,
+                        )
                         .await?;
                     out.send(Ok((project, res)))
                         .await
