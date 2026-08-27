@@ -63,6 +63,10 @@ pub const CATEGORY_DEFINITIONS: &str = r#"Categories:
 * **NFT Marketplace:** Platforms facilitating the buying, selling, or auctioning of NFTs.
 * **NFT Lending:** Protocols using NFTs as collateral for loans or rental markets.
 * **Cross Chain:** Bridges, messaging protocols, or interoperability layers between blockchains.
+* **Tokens:** Token infrastructure contracts and mechanisms — mint/burn controls, fee-on-transfer accounting, reflective/rebasing supply, presale and tokenomics logic.
+* **Governance:** DAO and governance mechanisms — proposal creation and execution, voting power and delegation, timelocks, treasury management, privileged admin roles.
+* **Custody:** Centralized custody and key management — exchange hot wallets, multisig custody, private-key storage and signing infrastructure.
+* **Privacy:** Privacy and confidentiality protocols — zk-SNARK shielded pools, mixers, confidential transactions and stealth addresses.
 * **Others:** Unique or experimental projects that do not fit the above categories.
 "#;
 
@@ -679,3 +683,54 @@ pub fn finding_link_finding_entry(
 "#
     )
 }
+
+// ── `Others`-bucket re-classification ────────────────────────────────
+//
+// One-shot maintenance pass: canonical semantic nodes stranded in
+// `Others` are re-judged against the real categories. The LLM sees the
+// node identity (name/definition/description) plus evidence of what it
+// actually covers (top linked findings), and must emit one category per
+// node — never `Others`.
+
+pub const RECLASSIFY_SEMANTIC_SYSTEM: &str = r#"You are an expert DeFi knowledge engineer and senior smart contract analyst.
+Your task is to re-classify DeFi semantic nodes that were previously parked in the `Others` catch-all category.
+
+Rules:
+- Assign each node exactly ONE category from the category definitions below.
+- NEVER assign `Others` — every node must land in a real category.
+- Base the decision on the node's name, definition, description, and the linked findings that instantiate it.
+- Prefer the most specific category that describes the mechanism the node covers.
+"#;
+
+pub const RECLASSIFY_SEMANTIC_USER_HEADER: &str = r#"## Category definitions
+
+Categories:
+* **Lending:** Protocols that allow users to supply assets to earn interest or borrow assets by providing collateral (e.g., Aave, Compound).
+* **Dexes:** Decentralized exchanges facilitating asset swaps via AMMs or order books (e.g., Uniswap, Curve).
+* **Yield:** Protocols focused on staking, locking, or rewards distribution mechanisms to incentivize liquidity or holding.
+* **Services:** Utility protocols providing infrastructure, privacy, automation, or oracle services.
+* **Derivatives:** Financial instruments derived from underlying assets, including perpetual futures, options, and synthetics.
+* **Yield Aggregator:** Vaults or strategies that automate yield farming by moving assets across protocols to maximize returns.
+* **Real World Assets:** Protocols tokenizing off-chain physical assets like real estate, treasury bills, or commodities.
+* **Stablecoins:** Protocols issuing tokens pegged to a fiat currency or stable value.
+* **Indexes:** Protocols creating baskets of tokens to represent a market sector or weighted strategy.
+* **Insurance:** Protocols providing coverage against smart contract failure, hacks, or de-pegging events.
+* **NFT Marketplace:** Platforms facilitating the buying, selling, or auctioning of NFTs.
+* **NFT Lending:** Protocols using NFTs as collateral for loans or rental markets.
+* **Cross Chain:** Bridges, messaging protocols, or interoperability layers between blockchains.
+* **Tokens:** Token infrastructure contracts and mechanisms — mint/burn controls, fee-on-transfer accounting, reflective/rebasing supply, presale and tokenomics logic.
+* **Governance:** DAO and governance mechanisms — proposal creation and execution, voting power and delegation, timelocks, treasury management, privileged admin roles.
+* **Custody:** Centralized custody and key management — exchange hot wallets, multisig custody, private-key storage and signing infrastructure.
+* **Privacy:** Privacy and confidentiality protocols — zk-SNARK shielded pools, mixers, confidential transactions and stealth addresses.
+
+## Task
+
+Re-classify each semantic node below with exactly one category from the definitions above. Never use `Others` — every node must land in a real category."#;
+
+pub const RECLASSIFY_SEMANTIC_USER_FOOTER: &str = r#"
+
+Respond with strict JSON in the exact shape:
+```json
+{"nodes":[{"semantic_id":1,"category":"Dexes"},{"semantic_id":2,"category":"Tokens"}]}
+```
+Coverage is mandatory: every listed node id must appear exactly once. Never use `Others`."#;

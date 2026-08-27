@@ -110,6 +110,11 @@ pub enum DbCommands {
     /// schema (auto-incr PKs reassigned, FKs rewritten); pass
     /// `--fresh` to instead drop and recreate dst's schema first.
     Copy(cmd::db::copy::CopyArgs),
+
+    /// Move every link / function / provenance row off merge-source
+    /// nodes/findings onto their canonicals, in one transaction with
+    /// a pre-remap SQL snapshot. One-time integrity sweep.
+    RemapLinks(cmd::db::remap_links::RemapLinksArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +163,10 @@ pub enum LearnCommands {
     /// `pending_semantic` (typically run after admitting a new project to
     /// the historical KG, before the regular `link` pass)
     RetroLink(cmd::learn::retro_link::RetroLinkArgs),
+
+    /// Re-classify canonical semantics stranded in the `Others` bucket
+    /// into real DeFi categories (dry-run by default; --apply to write)
+    ReclassifyOthers(cmd::learn::reclassify_others::ReclassifyOthersArgs),
 
     /// Validate historical database referential integrity; optionally repair dangling rows
     ValidateDb(cmd::learn::validate_db::ValidateDbArgs),
@@ -330,6 +339,7 @@ impl DbCommand {
             DbCommands::Snapshot(args) => args.run().await,
             DbCommands::ImportSnapshot(args) => args.run().await,
             DbCommands::Copy(args) => args.run().await,
+            DbCommands::RemapLinks(args) => args.run().await,
         }
     }
 }
@@ -353,6 +363,9 @@ impl LearnCommand {
             LearnCommands::Moves(args) => args.run(&db).await?,
             LearnCommands::Link(args) => args.run(&db).await?,
             LearnCommands::RetroLink(args) => args.run(&db).await?,
+            LearnCommands::ReclassifyOthers(args) => {
+                args.run(&db, &database.database_url).await?
+            }
             LearnCommands::ValidateDb(args) => args.run(&db).await?,
             LearnCommands::SetPlatformId(args) => args.run(&db).await?,
             LearnCommands::ListSemantics(args) => args.run(&db).await?,

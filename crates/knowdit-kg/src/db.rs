@@ -9,7 +9,7 @@ use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, finding_category, finding_link_status,
     finding_merge, merge_status, pending_semantic, project, project_category, project_finding,
     project_platform, project_semantic, semantic_finding_link, semantic_function, semantic_merge,
-    semantic_node,
+    semantic_node, semantic_node_category,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
@@ -119,6 +119,51 @@ impl DbValidationReport {
     pub fn is_clean(&self) -> bool {
         self.remaining_issues.is_empty()
     }
+}
+
+/// Per-table movement counts produced by one
+/// [`HistoricalDatabase::remap_semantic_merge_txn`] call: how many rows
+/// moved off the merge source (raw) onto the canonical, and how many
+/// collided with an existing canonical-side row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemapSemanticOutcome {
+    /// `semantic_finding_link` rows moved raw → canonical.
+    pub links_moved: usize,
+    /// `semantic_finding_link` rows dropped because the canonical already
+    /// held an equal-or-stronger edge for the same finding.
+    pub links_collided: usize,
+    /// `semantic_function` rows moved raw → canonical.
+    pub functions_moved: usize,
+    /// `semantic_function` rows dropped because the canonical already held
+    /// the identical (function_name, contract_path).
+    pub functions_skipped_dup: usize,
+    /// `project_semantic` rows moved raw → canonical.
+    pub provenance_moved: usize,
+    /// `semantic_node_category` rows added on canonicals because the raw
+    /// folded in from a different non-`Others` category.
+    pub secondary_categories_added: usize,
+}
+
+/// Per-table movement counts produced by one
+/// [`HistoricalDatabase::remap_finding_merge_txn`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemapFindingOutcome {
+    /// `semantic_finding_link` rows moved raw finding → canonical finding.
+    pub links_moved: usize,
+    /// `semantic_finding_link` rows dropped because the canonical already
+    /// held an equal-or-stronger edge for the same semantic.
+    pub links_collided: usize,
+    /// `project_finding` rows moved raw finding → canonical finding.
+    pub provenance_moved: usize,
+}
+
+/// Aggregate result of [`HistoricalDatabase::remap_all_merge_links`].
+#[derive(Debug, Clone, Default)]
+pub struct RemapReport {
+    pub semantic_merges_processed: usize,
+    pub finding_merges_processed: usize,
+    pub semantic: RemapSemanticOutcome,
+    pub finding: RemapFindingOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +454,8 @@ impl HistoricalDatabase {
     /// queries) and safe.
     pub async fn migrate_schema(&self) -> Result<()> {
         self.migrate_link_strength_columns_within(&self.db).await?;
+        self.migrate_semantic_node_category_table_within(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -418,6 +465,29 @@ impl HistoricalDatabase {
     /// caller's transaction.
     async fn migrate_schema_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
         self.migrate_link_strength_columns_within(conn).await?;
+        self.migrate_semantic_node_category_table_within(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Idempotent SQLite-only migration: create `semantic_node_category`
+    /// if absent, so pre-existing KGs get the secondary-category table
+    /// before any category-recall query runs. New DBs get it through
+    /// `create_tables`; this only fires for older files opened in place.
+    async fn migrate_semantic_node_category_table_within<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+    ) -> Result<()> {
+        if conn.get_database_backend() != DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+        conn.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS semantic_node_category ( \
+             semantic_node_id integer NOT NULL, \
+             category_id integer NOT NULL, \
+             PRIMARY KEY (semantic_node_id, category_id))",
+        )
+        .await?;
         Ok(())
     }
 
@@ -484,6 +554,9 @@ impl HistoricalDatabase {
             // historical-DB refactor.
             schema.create_table_from_entity(project_semantic::Entity),
             schema.create_table_from_entity(project_finding::Entity),
+            // Secondary categories carried onto canonicals when a raw folds
+            // in from a different category (category-recall fix).
+            schema.create_table_from_entity(semantic_node_category::Entity),
             schema.create_table_from_entity(knowdit_kg_model::db::pending_semantic::Entity),
             schema.create_table_from_entity(merge_status::Entity),
             // Append-only audit log of top-level learn operations. No FKs —
@@ -1305,29 +1378,42 @@ impl HistoricalDatabase {
         Ok(values)
     }
 
-    /// Transaction-scoped seed used by [`Self::init`]. Atomicity
-    /// matters: a kill mid-loop on the standalone variant would
-    /// leave a partial taxonomy that the `if !existing.is_empty()`
-    /// gate then refuses to re-seed, so the table is permanently
-    /// short of rows. Inside the init transaction, mid-seed kill
-    /// rolls back to zero rows — next run seeds from scratch.
+    /// Transaction-scoped seed used by [`Self::init`]. Idempotent:
+    /// inserts only the names missing from the `category` table, so
+    /// both fresh DBs and pre-existing DBs opened after a taxonomy
+    /// expansion converge on the full set.
     async fn seed_categories_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
         use crate::category::DeFiCategory;
 
-        let existing = category::Entity::find().all(conn).await?;
-        if !existing.is_empty() {
-            return Ok(());
-        }
-
+        // Insert-missing-per-name: idempotent for both fresh DBs AND
+        // pre-existing DBs opened after a taxonomy expansion (new enum
+        // variants appear as new `category` rows without touching the
+        // already-seeded ones).
+        let existing: HashSet<DeFiCategory> = category::Entity::find()
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        let mut inserted = 0usize;
         for cat in DeFiCategory::ALL {
+            if existing.contains(cat) {
+                continue;
+            }
             let am = category::ActiveModel {
                 name: Set(*cat),
                 ..Default::default()
             };
             category::Entity::insert(am).exec(conn).await?;
+            inserted += 1;
         }
 
-        tracing::info!("Seeded {} DeFi categories", DeFiCategory::ALL.len());
+        if inserted > 0 {
+            tracing::info!(
+                "Seeded {inserted} missing DeFi categor(y/ies) ({} total)",
+                DeFiCategory::ALL.len()
+            );
+        }
         Ok(())
     }
 
@@ -1588,11 +1674,17 @@ impl HistoricalDatabase {
 
     /// Fetch existing active semantic nodes for the given categories.
     /// Returns nodes that have NOT been merged away.
+    ///
+    /// Category-recall expansion: a canonical also surfaces when any of its
+    /// SECONDARY categories (`semantic_node_category`, carried from folded
+    /// raws) matches — not just its primary `semantic_node.category`. This is
+    /// the single choke point feeding the mapper, the merge agent, and the
+    /// merge-kg candidate pools, so the expansion applies everywhere at once.
     pub async fn existing_semantics_for_categories(
         &self,
         categories: &[crate::category::DeFiCategory],
     ) -> Result<Vec<semantic_node::Model>> {
-        let existing_node_ids: Vec<i32> = semantic_node::Entity::find()
+        let mut existing_node_ids: Vec<i32> = semantic_node::Entity::find()
             .filter(semantic_node::Column::Category.is_in(categories.iter().copied()))
             .all(&self.db)
             .await?
@@ -1600,6 +1692,28 @@ impl HistoricalDatabase {
             .map(|node| node.id)
             .unique()
             .collect();
+
+        if self.table_exists("semantic_node_category").await? {
+            let category_ids: Vec<i32> = category::Entity::find()
+                .filter(category::Column::Name.is_in(categories.iter().copied()))
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            if !category_ids.is_empty() {
+                let secondary_ids: Vec<i32> = semantic_node_category::Entity::find()
+                    .filter(semantic_node_category::Column::CategoryId.is_in(category_ids))
+                    .all(&self.db)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.semantic_node_id)
+                    .unique()
+                    .collect();
+                existing_node_ids.extend(secondary_ids);
+                existing_node_ids = existing_node_ids.into_iter().unique().collect();
+            }
+        }
 
         let merged_away: Vec<i32> = if !existing_node_ids.is_empty() {
             semantic_merge::Entity::find()
@@ -1628,6 +1742,113 @@ impl HistoricalDatabase {
         };
 
         Ok(nodes)
+    }
+
+    /// Secondary categories per canonical semantic id, resolved from
+    /// `semantic_node_category` → `category`. Returns an empty map when the
+    /// table is absent (pre-migration DB) so callers degrade to primary-only.
+    pub async fn semantic_secondary_categories(
+        &self,
+        semantic_ids: &[i32],
+    ) -> Result<HashMap<i32, Vec<DeFiCategory>>> {
+        let mut out: HashMap<i32, Vec<DeFiCategory>> = HashMap::new();
+        if semantic_ids.is_empty() || !self.table_exists("semantic_node_category").await? {
+            return Ok(out);
+        }
+        let links = semantic_node_category::Entity::find()
+            .filter(
+                semantic_node_category::Column::SemanticNodeId.is_in(semantic_ids.iter().copied()),
+            )
+            .all(&self.db)
+            .await?;
+        if links.is_empty() {
+            return Ok(out);
+        }
+        let category_ids: Vec<i32> = links.iter().map(|row| row.category_id).unique().collect();
+        let category_rows = category::Entity::find()
+            .filter(category::Column::Id.is_in(category_ids))
+            .all(&self.db)
+            .await?;
+        let name_by_id: HashMap<i32, DeFiCategory> = category_rows
+            .into_iter()
+            .map(|row| (row.id, row.name))
+            .collect();
+        for link in links {
+            if let Some(name) = name_by_id.get(&link.category_id) {
+                out.entry(link.semantic_node_id).or_default().push(*name);
+            }
+        }
+        for names in out.values_mut() {
+            names.sort_unstable();
+            names.dedup();
+        }
+        Ok(out)
+    }
+
+    /// Canonical semantic nodes whose primary category is `category`
+    /// (merged-away raws excluded). Backs the `reclassify-others`
+    /// maintenance pass; primary-only by design — the pass re-judges
+    /// exactly the nodes parked in the target bucket.
+    pub async fn canonical_semantics_in_category(
+        &self,
+        category: DeFiCategory,
+    ) -> Result<Vec<semantic_node::Model>> {
+        self.existing_semantics_for_categories(&[category]).await
+    }
+
+    /// Apply an LLM re-classification batch: update each node's PRIMARY
+    /// category (a deliberate correction — unlike merge, which never
+    /// touches identity), and drop now-redundant `semantic_node_category`
+    /// rows whose category equals the new primary. One transaction:
+    /// any error rolls the whole batch back.
+    pub async fn reclassify_semantic_categories(
+        &self,
+        decisions: &[(i32, DeFiCategory)],
+    ) -> Result<usize> {
+        if decisions.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin().await?;
+        let mut updated = 0usize;
+        for (semantic_id, new_category) in decisions {
+            let Some(node) = semantic_node::Entity::find_by_id(*semantic_id)
+                .one(&txn)
+                .await?
+            else {
+                return Err(KgError::other(format!(
+                    "reclassify target sem-{semantic_id} does not exist; rolling back"
+                )));
+            };
+            if node.category == *new_category {
+                continue;
+            }
+            let mut active = node.into_active_model();
+            active.category = Set(*new_category);
+            active.update(&txn).await?;
+            updated += 1;
+
+            // The old primary (now secondary) rows stay; only rows that
+            // duplicate the NEW primary become redundant.
+            let Some(category_row) = category::Entity::find()
+                .filter(category::Column::Name.eq(*new_category))
+                .one(&txn)
+                .await?
+            else {
+                return Err(KgError::other(format!(
+                    "category row missing for {}; rolling back",
+                    new_category.as_str()
+                )));
+            };
+            if self.table_exists("semantic_node_category").await? {
+                semantic_node_category::Entity::delete_many()
+                    .filter(semantic_node_category::Column::SemanticNodeId.eq(*semantic_id))
+                    .filter(semantic_node_category::Column::CategoryId.eq(category_row.id))
+                    .exec(&txn)
+                    .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(updated)
     }
 
     /// Fetch every finding linked to any of `semantic_ids` via
@@ -1722,6 +1943,388 @@ impl HistoricalDatabase {
             a.canonical_semantic_id == b.canonical_semantic_id && a.finding.id == b.finding.id
         });
         Ok(out)
+    }
+
+    /// Returns `true` when a NEW row was inserted and `false` when an
+    /// existing canonical-side row was kept (equal rank) or upgraded
+    /// (incoming strictly stronger) — the collision signal a remap pass
+    /// uses to count "would-have-lost" rows.
+    async fn upsert_semantic_finding_link_row<C: ConnectionTrait>(
+        conn: &C,
+        semantic_node_id: i32,
+        audit_finding_id: i32,
+        strength: LinkStrength,
+        evidence: &str,
+    ) -> Result<bool> {
+        let existing = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.eq(semantic_node_id))
+            .filter(semantic_finding_link::Column::AuditFindingId.eq(audit_finding_id))
+            .one(conn)
+            .await?;
+        match existing {
+            None => {
+                semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+                    semantic_node_id: Set(semantic_node_id),
+                    audit_finding_id: Set(audit_finding_id),
+                    strength: Set(strength),
+                    evidence: Set(evidence.to_string()),
+                })
+                .exec(conn)
+                .await?;
+                Ok(true)
+            }
+            Some(row) => {
+                let incoming_rank = strength.rank();
+                if incoming_rank > row.strength.rank() {
+                    let mut active: semantic_finding_link::ActiveModel = row.into();
+                    active.strength = Set(strength);
+                    active.evidence = Set(evidence.to_string());
+                    active.update(conn).await?;
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Move every row that hangs off the merged-away semantic
+    /// `from_semantic_id` onto EACH canonical in `to_semantic_ids`, inside
+    /// the caller's transaction:
+    ///
+    /// - `semantic_finding_link`: upsert `(to, finding)` strongest-wins for
+    ///   every target, then delete the source row.
+    /// - `semantic_function`: copy rows onto every target unless the exact
+    ///   `(function_name, contract_path)` pair already exists there, then
+    ///   delete the originals.
+    /// - `project_semantic`: upsert `(project, to)` for every target, then
+    ///   delete `(project, from)`.
+    ///
+    /// Idempotent and lossless: source rows are deleted only after every
+    /// canonical-side counterpart is guaranteed to exist. Multi-target
+    /// folds fan out to all targets, preserving what the old raw-chase
+    /// surfaced. `semantic_merge` itself is left untouched — it stays as
+    /// the merge-history record.
+    pub async fn remap_semantic_merge_txn<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        from_semantic_id: i32,
+        to_semantic_ids: &[i32],
+    ) -> Result<RemapSemanticOutcome> {
+        let mut out = RemapSemanticOutcome::default();
+
+        let source_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for link in &source_links {
+            for to_semantic_id in to_semantic_ids {
+                let inserted = Self::upsert_semantic_finding_link_row(
+                    conn,
+                    *to_semantic_id,
+                    link.audit_finding_id,
+                    link.strength,
+                    &link.evidence,
+                )
+                .await?;
+                if inserted {
+                    out.links_moved += 1;
+                } else {
+                    out.links_collided += 1;
+                }
+            }
+            semantic_finding_link::Entity::delete(semantic_finding_link::ActiveModel {
+                semantic_node_id: Set(from_semantic_id),
+                audit_finding_id: Set(link.audit_finding_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        let source_functions = semantic_function::Entity::find()
+            .filter(semantic_function::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for func in &source_functions {
+            for to_semantic_id in to_semantic_ids {
+                let duplicate = semantic_function::Entity::find()
+                    .filter(semantic_function::Column::SemanticNodeId.eq(*to_semantic_id))
+                    .filter(semantic_function::Column::FunctionName.eq(func.function_name.clone()))
+                    .filter(semantic_function::Column::ContractPath.eq(func.contract_path.clone()))
+                    .one(conn)
+                    .await?
+                    .is_some();
+                if duplicate {
+                    out.functions_skipped_dup += 1;
+                } else {
+                    semantic_function::Entity::insert(semantic_function::ActiveModel {
+                        semantic_node_id: Set(*to_semantic_id),
+                        function_name: Set(func.function_name.clone()),
+                        contract_path: Set(func.contract_path.clone()),
+                        ..Default::default()
+                    })
+                    .exec(conn)
+                    .await?;
+                    out.functions_moved += 1;
+                }
+            }
+            semantic_function::Entity::delete_by_id(func.id)
+                .exec(conn)
+                .await?;
+        }
+
+        let source_provenance = project_semantic::Entity::find()
+            .filter(project_semantic::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for row in &source_provenance {
+            for to_semantic_id in to_semantic_ids {
+                Self::upsert_project_semantic_row(conn, row.project_id, *to_semantic_id).await?;
+                out.provenance_moved += 1;
+            }
+            project_semantic::Entity::delete(project_semantic::ActiveModel {
+                project_id: Set(row.project_id),
+                semantic_node_id: Set(from_semantic_id),
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        // ── Category recall: carry the raw's category onto canonicals ──
+        // When a raw folds in from a DIFFERENT category (and that category
+        // is not the `Others` catch-all), the canonical gains a secondary
+        // category row so category-scoped candidate pools still surface it.
+        // Canonical-side carry is guaranteed before the raw's own secondary
+        // rows are deleted — same lossless order as the link moves.
+        if self.table_exists("semantic_node_category").await? {
+            let raw_node = semantic_node::Entity::find_by_id(from_semantic_id)
+                .one(conn)
+                .await?
+                .ok_or_else(|| {
+                    KgError::other(format!(
+                        "semantic remap source sem-{from_semantic_id} does not exist"
+                    ))
+                })?;
+            if raw_node.category != DeFiCategory::Others {
+                let raw_category_row = category::Entity::find()
+                    .filter(category::Column::Name.eq(raw_node.category))
+                    .one(conn)
+                    .await?;
+                if let Some(raw_category_row) = raw_category_row {
+                    for to_semantic_id in to_semantic_ids {
+                        let Some(target) = semantic_node::Entity::find_by_id(*to_semantic_id)
+                            .one(conn)
+                            .await?
+                        else {
+                            continue;
+                        };
+                        if target.category == raw_node.category {
+                            continue;
+                        }
+                        let exists = semantic_node_category::Entity::find()
+                            .filter(
+                                semantic_node_category::Column::SemanticNodeId.eq(*to_semantic_id),
+                            )
+                            .filter(
+                                semantic_node_category::Column::CategoryId.eq(raw_category_row.id),
+                            )
+                            .one(conn)
+                            .await?
+                            .is_some();
+                        if !exists {
+                            semantic_node_category::Entity::insert(
+                                semantic_node_category::ActiveModel {
+                                    semantic_node_id: Set(*to_semantic_id),
+                                    category_id: Set(raw_category_row.id),
+                                },
+                            )
+                            .exec(conn)
+                            .await?;
+                            out.secondary_categories_added += 1;
+                        }
+                    }
+                }
+            }
+            semantic_node_category::Entity::delete_many()
+                .filter(semantic_node_category::Column::SemanticNodeId.eq(from_semantic_id))
+                .exec(conn)
+                .await?;
+        }
+
+        Ok(out)
+    }
+
+    /// Move every row that hangs off the merged-away finding
+    /// `from_finding_id` onto EACH canonical in `to_finding_ids`, inside the
+    /// caller's transaction:
+    ///
+    /// - `semantic_finding_link`: upsert `(semantic, to)` strongest-wins for
+    ///   every target, then delete the source row.
+    /// - `project_finding`: upsert `(project, to)` for every target, then
+    ///   delete `(project, from)`.
+    ///
+    /// Idempotent and lossless; `finding_merge` itself is left untouched.
+    pub async fn remap_finding_merge_txn<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        from_finding_id: i32,
+        to_finding_ids: &[i32],
+    ) -> Result<RemapFindingOutcome> {
+        let mut out = RemapFindingOutcome::default();
+
+        let source_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::AuditFindingId.eq(from_finding_id))
+            .all(conn)
+            .await?;
+        for link in &source_links {
+            for to_finding_id in to_finding_ids {
+                let inserted = Self::upsert_semantic_finding_link_row(
+                    conn,
+                    link.semantic_node_id,
+                    *to_finding_id,
+                    link.strength,
+                    &link.evidence,
+                )
+                .await?;
+                if inserted {
+                    out.links_moved += 1;
+                } else {
+                    out.links_collided += 1;
+                }
+            }
+            semantic_finding_link::Entity::delete(semantic_finding_link::ActiveModel {
+                semantic_node_id: Set(link.semantic_node_id),
+                audit_finding_id: Set(from_finding_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        let source_provenance = project_finding::Entity::find()
+            .filter(project_finding::Column::AuditFindingId.eq(from_finding_id))
+            .all(conn)
+            .await?;
+        for row in &source_provenance {
+            for to_finding_id in to_finding_ids {
+                Self::upsert_project_finding_row(conn, row.project_id, *to_finding_id).await?;
+                out.provenance_moved += 1;
+            }
+            project_finding::Entity::delete(project_finding::ActiveModel {
+                project_id: Set(row.project_id),
+                audit_finding_id: Set(from_finding_id),
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        Ok(out)
+    }
+
+    /// One-time integrity sweep: iterate every `semantic_merge` and
+    /// `finding_merge` row and move all link / function / provenance rows
+    /// off the merge sources onto their canonicals, inside ONE transaction.
+    /// A post-loop assertion verifies zero rows still reference a merge
+    /// source; any violation aborts (the transaction rolls back and the DB
+    /// is left exactly as it was).
+    ///
+    /// Multi-target folds (one raw merged into N canonicals) fan out to
+    /// every target: merge rows are grouped by `from_*_id` first, so the
+    /// source rows are read once and copied onto all canonicals before the
+    /// source rows are deleted. This preserves the semantic of the old
+    /// raw-chase (`findings_for_semantic_ids` surfaced the raw's rows under
+    /// every canonical) while making the rows canonical-side.
+    pub async fn remap_all_merge_links(&self) -> Result<RemapReport> {
+        let txn = self.db.begin().await?;
+
+        let semantic_merges = semantic_merge::Entity::find()
+            .order_by_asc(semantic_merge::Column::FromSemanticId)
+            .all(&txn)
+            .await?;
+        let finding_merges = finding_merge::Entity::find()
+            .order_by_asc(finding_merge::Column::FromFindingId)
+            .all(&txn)
+            .await?;
+
+        let mut report = RemapReport {
+            semantic_merges_processed: semantic_merges.len(),
+            finding_merges_processed: finding_merges.len(),
+            ..Default::default()
+        };
+
+        for (from_semantic_id, target_ids) in group_merge_rows_by_source(
+            &semantic_merges,
+            |m| m.from_semantic_id,
+            |m| m.to_semantic_id,
+        ) {
+            let outcome = self
+                .remap_semantic_merge_txn(&txn, from_semantic_id, &target_ids)
+                .await?;
+            report.semantic.links_moved += outcome.links_moved;
+            report.semantic.links_collided += outcome.links_collided;
+            report.semantic.functions_moved += outcome.functions_moved;
+            report.semantic.functions_skipped_dup += outcome.functions_skipped_dup;
+            report.semantic.provenance_moved += outcome.provenance_moved;
+            report.semantic.secondary_categories_added += outcome.secondary_categories_added;
+        }
+
+        for (from_finding_id, target_ids) in
+            group_merge_rows_by_source(&finding_merges, |m| m.from_finding_id, |m| m.to_finding_id)
+        {
+            let outcome = self
+                .remap_finding_merge_txn(&txn, from_finding_id, &target_ids)
+                .await?;
+            report.finding.links_moved += outcome.links_moved;
+            report.finding.links_collided += outcome.links_collided;
+            report.finding.provenance_moved += outcome.provenance_moved;
+        }
+
+        let semantic_sources: Vec<i32> = semantic_merges
+            .iter()
+            .map(|m| m.from_semantic_id)
+            .unique()
+            .collect();
+        let residual_semantic_links = semantic_finding_link::Entity::find()
+            .filter(
+                semantic_finding_link::Column::SemanticNodeId
+                    .is_in(semantic_sources.iter().copied()),
+            )
+            .count(&txn)
+            .await?;
+        if residual_semantic_links > 0 {
+            return Err(KgError::other(format!(
+                "{residual_semantic_links} semantic_finding_link row(s) still reference a merge source after remap; rolling back"
+            )));
+        }
+
+        let finding_sources: Vec<i32> = finding_merges
+            .iter()
+            .map(|m| m.from_finding_id)
+            .unique()
+            .collect();
+        let residual_finding_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::AuditFindingId.is_in(finding_sources))
+            .count(&txn)
+            .await?;
+        if residual_finding_links > 0 {
+            return Err(KgError::other(format!(
+                "{residual_finding_links} semantic_finding_link row(s) still reference a merge-source finding after remap; rolling back"
+            )));
+        }
+
+        if self.table_exists("semantic_node_category").await? {
+            let residual_secondary = semantic_node_category::Entity::find()
+                .filter(semantic_node_category::Column::SemanticNodeId.is_in(semantic_sources))
+                .count(&txn)
+                .await?;
+            if residual_secondary > 0 {
+                return Err(KgError::other(format!(
+                    "{residual_secondary} semantic_node_category row(s) still reference a merge source after remap; rolling back"
+                )));
+            }
+        }
+
+        txn.commit().await?;
+        Ok(report)
     }
 
     pub async fn semantic_link_candidates_for_categories(
@@ -3325,6 +3928,12 @@ impl HistoricalDatabase {
         // populate `pending_semantic` so the retro-link pass during the
         // incremental learn flow can attach existing findings to them.
         let mut new_canonical_semantic_ids: Vec<i32> = Vec::new();
+        // Merge folds written by this call: (raw id, canonical targets).
+        // After the in-project link block lands (which attaches rows to raw
+        // ids), each fold's rows are moved onto its canonicals so no link /
+        // function / provenance row ever survives on a merge source.
+        let mut semantic_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut finding_folds: Vec<(i32, Vec<i32>)> = Vec::new();
 
         // Process merge results
         let mut new_semantic_count = 0;
@@ -3404,6 +4013,7 @@ impl HistoricalDatabase {
                     let new_id = inserted.last_insert_id;
                     upsert_project_semantic(conn, project_id, new_id).await?;
                     raw_semantic_id_by_idx.push(new_id);
+                    semantic_folds.push((new_id, target_ids.clone()));
 
                     for func in &result.semantic.functions {
                         let f = semantic_function::ActiveModel {
@@ -3526,6 +4136,7 @@ impl HistoricalDatabase {
                     // modified by a merge; only `description`,
                     // `patterns`, `exploits` may be replaced with the
                     // agent's generalization.
+                    finding_folds.push((finding_id, target_ids.clone()));
                     for target_id in target_ids {
                         let target = audit_finding::Entity::find_by_id(*target_id)
                             .one(conn)
@@ -3653,6 +4264,26 @@ impl HistoricalDatabase {
                 .await?;
                 in_project_link_rows += 1;
             }
+        }
+
+        // ── Move fold rows onto their canonicals ──────────────────────
+        // The in-project block above attached link rows to the *raw* ids;
+        // now that every fold is written, move each raw's link / function /
+        // provenance rows onto its canonical(s) so nothing survives on a
+        // merge source. New rows (action == New) have no folds and are
+        // untouched.
+        let mut remapped_links = 0usize;
+        for (from_semantic_id, target_ids) in &semantic_folds {
+            let outcome = self
+                .remap_semantic_merge_txn(conn, *from_semantic_id, target_ids)
+                .await?;
+            remapped_links += outcome.links_moved;
+        }
+        for (from_finding_id, target_ids) in &finding_folds {
+            let outcome = self
+                .remap_finding_merge_txn(conn, *from_finding_id, target_ids)
+                .await?;
+            remapped_links += outcome.links_moved;
         }
 
         // NOTE: we do NOT write finding_link_status here. In-project links
@@ -3791,6 +4422,31 @@ where
     I: IntoIterator<Item = (i32, i32)>,
 {
     pairs.into_iter().collect()
+}
+
+fn group_merge_rows_by_source<M>(
+    rows: &[M],
+    from: impl Fn(&M) -> i32,
+    to: impl Fn(&M) -> i32,
+) -> Vec<(i32, Vec<i32>)> {
+    let mut grouped: Vec<(i32, Vec<i32>)> = Vec::new();
+    let mut seen: HashMap<i32, usize> = HashMap::new();
+    for row in rows {
+        let from_id = from(row);
+        let to_id = to(row);
+        match seen.get(&from_id) {
+            Some(&idx) => {
+                if !grouped[idx].1.contains(&to_id) {
+                    grouped[idx].1.push(to_id);
+                }
+            }
+            None => {
+                seen.insert(from_id, grouped.len());
+                grouped.push((from_id, vec![to_id]));
+            }
+        }
+    }
+    grouped
 }
 
 fn resolve_merge_target(id: i32, merge_map: &HashMap<i32, i32>) -> i32 {
@@ -4353,6 +5009,13 @@ impl HistoricalDatabase {
         let txn = self.db.begin().await?;
         let mut out = MergeImportOutcome::default();
 
+        // Fold tracking: (fresh leaf id, destination canonical ids). After
+        // the structural link carry (which maps src ids onto the fresh
+        // leaves), the remap pass moves every leaf-side row onto the
+        // canonicals so nothing survives on a merge source.
+        let mut semantic_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut finding_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+
         // ---- semantics ----
         for item in semantics {
             let inserted = semantic_node::Entity::insert(semantic_node::ActiveModel {
@@ -4383,6 +5046,7 @@ impl HistoricalDatabase {
                 out.new_semantics += 1;
             } else {
                 out.folded_semantics += 1;
+                semantic_folds.push((node_id, item.target_ids.clone()));
                 for target_id in &item.target_ids {
                     // One-level: node_id is a fresh leaf; target is a dst canonical.
                     semantic_merge::Entity::insert(semantic_merge::ActiveModel {
@@ -4461,6 +5125,7 @@ impl HistoricalDatabase {
             } else {
                 out.folded_finding_ids.push(finding_id);
                 out.folded_findings += 1;
+                finding_folds.push((finding_id, item.target_ids.clone()));
                 for target_id in &item.target_ids {
                     finding_merge::Entity::insert(finding_merge::ActiveModel {
                         from_finding_id: Set(finding_id),
@@ -4559,6 +5224,21 @@ impl HistoricalDatabase {
                 .await?;
                 out.carried_links += 1;
             }
+        }
+
+        // ── Move fold rows onto their destination canonicals ────────
+        // The carry block attached link rows to the fresh leaves. Move each
+        // leaf's link / function / provenance rows onto its canonical(s) so
+        // nothing survives on a merge source. The old raw-chase in
+        // `findings_for_semantic_ids` stays as a defensive layer but now
+        // finds nothing extra.
+        for (from_semantic_id, target_ids) in &semantic_folds {
+            self.remap_semantic_merge_txn(&txn, *from_semantic_id, target_ids)
+                .await?;
+        }
+        for (from_finding_id, target_ids) in &finding_folds {
+            self.remap_finding_merge_txn(&txn, *from_finding_id, target_ids)
+                .await?;
         }
 
         // Folded findings are not visited by the ③b link pass; mark them
@@ -5545,7 +6225,6 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
                 .len(),
             1
         );
-
         drop(restored);
         drop(db);
         cleanup_test_db(&source_path);
@@ -6111,6 +6790,460 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             .collect();
         assert_eq!(link_rows.len(), 1);
         assert_eq!(link_rows[0].args, args_a);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// Cross-category folds carry the raw's category onto every canonical
+    /// target as a secondary category; same-category folds and `Others`
+    /// raws carry nothing.
+    #[tokio::test]
+    async fn remap_semantic_merge_carries_secondary_categories() {
+        let (db, path) = create_test_db().await;
+
+        let raw_dexes = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Raw DEX Router".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("router def".to_string()),
+            description: Set("router desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw_others = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Raw Others Node".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("o def".to_string()),
+            description: Set("o desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical_lending = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical Lending".to_string()),
+            category: Set(DeFiCategory::Lending),
+            definition: Set("l def".to_string()),
+            description: Set("l desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical_dexes = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical DEX".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d def".to_string()),
+            description: Set("d desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        let dexes_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Dexes))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let others_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Others))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let txn = db.db.begin().await.unwrap();
+        db.remap_semantic_merge_txn(&txn, raw_dexes, &[canonical_lending, canonical_dexes])
+            .await
+            .unwrap();
+        db.remap_semantic_merge_txn(&txn, raw_others, &[canonical_lending])
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let rows = semantic_node_category::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only the cross-category fold carries");
+        assert_eq!(rows[0].semantic_node_id, canonical_lending);
+        assert_eq!(rows[0].category_id, dexes_row.id);
+        assert!(rows.iter().all(|r| r.category_id != others_row.id));
+
+        // Same-category fold carried nothing; `Others` raw carried nothing.
+        let secondary = db
+            .semantic_secondary_categories(&[canonical_lending, canonical_dexes])
+            .await
+            .unwrap();
+        assert_eq!(secondary[&canonical_lending], vec![DeFiCategory::Dexes]);
+        assert!(!secondary.contains_key(&canonical_dexes));
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `existing_semantics_for_categories` surfaces a canonical whose
+    /// SECONDARY category matches, not just its primary.
+    #[tokio::test]
+    async fn category_query_expands_through_secondary_categories() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical Lending".to_string()),
+            category: Set(DeFiCategory::Lending),
+            definition: Set("l def".to_string()),
+            description: Set("l desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let dexes_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Dexes))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        semantic_node_category::Entity::insert(semantic_node_category::ActiveModel {
+            semantic_node_id: Set(canonical),
+            category_id: Set(dexes_row.id),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let hits = db
+            .existing_semantics_for_categories(&[DeFiCategory::Dexes])
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, canonical);
+
+        // A category the node has NEITHER as primary nor secondary misses.
+        let misses = db
+            .existing_semantics_for_categories(&[DeFiCategory::Custody])
+            .await
+            .unwrap();
+        assert!(misses.is_empty());
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `semantic_secondary_categories` resolves carried rows to category
+    /// names, deduped and sorted; missing table degrades to an empty map.
+    #[tokio::test]
+    async fn semantic_secondary_categories_resolves_carried_rows() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical".to_string()),
+            category: Set(DeFiCategory::Lending),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let dexes_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Dexes))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let custody_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Custody))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        // Insert two DISTINCT secondary categories (composite PK forbids
+        // duplicates); query must resolve them sorted + deduped.
+        for category_id in [dexes_row.id, custody_row.id] {
+            semantic_node_category::Entity::insert(semantic_node_category::ActiveModel {
+                semantic_node_id: Set(canonical),
+                category_id: Set(category_id),
+            })
+            .exec(&db.db)
+            .await
+            .unwrap();
+        }
+
+        let map = db
+            .semantic_secondary_categories(&[canonical])
+            .await
+            .unwrap();
+        // Sorted by `DeFiCategory` enum order (Dexes < Custody by
+        // declaration), which is what `semantic_secondary_categories`
+        // produces.
+        assert_eq!(
+            map[&canonical],
+            vec![DeFiCategory::Dexes, DeFiCategory::Custody]
+        );
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `reclassify_semantic_categories` updates the primary category and
+    /// prunes secondary rows duplicating the NEW primary.
+    #[tokio::test]
+    async fn reclassify_semantic_categories_writes_and_prunes() {
+        let (db, path) = create_test_db().await;
+
+        let node = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Stranded".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let tokens_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Tokens))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let dexes_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Dexes))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        // Pre-existing secondary rows: one duplicating the new primary
+        // (pruned), one not (stays).
+        for category_id in [tokens_row.id, dexes_row.id] {
+            semantic_node_category::Entity::insert(semantic_node_category::ActiveModel {
+                semantic_node_id: Set(node),
+                category_id: Set(category_id),
+            })
+            .exec(&db.db)
+            .await
+            .unwrap();
+        }
+
+        let updated = db
+            .reclassify_semantic_categories(&[(node, DeFiCategory::Tokens)])
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let reloaded = semantic_node::Entity::find_by_id(node)
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.category, DeFiCategory::Tokens);
+
+        let remaining = semantic_node_category::Entity::find()
+            .filter(semantic_node_category::Column::SemanticNodeId.eq(node))
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].category_id, dexes_row.id);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `canonical_semantics_in_category` returns primary-category nodes,
+    /// excluding merged-away raws.
+    #[tokio::test]
+    async fn canonical_semantics_in_category_scopes_to_active_canonicals() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical Others".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Merged-away Others".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set("".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let nodes = db
+            .canonical_semantics_in_category(DeFiCategory::Others)
+            .await
+            .unwrap();
+        assert!(nodes.iter().any(|n| n.id == canonical));
+        assert!(nodes.iter().all(|n| n.id != raw));
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `remap_all_merge_links` moves links/functions/provenance off merge
+    /// sources onto canonicals and aborts (rolling back) on residual rows.
+    #[tokio::test]
+    async fn remap_all_merge_links_moves_and_asserts_residual() {
+        let (db, path) = create_test_db().await;
+
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Raw".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("Canonical".to_string()),
+            category: Set(DeFiCategory::Lending),
+            definition: Set("def".to_string()),
+            description: Set("desc".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let project_id = project::Entity::insert(project::ActiveModel {
+            name: Set("P".to_string()),
+            status: Set("completed".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("F".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        // Link + function + provenance on the raw.
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(raw),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::High),
+            evidence: Set("ev".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_function::Entity::insert(semantic_function::ActiveModel {
+            semantic_node_id: Set(raw),
+            function_name: Set("f".to_string()),
+            contract_path: Set("c".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        project_semantic::Entity::insert(project_semantic::ActiveModel {
+            project_id: Set(project_id),
+            semantic_node_id: Set(raw),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set("".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let report = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(report.semantic_merges_processed, 1);
+        assert_eq!(report.semantic.links_moved, 1);
+        assert_eq!(report.semantic.functions_moved, 1);
+        assert_eq!(report.semantic.provenance_moved, 1);
+        assert_eq!(report.semantic.secondary_categories_added, 1);
+
+        // Source rows gone; canonical-side rows exist.
+        assert!(
+            semantic_finding_link::Entity::find()
+                .filter(semantic_finding_link::Column::SemanticNodeId.eq(raw))
+                .count(&db.db)
+                .await
+                .unwrap()
+                == 0
+        );
+        assert!(
+            semantic_finding_link::Entity::find()
+                .filter(semantic_finding_link::Column::SemanticNodeId.eq(canonical))
+                .count(&db.db)
+                .await
+                .unwrap()
+                == 1
+        );
+        assert!(
+            semantic_function::Entity::find()
+                .filter(semantic_function::Column::SemanticNodeId.eq(raw))
+                .count(&db.db)
+                .await
+                .unwrap()
+                == 0
+        );
+        assert!(
+            project_semantic::Entity::find()
+                .filter(project_semantic::Column::SemanticNodeId.eq(raw))
+                .count(&db.db)
+                .await
+                .unwrap()
+                == 0
+        );
+
+        // A second run is a clean no-op (idempotent).
+        let second = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(second.semantic.links_moved, 0);
+        assert_eq!(second.semantic.secondary_categories_added, 0);
 
         drop(db);
         cleanup_test_db(&path);

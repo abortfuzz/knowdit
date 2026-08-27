@@ -52,6 +52,22 @@ pub enum DeFiCategory {
     #[serde(rename = "Cross Chain")]
     #[sea_orm(string_value = "Cross Chain")]
     CrossChain,
+    /// Token-infrastructure mechanics: mint/burn controls, fee-on-transfer
+    /// accounting, reflective/rebasing supply, presale and tokenomics logic.
+    #[sea_orm(string_value = "Tokens")]
+    Tokens,
+    /// DAO and governance mechanisms: proposals, voting, timelocks,
+    /// treasury management, privileged admin roles.
+    #[sea_orm(string_value = "Governance")]
+    Governance,
+    /// Centralized custody and key management: exchange hot wallets,
+    /// multisig custody, private-key storage and signing infrastructure.
+    #[sea_orm(string_value = "Custody")]
+    Custody,
+    /// Privacy and confidentiality protocols: zk-SNARK shielded pools,
+    /// mixers, confidential transactions, stealth addresses.
+    #[sea_orm(string_value = "Privacy")]
+    Privacy,
     #[sea_orm(string_value = "Others")]
     Others,
 }
@@ -71,6 +87,10 @@ impl DeFiCategory {
         Self::NftMarketplace,
         Self::NftLending,
         Self::CrossChain,
+        Self::Tokens,
+        Self::Governance,
+        Self::Custody,
+        Self::Privacy,
         Self::Others,
     ];
 
@@ -89,6 +109,10 @@ impl DeFiCategory {
             Self::NftMarketplace => "NFT Marketplace",
             Self::NftLending => "NFT Lending",
             Self::CrossChain => "Cross Chain",
+            Self::Tokens => "Tokens",
+            Self::Governance => "Governance",
+            Self::Custody => "Custody",
+            Self::Privacy => "Privacy",
             Self::Others => "Others",
         }
     }
@@ -150,6 +174,17 @@ mod parse_tests {
             DeFiCategory::parse("nft-marketplace"),
             Some(DeFiCategory::NftMarketplace)
         );
+    }
+
+    #[test]
+    fn parses_new_categories() {
+        assert_eq!(DeFiCategory::parse("Tokens"), Some(DeFiCategory::Tokens));
+        assert_eq!(
+            DeFiCategory::parse("governance"),
+            Some(DeFiCategory::Governance)
+        );
+        assert_eq!(DeFiCategory::parse("Custody"), Some(DeFiCategory::Custody));
+        assert_eq!(DeFiCategory::parse("privacy"), Some(DeFiCategory::Privacy));
     }
 
     #[test]
