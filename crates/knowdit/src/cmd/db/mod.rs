@@ -7,5 +7,6 @@
 
 pub mod copy;
 pub mod import_snapshot;
+pub mod remap_links;
 pub mod snapshot;
 pub mod snapshot_format;

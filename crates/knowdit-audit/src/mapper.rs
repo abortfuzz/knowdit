@@ -172,6 +172,19 @@ impl KnowledgeMapper {
             return Ok(MapperOutcome::default());
         }
 
+        // Secondary categories per canonical (category-recall): rendered in
+        // the historical block so the LLM sees the full coverage a canonical
+        // absorbed through cross-category folds.
+        let secondary_categories: HashMap<i32, Vec<DeFiCategory>> = {
+            let canonical_ids: Vec<i32> = historical_semantics
+                .iter()
+                .map(|c| c.canonical.id)
+                .collect();
+            kg.semantic_secondary_categories(&canonical_ids)
+                .await
+                .wrap_err("failed to load secondary categories from knowledge graph")?
+        };
+
         tracing::info!(
             "Mapping {} extracted semantic(s) against {} historical semantic(s) (batch_size={})",
             extracted_with_id.len(),
@@ -189,6 +202,7 @@ impl KnowledgeMapper {
             &extracted_with_id,
             &extract_ids,
             &historical_semantics,
+            &secondary_categories,
             "pass1",
         )
         .await?;
@@ -245,6 +259,7 @@ impl KnowledgeMapper {
                 &unmatched_after_pass1,
                 &pass2_extract_ids,
                 &pass2_historicals,
+                &secondary_categories,
                 "pass2",
             )
             .await?
@@ -403,6 +418,7 @@ async fn batch_match(
     extracts: &[(i32, &ExtractedSemantic)],
     valid_extract_ids: &BTreeSet<i32>,
     historicals: &[CanonicalWithChildren<semantic_node::Model>],
+    secondary_categories: &HashMap<i32, Vec<DeFiCategory>>,
     label_prefix: &str,
 ) -> Result<Vec<SemanticMatch>> {
     if extracts.is_empty() || historicals.is_empty() {
@@ -426,6 +442,7 @@ async fn batch_match(
     let system_prompt = Arc::new(system_prompt.to_string());
     let valid_extract_ids = Arc::new(valid_extract_ids.clone());
     let label_prefix = Arc::new(label_prefix.to_string());
+    let secondary_categories = Arc::new(secondary_categories.clone());
 
     type Batch = Vec<CanonicalWithChildren<semantic_node::Model>>;
     // Job queue sized to hold every batch, so feeding it never blocks
@@ -444,6 +461,7 @@ async fn batch_match(
         let system_prompt = system_prompt.clone();
         let valid_extract_ids = valid_extract_ids.clone();
         let label_prefix = label_prefix.clone();
+        let secondary_categories = secondary_categories.clone();
         workers.spawn(async move {
             while let Ok((batch_idx, batch)) = rx.recv().await {
                 let label = format!(
@@ -459,6 +477,7 @@ async fn batch_match(
                     &valid_extract_ids,
                     &batch,
                     max_rendered_raw_children,
+                    &secondary_categories,
                     &label,
                 )
                 .await;
@@ -523,9 +542,15 @@ async fn run_one_batch(
     valid_extract_ids: &BTreeSet<i32>,
     batch: &[CanonicalWithChildren<semantic_node::Model>],
     max_rendered_raw_children: usize,
+    secondary_categories: &HashMap<i32, Vec<DeFiCategory>>,
     label: &str,
 ) -> Result<Vec<SemanticMatch>> {
-    let user_prompt = build_user_prompt(extracted_block, batch, max_rendered_raw_children);
+    let user_prompt = build_user_prompt(
+        extracted_block,
+        batch,
+        max_rendered_raw_children,
+        secondary_categories,
+    );
 
     let response: MatchResponse = llm
         .prompt_json_with_retry(system_prompt, &user_prompt, Some("mapper"), None, None)
@@ -692,14 +717,20 @@ fn render_extracted_block(extracted: &[(i32, &ExtractedSemantic)]) -> String {
 fn render_historical_block(
     batch: &[CanonicalWithChildren<semantic_node::Model>],
     max_rendered_raw_children: usize,
+    secondary_categories: &HashMap<i32, Vec<DeFiCategory>>,
 ) -> String {
     let mut out = String::new();
     for entry in batch {
         let canonical = &entry.canonical;
+        let secondary = secondary_categories
+            .get(&canonical.id)
+            .map(|cats| format!(" (+{})", cats.iter().map(|c| c.as_str()).join(", ")))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- historical_id={} | category={} | name=\"{}\"\n  definition: {}\n  description: {}\n",
+            "- historical_id={} | category={}{} | name=\"{}\"\n  definition: {}\n  description: {}\n",
             canonical.id,
             canonical.category.as_str(),
+            secondary,
             canonical.name,
             canonical.definition.trim(),
             canonical.description.trim()
@@ -733,13 +764,15 @@ fn build_user_prompt(
     extracted_block: &str,
     batch: &[CanonicalWithChildren<semantic_node::Model>],
     max_rendered_raw_children: usize,
+    secondary_categories: &HashMap<i32, Vec<DeFiCategory>>,
 ) -> String {
     format!(
         "## Extracted project semantics\n{extracted}\n\
          \n## Historical knowledge-graph semantics (this batch)\n\
          Each historical entry is a *canonical semantic cluster*; `merged_raw_examples` (when \
          present) shows specific raw semantics merged into the canonical and indicates the kinds \
-         of behaviours the cluster covers.\n{historical}\n\
+         of behaviours the cluster covers. A `(+X)` after `category` lists secondary categories \
+         the canonical also covers via folded variants.\n{historical}\n\
          \n## Task\nEmit ONE entry in the `matches` array for EVERY `(extract_id, historical_id)` \
          pair shown above — no silent omission. Each entry must carry an explicit `strength` from \
          {{`High`, `Medium`, `Low`}} plus an `evidence` rationale. Apply the strength rubric from \
@@ -751,7 +784,8 @@ fn build_user_prompt(
          ```\nNever invent ids that were not listed in the inputs. Coverage is mandatory: missing \
          pairs are treated as the agent shirking the contract and a warning is logged.",
         extracted = extracted_block,
-        historical = render_historical_block(batch, max_rendered_raw_children),
+        historical =
+            render_historical_block(batch, max_rendered_raw_children, secondary_categories),
     )
 }
 

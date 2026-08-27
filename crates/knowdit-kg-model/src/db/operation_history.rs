@@ -26,6 +26,14 @@ pub enum OperationType {
     /// `knowdit learn link` — global finding-to-semantic linking pass.
     #[sea_orm(string_value = "link")]
     Link,
+    /// `knowdit db remap-links` — one-time move of link / function /
+    /// provenance rows off merge sources onto their canonicals.
+    #[sea_orm(string_value = "remaplinks")]
+    RemapLinks,
+    /// `knowdit learn reclassify-others` — LLM re-classification of
+    /// canonical semantics stranded in the `Others` bucket.
+    #[sea_orm(string_value = "reclassifyothers")]
+    ReclassifyOthers,
 }
 
 impl OperationType {
@@ -34,6 +42,8 @@ impl OperationType {
             Self::C4Learn => "c4learn",
             Self::SherlockLearn => "sherlocklearn",
             Self::Link => "link",
+            Self::RemapLinks => "remaplinks",
+            Self::ReclassifyOthers => "reclassifyothers",
         }
     }
 }

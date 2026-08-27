@@ -9,6 +9,7 @@ pub mod link;
 pub mod list_projects;
 pub mod list_semantics;
 pub mod merge_args;
+pub mod reclassify_others;
 pub mod retro_link;
 pub mod search_semantics;
 pub mod set_platform_id;
